@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-labelledby="title">
+  <title id="title">Rust Console</title>
+  <defs>
+    <linearGradient id="signal" x1="16" y1="116" x2="112" y2="12" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#b00020"/>
+      <stop offset="1" stop-color="#ff1744"/>
+    </linearGradient>
+  </defs>
+  <path fill="url(#signal)" fill-rule="evenodd" d="M12 13c19 7 36 22 52 41 16-19 33-34 52-41-10 23-24 40-40 53 16 17 27 33 36 50-21-8-36-21-48-37-12 16-27 29-48 37 9-18 20-34 36-50-16-14-30-31-40-53Zm46 53 6-7 6 7-6 7-6-7Z"/>
+</svg>
