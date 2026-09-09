@@ -1,12 +1,5 @@
 # Independent Windows Virtual HID Mouse and Keyboard
 
-> This implementation specification is based on inspection of
-> [HIDMaestro](https://github.com/inayayousfi/HIDMaestro/tree/d042641b09a56dd8e1f1c9d7812c41dd3913cfd4)
-> at commit `d042641b09a56dd8e1f1c9d7812c41dd3913cfd4`. The design below is
-> written as an independent Windows implementation and does not require that
-> library or its API. If source code is copied instead of independently
-> implemented, preserve the source repository's MIT license notice.
-
 ## Purpose
 
 This document describes the difficult logic and Windows boundaries needed to
