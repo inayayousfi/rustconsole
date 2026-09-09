@@ -1,0 +1,95 @@
+[workspace]
+members = ["apps/*", "crates/*"]
+exclude = ["native/windows-input-driver"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+publish = false
+license = "GPL-3.0-only"
+
+[workspace.dependencies]
+backon = { version = "=1.6.0", default-features = false, features = ["std"] }
+bytes = "=1.12.1"
+clap = { version = "4.5", features = ["derive"] }
+ash = "=0.38.0"
+cc = "1.2.38"
+ffmpeg-next = { version = "9.0.0", default-features = false, features = ["format"] }
+fontdue = "=0.9.3"
+glow = "=0.16.0"
+gdk = "=0.18.2"
+gdkwayland-sys = "=0.18.2"
+gtk = "=0.18.2"
+keyring = "=4.2.0"
+libc = "=0.2.189"
+opaque-ke = { version = "=4.0.1", default-features = false, features = ["argon2", "ristretto255", "std"] }
+prost = "0.14.4"
+quinn = { version = "=0.11.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+rand = { version = "=0.8.8", default-features = false, features = ["getrandom"] }
+raw-window-handle = "=0.6.2"
+rcgen = { version = "=0.14.5", default-features = false, features = ["ring"] }
+rpassword = "=7.4.0"
+sdl3 = { version = "=0.18.4", features = ["ash"] }
+rustls = { version = "=0.23.35", default-features = false, features = ["ring", "std"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+sha2 = "=0.10.9"
+tokio = { version = "=1.47.1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tauri = { version = "=2.11.5", default-features = false, features = ["wry"] }
+tauri-build = { version = "=2.6.3", default-features = false, features = ["config-json"] }
+webkit2gtk = "=2.0.2"
+windows-service = "0.8.1"
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Devices_FunctionDiscovery",
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Direct3D11on12",
+    "Win32_Graphics_Direct3D12",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_Media_Audio",
+    "Win32_NetworkManagement_WindowsFirewall",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_JobObjects",
+    "Win32_System_Memory",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+    "Win32_System_Pipes",
+    "Win32_System_Performance",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    "Win32_System_StationsAndDesktops",
+    "Win32_System_Threading",
+    "Win32_System_IO",
+    "Win32_UI_Input",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_UI_WindowsAndMessaging",
+] }
+rustconsole-discovery = { path = "crates/rustconsole-discovery" }
+rustconsole-codec-ffmpeg = { path = "crates/rustconsole-codec-ffmpeg" }
+rustconsole-client-core = { path = "crates/rustconsole-client-core" }
+rustconsole-host-core = { path = "crates/rustconsole-host-core" }
+rustconsole-host-windows = { path = "crates/rustconsole-host-windows" }
+rustconsole-input-windows = { path = "crates/rustconsole-input-windows" }
+rustconsole-media = { path = "crates/rustconsole-media" }
+rustconsole-protocol = { path = "crates/rustconsole-protocol" }
+rustconsole-render = { path = "crates/rustconsole-render" }
+rustconsole-render-vulkan = { path = "crates/rustconsole-render-vulkan" }
+rustconsole-render-vulkan-linux = { path = "crates/rustconsole-render-vulkan-linux" }
+rustconsole-session = { path = "crates/rustconsole-session" }
+rustconsole-player-core = { path = "crates/rustconsole-player-core" }
+rustconsole-player-linux = { path = "crates/rustconsole-player-linux" }
+zeroize = { version = "=1.8.1", features = ["std"] }
+
+[patch.crates-io]
+ffmpeg-sys-next = { path = "vendor/ffmpeg-sys-next-9.0.0" }

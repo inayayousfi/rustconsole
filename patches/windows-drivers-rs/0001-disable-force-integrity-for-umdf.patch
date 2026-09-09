@@ -1,0 +1,19 @@
+diff --git a/crates/wdk-build/src/lib.rs b/crates/wdk-build/src/lib.rs
+--- a/crates/wdk-build/src/lib.rs
++++ b/crates/wdk-build/src/lib.rs
+@@ -1298,9 +1298,12 @@ impl Config {
+             // Force Linker Optimizations
+             println!("cargo::rustc-cdylib-link-arg=/OPT:REF,ICF");
+ 
+-            // Enable "Forced Integrity Checking" to prevent non-signed binaries
+-            // from loading
+-            println!("cargo::rustc-cdylib-link-arg=/INTEGRITYCHECK");
++            // UMDF binaries run in user mode and rely on their signed driver package.
++            // Requiring kernel-mode Code Integrity here rejects locally trusted test
++            // certificates under Secure Boot, so reserve it for kernel-mode drivers.
++            if !matches!(self.driver_config, DriverConfig::Umdf(_)) {
++                println!("cargo::rustc-cdylib-link-arg=/INTEGRITYCHECK");
++            }
+ 
+             // Disable Manifest File Generation
+             println!("cargo::rustc-cdylib-link-arg=/MANIFEST:NO");

@@ -1,0 +1,26 @@
+[package]
+name = "rustconsole-player-linux"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+rustconsole-codec-ffmpeg.workspace = true
+rustconsole-media.workspace = true
+rustconsole-protocol.workspace = true
+rustconsole-player-core.workspace = true
+zeroize.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ash.workspace = true
+gdkwayland-sys.workspace = true
+glow.workspace = true
+gtk.workspace = true
+keyring.workspace = true
+libc.workspace = true
+sdl3 = { workspace = true, features = ["use-pkg-config"] }

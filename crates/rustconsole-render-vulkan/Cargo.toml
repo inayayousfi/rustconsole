@@ -1,0 +1,15 @@
+[package]
+name = "rustconsole-render-vulkan"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+ash.workspace = true
+fontdue.workspace = true
+sdl3 = { workspace = true, features = ["use-pkg-config"] }

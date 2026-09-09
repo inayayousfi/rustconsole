@@ -1,0 +1,31 @@
+[package]
+name = "rustconsole-host-windows"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+rustconsole-codec-ffmpeg.workspace = true
+rustconsole-host-core.workspace = true
+rustconsole-input-windows.workspace = true
+rustconsole-media.workspace = true
+rustconsole-protocol.workspace = true
+rustconsole-session.workspace = true
+rand.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+bytes.workspace = true
+quinn.workspace = true
+rpassword.workspace = true
+tokio.workspace = true
+windows.workspace = true
+windows-service.workspace = true
+zeroize.workspace = true
+
+[target.'cfg(windows)'.build-dependencies]
+cc.workspace = true

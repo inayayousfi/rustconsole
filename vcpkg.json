@@ -1,0 +1,24 @@
+{
+  "name": "rustconsole-native-dependencies",
+  "version-string": "0.1.0",
+  "dependencies": [
+    {
+      "name": "ffmpeg",
+      "default-features": false,
+      "features": [
+        "avcodec",
+        "avformat",
+        "nvcodec",
+        "opus"
+      ],
+      "platform": "windows"
+    }
+  ],
+  "overrides": [
+    {
+      "name": "ffmpeg",
+      "version": "8.1.2",
+      "port-version": 3
+    }
+  ]
+}

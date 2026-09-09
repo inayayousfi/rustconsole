@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    name: Linux stable
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - run: sudo apt-get update && sudo apt-get install -y clang libavcodec-dev libavformat-dev libavutil-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - run: cargo fmt --all --check
+      - run: cargo check --workspace --all-targets
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+      - run: node scripts/check-dependency-direction.mjs
+      - name: Check locked Windows driver dependencies
+        run: cargo metadata --locked --manifest-path native/windows-input-driver/Cargo.toml --format-version 1 > /dev/null
+
+  windows:
+    name: Windows stable
+    runs-on: windows-2022
+    env:
+      VCPKGRS_TRIPLET: x64-windows-static
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install pinned native dependencies
+        shell: pwsh
+        run: |
+          vcpkg install `
+            --triplet $env:VCPKGRS_TRIPLET `
+            --x-manifest-root="$PWD" `
+            --x-install-root="$env:VCPKG_ROOT\installed"
+          New-Item -ItemType Directory -Force "$env:VCPKG_ROOT\installed\vcpkg\updates" | Out-Null
+      - name: Check FFmpeg AV1 NVENC support
+        shell: pwsh
+        run: ./scripts/check-windows-ffmpeg.ps1
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo check --workspace --all-targets
+      - run: cargo test --workspace
+      - run: node scripts/check-dependency-direction.mjs
+
+  minimum-rust:
+    name: Rust 1.95
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - run: sudo apt-get update && sudo apt-get install -y clang libavcodec-dev libavformat-dev libavutil-dev
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+      - run: cargo check --workspace --all-targets

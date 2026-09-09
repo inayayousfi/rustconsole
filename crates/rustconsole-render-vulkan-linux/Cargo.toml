@@ -1,0 +1,16 @@
+[package]
+name = "rustconsole-render-vulkan-linux"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+ash.workspace = true
+libc.workspace = true
+rustconsole-codec-ffmpeg.workspace = true
+rustconsole-render-vulkan.workspace = true

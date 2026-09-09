@@ -1,0 +1,15 @@
+[package]
+name = "rustconsole-host-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+rustconsole-media.workspace = true
+rustconsole-protocol.workspace = true
+rustconsole-session.workspace = true

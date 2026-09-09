@@ -1,0 +1,33 @@
+[package]
+name = "rustconsole-input-driver"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "GPL-3.0-only"
+publish = false
+
+[package.metadata.wdk.driver-model]
+driver-type = "UMDF"
+umdf-version-major = 2
+target-umdf-version-minor = 23
+
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[build-dependencies]
+wdk-build = { git = "https://github.com/microsoft/windows-drivers-rs", rev = "36558802149bc92455bf5719fe77f3a829d8580f" }
+
+[dependencies]
+wdk = { git = "https://github.com/microsoft/windows-drivers-rs", rev = "36558802149bc92455bf5719fe77f3a829d8580f" }
+wdk-sys = { git = "https://github.com/microsoft/windows-drivers-rs", rev = "36558802149bc92455bf5719fe77f3a829d8580f", features = ["hid"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Memory", "Win32_System_Registry", "Win32_System_Threading"] }
+
+[dev-dependencies]
+wdk-sys = { git = "https://github.com/microsoft/windows-drivers-rs", rev = "36558802149bc92455bf5719fe77f3a829d8580f", features = ["hid", "test-stubs"] }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "forbid"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "forbid"

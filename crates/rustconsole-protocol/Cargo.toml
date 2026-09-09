@@ -1,0 +1,13 @@
+[package]
+name = "rustconsole-protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+prost.workspace = true

@@ -1,0 +1,21 @@
+[package]
+name = "rustconsole-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "rustconsole-client"
+path = "src/main.rs"
+
+[dependencies]
+keyring.workspace = true
+rustconsole-client-core.workspace = true
+serde.workspace = true
+tauri.workspace = true
+zeroize.workspace = true
+
+[build-dependencies]
+tauri-build.workspace = true

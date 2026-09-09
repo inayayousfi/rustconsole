@@ -1,0 +1,15 @@
+[package]
+name = "rustconsole-host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "rustconsole-host"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+rustconsole-host-windows.workspace = true

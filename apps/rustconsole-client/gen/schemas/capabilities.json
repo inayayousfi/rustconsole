@@ -1,0 +1,1 @@
+{"main":{"identifier":"main","description":"Allows the main viewer window to receive stream lifecycle events.","local":true,"windows":["main"],"permissions":["core:event:allow-listen"]}}

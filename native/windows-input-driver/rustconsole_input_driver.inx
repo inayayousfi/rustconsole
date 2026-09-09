@@ -1,0 +1,61 @@
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = HIDClass
+ClassGuid   = {745a17a0-74d3-11d0-b6fe-00a0c90f57da}
+Provider    = %ProviderName%
+PnpLockDown = 1
+
+[DestinationDirs]
+DefaultDestDir = 13
+UMDriverCopy   = 13
+
+[SourceDisksNames]
+1 = %DiskName%
+
+[SourceDisksFiles]
+rustconsole_input_driver.dll = 1
+
+[Manufacturer]
+%ManufacturerName% = Models,NT$ARCH$.10.0...17134
+
+[Models.NT$ARCH$.10.0...17134]
+%DeviceDesc% = VirtualHid_Install,ROOT\RUSTCONSOLEINPUT
+
+[VirtualHid_Install.NT]
+CopyFiles = UMDriverCopy
+Include   = MsHidUmdf.inf,WUDFRD.inf
+Needs     = MsHidUmdf.NT,WUDFRD.NT
+
+[UMDriverCopy]
+rustconsole_input_driver.dll
+
+[VirtualHid_Install.NT.HW]
+AddReg  = VirtualHid_HW_AddReg
+Include = MsHidUmdf.inf,WUDFRD.inf
+Needs   = MsHidUmdf.NT.HW,WUDFRD.NT.HW
+
+[VirtualHid_HW_AddReg]
+HKR,,"LowerFilters",0x00010008,"WUDFRd"
+
+[VirtualHid_Install.NT.Services]
+Include = MsHidUmdf.inf,WUDFRD.inf
+Needs   = MsHidUmdf.NT.Services,WUDFRD.NT.Services
+
+[VirtualHid_Install.NT.Wdf]
+UmdfService                = rustconsole_input_driver,VirtualHid_UmdfService
+UmdfServiceOrder           = rustconsole_input_driver
+UmdfKernelModeClientPolicy = AllowKernelModeClients
+UmdfFileObjectPolicy       = AllowNullAndUnknownFileObjects
+UmdfMethodNeitherAction    = Copy
+UmdfFsContextUsePolicy     = CanUseFsContext2
+UmdfHostProcessSharing     = ProcessSharingDisabled
+
+[VirtualHid_UmdfService]
+UmdfLibraryVersion = $UMDFVERSION$
+ServiceBinary      = %13%\rustconsole_input_driver.dll
+
+[Strings]
+ProviderName     = "Rust Console"
+ManufacturerName = "Rust Console"
+DeviceDesc       = "Rust Console Virtual Input Device"
+DiskName         = "Rust Console Virtual Input Driver"

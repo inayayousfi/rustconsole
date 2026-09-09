@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Rust Console</title>
+    <link rel="icon" href="logo.svg" />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="app-bar">
+        <a class="brand" id="brand-link" href="#machines" aria-label="Rust Console machines">
+          <img src="logo.svg" alt="" width="32" height="32" />
+          <strong>Rust Console</strong>
+        </a>
+
+        <nav class="primary-nav" aria-label="Main navigation">
+          <button type="button" class="nav-item is-active" data-page="machines" aria-current="page">Machines</button>
+          <button type="button" class="nav-item" data-page="settings">Settings</button>
+        </nav>
+
+        <button class="disconnect-button" type="button" id="disconnect-button" hidden>Disconnect</button>
+      </header>
+
+      <main class="workspace">
+        <section class="page is-active" id="machines-page" data-page-panel="machines" aria-labelledby="machines-title">
+          <header class="page-heading">
+            <h1 id="machines-title">Machines</h1>
+            <button class="add-button" type="button" id="add-machine-button" aria-label="Add machine">
+              <span aria-hidden="true">+</span>
+              Add machine
+            </button>
+          </header>
+
+          <div class="tabs" role="tablist" aria-label="Machine sources">
+            <button type="button" role="tab" id="recent-tab" aria-controls="recent-panel" aria-selected="true" data-machine-tab="recent">Recent</button>
+            <button type="button" role="tab" id="discovered-tab" aria-controls="discovered-panel" aria-selected="false" data-machine-tab="discovered">Discovered</button>
+          </div>
+
+          <section class="tab-panel" id="recent-panel" role="tabpanel" aria-labelledby="recent-tab">
+            <div class="machine-grid" id="machine-grid"></div>
+            <div class="empty-state" id="no-machines" hidden>
+              <h2>No machines yet</h2>
+              <button type="button" id="empty-add-button">Add machine</button>
+            </div>
+          </section>
+
+          <section class="tab-panel" id="discovered-panel" role="tabpanel" aria-labelledby="discovered-tab" hidden>
+            <div class="discovery-toolbar">
+              <div>
+                <div class="discovery-progress" id="discovery-progress" hidden>
+                  <progress id="discovery-progress-bar" value="0" max="1"></progress>
+                </div>
+                <p id="discovery-errors" hidden></p>
+              </div>
+              <button type="button" class="secondary-button refresh-button" id="refresh-discovery" aria-label="Refresh discovery" title="Refresh discovery">
+                <span class="refresh-icon" aria-hidden="true"></span>
+              </button>
+            </div>
+            <div class="machine-grid" id="discovered-grid"></div>
+            <div class="empty-state discovered-state" id="no-discovered-machines">
+              <h2>No Rust Console machines discovered</h2>
+            </div>
+          </section>
+
+          <p class="app-message" id="app-message" role="alert" hidden></p>
+        </section>
+
+        <section class="page" id="settings-page" data-page-panel="settings" aria-labelledby="settings-title" hidden>
+          <header class="page-heading settings-heading">
+            <h1 id="settings-title">Settings</h1>
+          </header>
+
+          <section class="settings-list" aria-label="Settings">
+            <div class="setting-item">
+              <div>
+                <label for="maximum-bitrate">Maximum bitrate</label>
+                <output id="maximum-bitrate-value" for="maximum-bitrate">20 Mbit/s</output>
+              </div>
+              <div class="setting-control">
+                <input id="maximum-bitrate" name="maximum-bitrate" type="range" value="20" min="5" max="100" step="1" />
+                <div class="range-labels" aria-hidden="true"><span>5</span><span>100 Mbit/s</span></div>
+              </div>
+            </div>
+            <div class="setting-item audio-prerequisite-setting">
+              <div>
+                <span class="setting-label">Windows host audio</span>
+                <span class="requirement-tag">External prerequisite</span>
+              </div>
+              <div class="prerequisite-copy">
+                <strong>VB-CABLE is third-party software from VB-Audio Software. It is not included with Rust Console.</strong>
+                <p>Rust Console uses VB-CABLE Standard as a virtual audio device on Windows hosts. Download and install it from the official website, then restart Windows.</p>
+                <p>VB-CABLE is donationware. All contributions are welcome. A paid license is required for some professional uses.</p>
+                <div class="prerequisite-links">
+                  <button type="button" data-vb-audio-page="product">www.vb-cable.com</button>
+                  <button type="button" data-vb-audio-page="licensing">vb-audio.com/Services/licensing.htm</button>
+                </div>
+              </div>
+            </div>
+          </section>
+        </section>
+      </main>
+    </div>
+
+    <dialog id="machine-dialog" aria-labelledby="machine-dialog-title">
+      <form id="machine-form">
+        <header class="dialog-heading">
+          <h2 id="machine-dialog-title">Add machine</h2>
+          <button class="icon-button" type="button" data-close-dialog="machine-dialog" aria-label="Close">×</button>
+        </header>
+        <label for="machine-address">Address</label>
+        <input id="machine-address" name="address" autocomplete="url" spellcheck="false" placeholder="192.168.1.10 or machine.local" required />
+        <label for="machine-port">Port</label>
+        <input id="machine-port" name="port" type="number" value="47999" min="1" max="65535" step="1" required />
+        <p class="form-error" id="machine-error" role="alert" hidden></p>
+        <div class="dialog-actions">
+          <button class="secondary-button" type="button" data-close-dialog="machine-dialog">Cancel</button>
+          <button class="primary-button" type="submit">Add machine</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog class="audio-prerequisite-dialog" id="audio-prerequisite-dialog" aria-labelledby="audio-prerequisite-title">
+      <form method="dialog">
+        <div class="important-mark" aria-hidden="true">!</div>
+        <header class="dialog-heading">
+          <div>
+            <p class="dialog-eyebrow">Windows host audio</p>
+            <h2 id="audio-prerequisite-title">Audio setup required</h2>
+          </div>
+        </header>
+        <div id="audio-prerequisite-message">
+          <strong>VB-CABLE is third-party software from VB-Audio Software. It is not included with Rust Console.</strong>
+          <p>Rust Console uses VB-CABLE Standard as a virtual audio device on Windows hosts. Download and install it from the official website, then restart Windows.</p>
+          <p>VB-CABLE is donationware. All contributions are welcome. A paid license is required for some professional uses.</p>
+        </div>
+        <p class="form-error" id="audio-prerequisite-error" role="alert" hidden></p>
+        <div class="dialog-actions prerequisite-actions">
+          <button class="secondary-button" type="button" data-vb-audio-page="licensing">Licensing</button>
+          <button class="primary-button" type="button" data-vb-audio-page="product">Open official VB-CABLE page</button>
+          <button class="secondary-button" type="submit" id="audio-prerequisite-close" value="cancel">Close</button>
+          <button class="secondary-button" type="submit" id="audio-prerequisite-continue" value="continue" hidden>Continue without audio</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="credential-dialog" aria-labelledby="credential-dialog-title">
+      <form id="credential-form">
+        <header class="dialog-heading">
+          <div>
+            <h2 id="credential-dialog-title">Connect to machine</h2>
+            <p id="credential-machine"></p>
+          </div>
+          <button class="icon-button" type="button" data-close-dialog="credential-dialog" aria-label="Close">×</button>
+        </header>
+        <label for="machine-password">Application password</label>
+        <input id="machine-password" name="password" type="password" autocomplete="current-password" required />
+        <label class="remember-row">
+          <input type="checkbox" id="remember-password" />
+          <span>Remember in the Linux secret store</span>
+        </label>
+        <p class="form-error" id="credential-error" role="alert" hidden></p>
+        <div class="dialog-actions">
+          <button class="secondary-button" type="button" data-close-dialog="credential-dialog">Cancel</button>
+          <button class="primary-button" type="submit" id="credential-submit">Connect</button>
+        </div>
+      </form>
+    </dialog>
+
+    <template id="machine-card-template">
+      <article class="machine-card">
+        <header>
+          <span class="machine-status"><i></i><span></span></span>
+        </header>
+        <div class="machine-identity">
+          <h2></h2>
+          <p></p>
+          <ul class="route-list" hidden></ul>
+          <strong class="audio-requirement" hidden></strong>
+          <strong class="firewall-warning" hidden></strong>
+        </div>
+        <footer>
+          <button class="remove-machine" type="button">Remove</button>
+          <button class="card-action" type="button"></button>
+        </footer>
+      </article>
+    </template>
+
+    <script src="discovery-auth-queue.js"></script>
+    <script type="module" src="app.js"></script>
+  </body>
+</html>

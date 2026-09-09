@@ -1,0 +1,16 @@
+[package]
+name = "rustconsole-test-game"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "rustconsole-test-game"
+path = "src/main.rs"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+raw-window-handle.workspace = true
+sdl3 = { workspace = true, features = ["build-from-source-static", "raw-window-handle"] }
+windows.workspace = true
