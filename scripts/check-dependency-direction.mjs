@@ -6,8 +6,8 @@ const allowedDependencies = new Map([
   ["rustconsole-session", ["rustconsole-protocol"]],
   ["rustconsole-discovery", []],
   ["rustconsole-media", []],
-  ["rustconsole-render", ["rustconsole-protocol"]],
-  ["rustconsole-render-vulkan", []],
+  ["rustconsole-render", []],
+  ["rustconsole-render-vulkan", ["rustconsole-render"]],
   [
     "rustconsole-render-vulkan-linux",
     [

@@ -6,6 +6,7 @@ mod overlay;
 pub use color::{VideoColorMode, VideoColorParameters};
 
 use ash::{Entry, vk};
+use rustconsole_render::{DecodedVideoColor, PlayerVideoBackend};
 use std::ffi::{CStr, CString};
 use std::io::Cursor;
 use std::marker::PhantomData;
@@ -745,6 +746,35 @@ where
             self.surface_loader.destroy_surface(self.surface, None);
             self.instance.destroy_instance(None);
         }
+    }
+}
+
+impl<Importer, Frame> PlayerVideoBackend<Frame> for VulkanRenderer<Importer, Frame>
+where
+    Importer: VulkanFrameImporter<Frame>,
+{
+    type Error = String;
+
+    fn present_frame(
+        &mut self,
+        frame: &Frame,
+        color: DecodedVideoColor,
+        width: u32,
+        height: u32,
+        overlay_text: &str,
+    ) -> Result<(), Self::Error> {
+        self.color_parameters = color::parameters_for_decoded_color(color, self.hdr10_output);
+        self.present(frame, width, height, overlay_text)
+    }
+
+    fn present_loading(
+        &mut self,
+        width: u32,
+        height: u32,
+        elapsed_seconds: f32,
+        status: &str,
+    ) -> Result<(), Self::Error> {
+        VulkanRenderer::present_loading(self, width, height, elapsed_seconds, status)
     }
 }
 

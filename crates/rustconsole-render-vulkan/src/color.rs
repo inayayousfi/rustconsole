@@ -1,3 +1,5 @@
+use rustconsole_render::DecodedVideoColor;
+
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum VideoColorMode {
@@ -69,6 +71,21 @@ impl Default for VideoColorParameters {
     }
 }
 
+pub(crate) const fn parameters_for_decoded_color(
+    color: DecodedVideoColor,
+    hdr10_output: bool,
+) -> VideoColorParameters {
+    match color {
+        DecodedVideoColor::Bt709Limited => VideoColorParameters::bt709_limited_to_srgb(),
+        DecodedVideoColor::Bt2020PqLimited if hdr10_output => {
+            VideoColorParameters::bt2020_pq_limited_to_hdr10(1_000.0)
+        }
+        DecodedVideoColor::Bt2020PqLimited => {
+            VideoColorParameters::bt2020_pq_limited_to_srgb_bt2390(1_000.0, 203.0, 0.203)
+        }
+    }
+}
+
 const _: () = assert!(std::mem::size_of::<VideoColorParameters>() == 16);
 
 #[cfg(test)]
@@ -84,6 +101,26 @@ mod tests {
         assert_eq!(parameters.source_peak_nits, 1_000.0);
         assert_eq!(parameters.target_peak_nits, 203.0);
         assert_eq!(parameters.target_black_nits, 0.203);
+    }
+
+    #[test]
+    fn decoded_color_selects_the_existing_sdr_and_hdr_conversions() {
+        assert_eq!(
+            parameters_for_decoded_color(DecodedVideoColor::Bt709Limited, false).mode,
+            VideoColorMode::Bt709LimitedToSrgb
+        );
+        assert_eq!(
+            parameters_for_decoded_color(DecodedVideoColor::Bt2020PqLimited, true).mode,
+            VideoColorMode::Bt2020PqLimitedToHdr10
+        );
+        let tone_mapped = parameters_for_decoded_color(DecodedVideoColor::Bt2020PqLimited, false);
+        assert_eq!(
+            tone_mapped.mode,
+            VideoColorMode::Bt2020PqLimitedToSrgbBt2390
+        );
+        assert_eq!(tone_mapped.source_peak_nits, 1_000.0);
+        assert_eq!(tone_mapped.target_peak_nits, 203.0);
+        assert_eq!(tone_mapped.target_black_nits, 0.203);
     }
 
     #[test]

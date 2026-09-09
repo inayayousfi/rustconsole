@@ -8,8 +8,7 @@ use rustconsole_player_linux::{
     DmaBufFrameFormat, NativeDmaBufFrame, SdlAudioOutput, StreamCallbacks, VideoStreamSample,
 };
 use rustconsole_protocol::InputEvent;
-use rustconsole_render::OverlayStatistics;
-use rustconsole_render_vulkan::VideoColorParameters;
+use rustconsole_render::{DecodedVideoColor, OverlayStatistics, PlayerVideoBackend};
 use rustconsole_render_vulkan::{VulkanOutputPreference, VulkanRenderer};
 use rustconsole_render_vulkan_linux::DmaBufFrameImporter;
 use sdl3::event::{Event, WindowEvent};
@@ -273,7 +272,7 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
         audio_queue.clone(),
     );
 
-    let mut renderer = None::<VulkanRenderer<DmaBufFrameImporter, NativeDmaBufFrame>>;
+    let mut renderer = None::<Box<dyn PlayerVideoBackend<NativeDmaBufFrame, Error = String>>>;
     let mut last_frame = None::<(u64, Av1ColorDescription, NativeDmaBufFrame)>;
     let mut pending_video_timestamp = None;
     let mut video_clock = None::<VideoPlaybackClock>;
@@ -601,34 +600,20 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
         }
         if (authenticated || recovering) && redraw {
             if renderer.is_none() {
-                renderer = Some(VulkanRenderer::new(
+                renderer = Some(Box::new(VulkanRenderer::new(
                     &window,
                     DmaBufFrameImporter,
                     output_preference,
-                )?);
+                )?));
             }
             let (width, height) = window.size_in_pixels();
             if let Some(frame) = &last_frame {
-                let hdr10_output = renderer.as_ref().unwrap().is_hdr10_output();
-                renderer
-                    .as_mut()
-                    .unwrap()
-                    .set_video_color_parameters(match frame.1 {
-                        Av1ColorDescription::Bt709Limited => {
-                            VideoColorParameters::bt709_limited_to_srgb()
-                        }
-                        Av1ColorDescription::Bt2020PqLimited => {
-                            if hdr10_output {
-                                VideoColorParameters::bt2020_pq_limited_to_hdr10(1_000.0)
-                            } else {
-                                VideoColorParameters::bt2020_pq_limited_to_srgb_bt2390(
-                                    1_000.0, 203.0, 0.203,
-                                )
-                            }
-                        }
-                    });
-                renderer.as_mut().unwrap().present(
+                renderer.as_mut().unwrap().present_frame(
                     &frame.2,
+                    match frame.1 {
+                        Av1ColorDescription::Bt709Limited => DecodedVideoColor::Bt709Limited,
+                        Av1ColorDescription::Bt2020PqLimited => DecodedVideoColor::Bt2020PqLimited,
+                    },
                     width.max(1),
                     height.max(1),
                     &overlay.text("Streaming"),

@@ -3838,9 +3838,6 @@ dependencies = [
 [[package]]
 name = "rustconsole-render"
 version = "0.1.0"
-dependencies = [
- "rustconsole-protocol",
-]
 
 [[package]]
 name = "rustconsole-render-vulkan"
@@ -3848,6 +3845,7 @@ version = "0.1.0"
 dependencies = [
  "ash",
  "fontdue",
+ "rustconsole-render",
  "sdl3",
 ]
 
