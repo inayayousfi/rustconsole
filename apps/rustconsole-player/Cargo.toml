@@ -21,4 +21,4 @@ rustconsole-render-vulkan-linux.workspace = true
 zeroize.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
-sdl3 = { workspace = true, features = ["use-pkg-config"] }
+sdl3.workspace = true

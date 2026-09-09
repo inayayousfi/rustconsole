@@ -4,7 +4,7 @@ Rust Console is licensed under GPL version 3 only. The `LICENSE` file contains t
 
 Rust Console uses `ffmpeg-next` 9.0.0, licensed under the WTFPL, to call native FFmpeg libraries in-process. Default features are disabled; the project enables the crate's format feature because the released codec-only configuration does not compile, and that feature also enables the codec API. Hardware device and frame operations use the low-level FFmpeg interface re-exported by that crate where no safe wrapper exists.
 
-Rust Console uses `sdl3` 0.18.4, licensed under MIT, to create the native player window, receive native events, create the Vulkan surface, and run the Windows fullscreen stress application. Linux links the system SDL 3 library. The Windows stress application builds SDL 3.4.14 statically from the source package locked by Cargo. SDL uses the zlib license.
+Rust Console uses `sdl3` 0.18.4, licensed under MIT, to create the native player window, receive native events, create the Vulkan surface, and run the Windows fullscreen stress application. The player and Windows stress application build SDL 3.4.14 statically from the source package locked by Cargo. SDL uses the zlib license.
 
 Rust Console uses `fontdue` 0.9.3 under its `MIT OR Apache-2.0 OR Zlib` license expression to rasterize the player overlay's glyph atlas.
 

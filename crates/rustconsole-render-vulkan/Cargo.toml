@@ -13,4 +13,4 @@ path = "src/lib.rs"
 ash.workspace = true
 fontdue.workspace = true
 rustconsole-render.workspace = true
-sdl3 = { workspace = true, features = ["use-pkg-config"] }
+sdl3.workspace = true

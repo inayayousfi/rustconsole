@@ -12,5 +12,5 @@ path = "src/main.rs"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 raw-window-handle.workspace = true
-sdl3 = { workspace = true, features = ["build-from-source-static", "raw-window-handle"] }
+sdl3 = { workspace = true, features = ["raw-window-handle"] }
 windows.workspace = true

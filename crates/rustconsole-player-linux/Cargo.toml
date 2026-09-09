@@ -23,4 +23,4 @@ glow.workspace = true
 gtk.workspace = true
 keyring.workspace = true
 libc.workspace = true
-sdl3 = { workspace = true, features = ["use-pkg-config"] }
+sdl3.workspace = true
