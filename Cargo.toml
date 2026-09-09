@@ -39,6 +39,7 @@ sha2 = "=0.10.9"
 tokio = { version = "=1.47.1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 tauri = { version = "=2.11.5", default-features = false, features = ["wry"] }
 tauri-build = { version = "=2.6.3", default-features = false, features = ["config-json"] }
+tauri-winres = "=0.3.6"
 webkit2gtk = "=2.0.2"
 windows-service = "0.8.1"
 windows = { version = "0.62.2", features = [

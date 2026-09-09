@@ -12,7 +12,10 @@ use rustconsole_render::{DecodedVideoColor, OverlayStatistics, PlayerVideoBacken
 use rustconsole_render_vulkan::{VulkanOutputPreference, VulkanRenderer};
 use rustconsole_render_vulkan_linux::DmaBufFrameImporter;
 use sdl3::event::{Event, WindowEvent};
+use sdl3::iostream::IOStream;
 use sdl3::mouse::MouseButton;
+use sdl3::surface::Surface;
+use sdl3::video::Window;
 use std::collections::VecDeque;
 use std::io::{BufReader, BufWriter};
 use std::path::Path;
@@ -23,6 +26,21 @@ use std::time::{Duration, Instant};
 
 const RENDERING_BACKEND_LABEL: &str = "Rendering backend: Vulkan";
 const RECONNECT_STABLE_RESET: Duration = Duration::from_secs(30);
+
+fn set_window_icon(window: &mut Window) {
+    let result = (|| -> Result<(), sdl3::Error> {
+        let mut icon_stream = IOStream::from_bytes(include_bytes!("../../../assets/icon.bmp"))?;
+        let icon = Surface::load_bmp_rw(&mut icon_stream)?;
+        if window.set_icon(&icon) {
+            Ok(())
+        } else {
+            Err(sdl3::get_error())
+        }
+    })();
+    if let Err(error) = result {
+        eprintln!("rustconsole-player: could not set window icon: {error}");
+    }
+}
 
 fn reconnect_backoff(seed: Option<u64>) -> impl backon::Backoff {
     let mut builder = backon::ExponentialBuilder::default()
@@ -82,6 +100,7 @@ fn run_surface_proof(report: &Path) -> Result<(), Box<dyn std::error::Error>> {
         .vulkan()
         .build()
         .map_err(|error| error.to_string())?;
+    set_window_icon(&mut window);
     if !window.show() {
         return Err(sdl3::get_error().into());
     }
@@ -248,6 +267,7 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
         .vulkan()
         .build()
         .map_err(|error| error.to_string())?;
+    set_window_icon(&mut window);
     let mut event_pump = sdl.event_pump()?;
     let audio_queue = AudioPlaybackQueue::default();
     let mut audio_output = SdlAudioOutput::new(&sdl);

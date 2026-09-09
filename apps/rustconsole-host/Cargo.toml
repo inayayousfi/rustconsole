@@ -13,3 +13,6 @@ path = "src/main.rs"
 [dependencies]
 clap.workspace = true
 rustconsole-host-windows.workspace = true
+
+[build-dependencies]
+tauri-winres.workspace = true

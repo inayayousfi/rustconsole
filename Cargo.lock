@@ -3736,6 +3736,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "rustconsole-host-windows",
+ "tauri-winres",
 ]
 
 [[package]]
