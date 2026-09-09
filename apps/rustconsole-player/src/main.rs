@@ -3,6 +3,7 @@ use rustconsole_player_core::StreamProgress;
 use rustconsole_player_core::process_protocol::{
     LaunchRequest, PlayerCommand, PlayerEvent, read_command, write_event,
 };
+use rustconsole_player_gui::{GuiFrame, PlayerGui, PlayerGuiAction, PlayerGuiView, PointerButton};
 use rustconsole_player_linux::{
     AudioPlaybackQueue, AudioPlaybackSnapshot, Av1ColorDescription, DecodedVideoFrame,
     DmaBufFrameFormat, NativeDmaBufFrame, SdlAudioOutput, StreamCallbacks, VideoStreamSample,
@@ -15,7 +16,7 @@ use sdl3::event::{Event, WindowEvent};
 use sdl3::iostream::IOStream;
 use sdl3::mouse::MouseButton;
 use sdl3::surface::Surface;
-use sdl3::video::Window;
+use sdl3::video::{FullscreenType, Window};
 use std::collections::VecDeque;
 use std::io::{BufReader, BufWriter};
 use std::path::Path;
@@ -105,21 +106,39 @@ fn run_surface_proof(report: &Path) -> Result<(), Box<dyn std::error::Error>> {
         return Err(sdl3::get_error().into());
     }
     let mut events = sdl.event_pump()?;
-    let mut renderer =
-        VulkanRenderer::new(&window, DmaBufFrameImporter, VulkanOutputPreference::Sdr)?;
+    let mut gui = PlayerGui::default();
+    let mut renderer = VulkanRenderer::new(
+        &window,
+        DmaBufFrameImporter,
+        VulkanOutputPreference::Sdr,
+        gui.context(),
+    )?;
     let (width, height) = window.size_in_pixels();
-    renderer.present_loading(
-        width.max(1),
-        height.max(1),
+    let (logical_width, logical_height) = window.size();
+    gui.update_viewport(
+        logical_width as f32,
+        logical_height as f32,
+        width as f32 / logical_width.max(1) as f32,
+        0.0,
+    );
+    let (loading_gui, _) = gui.frame(PlayerGuiView {
+        fullscreen: false,
+        status: Some("Video negotiated\nWaiting for host packets\nWaiting 0.2 seconds"),
+        diagnostics: "",
+    });
+    renderer.present_loading(width.max(1), height.max(1), 0.25, loading_gui)?;
+    gui.update_viewport(
+        logical_width as f32,
+        logical_height as f32,
+        width as f32 / logical_width.max(1) as f32,
         0.25,
-        "Video negotiated\nWaiting for host packets",
-    )?;
-    renderer.present(
-        &frame,
-        width.max(1),
-        height.max(1),
-        "SDL3 Vulkan DMA-BUF\nfixture frame",
-    )?;
+    );
+    let (frame_gui, _) = gui.frame(PlayerGuiView {
+        fullscreen: false,
+        status: None,
+        diagnostics: "SDL3 Vulkan DMA-BUF\nfixture frame",
+    });
+    renderer.present(&frame, width.max(1), height.max(1), frame_gui)?;
     let deadline = std::time::Instant::now() + Duration::from_secs(1);
     while std::time::Instant::now() < deadline {
         for _ in events.poll_iter() {}
@@ -127,7 +146,7 @@ fn run_surface_proof(report: &Path) -> Result<(), Box<dyn std::error::Error>> {
     }
     std::fs::write(
         report,
-        "status=ok\nrenderer=sdl3-vulkan-dma-buf\nloading=procedural-draw-submitted\noverlay=glyph-atlas-draw-submitted\npixel_readback=not-performed\n",
+        "status=ok\nrenderer=sdl3-vulkan-dma-buf\nloading=procedural-draw-submitted\noverlay=egui-draw-submitted\npixel_readback=not-performed\n",
     )?;
     Ok(())
 }
@@ -292,7 +311,11 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
         audio_queue.clone(),
     );
 
-    let mut renderer = None::<Box<dyn PlayerVideoBackend<NativeDmaBufFrame, Error = String>>>;
+    let mut gui = PlayerGui::default();
+    let gui_started = Instant::now();
+    let mut pointer_routing = PointerRouting::default();
+    let mut renderer =
+        None::<Box<dyn PlayerVideoBackend<NativeDmaBufFrame, GuiFrame, Error = String>>>;
     let mut last_frame = None::<(u64, Av1ColorDescription, NativeDmaBufFrame)>;
     let mut pending_video_timestamp = None;
     let mut video_clock = None::<VideoPlaybackClock>;
@@ -560,16 +583,41 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
                         });
                     }
                 }
-                Event::MouseButtonDown { mouse_btn, .. } => {
-                    if let Some(button) = mouse_button(mouse_btn) {
+                Event::MouseButtonDown {
+                    mouse_btn, x, y, ..
+                } => {
+                    gui.pointer_moved(x, y);
+                    if let Some(gui_button) = gui_pointer_button(mouse_btn) {
+                        let captured = gui.captures_pointer_at(x, y);
+                        gui.pointer_button(x, y, gui_button, true);
+                        redraw = true;
+                        let Some(button) = mouse_button(mouse_btn) else {
+                            continue;
+                        };
+                        if pointer_routing.press(button, captured) {
+                            let _ = session.input.send(InputEvent::PointerButton {
+                                button,
+                                pressed: true,
+                            });
+                        }
+                    } else if let Some(button) = mouse_button(mouse_btn) {
                         let _ = session.input.send(InputEvent::PointerButton {
                             button,
                             pressed: true,
                         });
                     }
                 }
-                Event::MouseButtonUp { mouse_btn, .. } => {
-                    if let Some(button) = mouse_button(mouse_btn) {
+                Event::MouseButtonUp {
+                    mouse_btn, x, y, ..
+                } => {
+                    gui.pointer_moved(x, y);
+                    if let Some(gui_button) = gui_pointer_button(mouse_btn) {
+                        gui.pointer_button(x, y, gui_button, false);
+                        redraw = true;
+                    }
+                    if let Some(button) = mouse_button(mouse_btn)
+                        && pointer_routing.release(button)
+                    {
                         let _ = session.input.send(InputEvent::PointerButton {
                             button,
                             pressed: false,
@@ -577,14 +625,32 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 Event::MouseMotion { x, y, .. } => {
+                    gui.pointer_moved(x, y);
+                    redraw = true;
                     let (width, height) = window.size();
-                    if width > 1 && height > 1 && x >= 0.0 && y >= 0.0 {
+                    if !gui.captures_pointer_at(x, y)
+                        && width > 1
+                        && height > 1
+                        && x >= 0.0
+                        && y >= 0.0
+                    {
                         let x = ((x * 32767.0) / (width - 1) as f32).clamp(0.0, 32767.0) as u16;
                         let y = ((y * 32767.0) / (height - 1) as f32).clamp(0.0, 32767.0) as u16;
                         let _ = session.input.try_send(InputEvent::PointerPosition { x, y });
                     }
                 }
-                Event::MouseWheel { x, y, .. } => {
+                Event::MouseWheel {
+                    x,
+                    y,
+                    mouse_x,
+                    mouse_y,
+                    ..
+                } => {
+                    gui.mouse_wheel(x, y);
+                    redraw = true;
+                    if gui.captures_pointer_at(mouse_x, mouse_y) {
+                        continue;
+                    }
                     let horizontal = x.clamp(i16::MIN as f32, i16::MAX as f32) as i16;
                     let vertical = y.clamp(i16::MIN as f32, i16::MAX as f32) as i16;
                     if horizontal != 0 || vertical != 0 {
@@ -598,6 +664,27 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
                     win_event: WindowEvent::PixelSizeChanged(_, _),
                     ..
                 } => redraw = true,
+                Event::Window {
+                    win_event: WindowEvent::MouseLeave,
+                    ..
+                } => {
+                    gui.pointer_gone();
+                    redraw = true;
+                }
+                Event::Window {
+                    win_event: WindowEvent::FocusGained,
+                    ..
+                } => {
+                    gui.set_focused(true);
+                    redraw = true;
+                }
+                Event::Window {
+                    win_event: WindowEvent::FocusLost,
+                    ..
+                } => {
+                    gui.set_focused(false);
+                    redraw = true;
+                }
                 _ => {}
             }
         }
@@ -620,14 +707,35 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
         }
         if (authenticated || recovering) && redraw {
             if renderer.is_none() {
+                gui.reset_renderer();
                 renderer = Some(Box::new(VulkanRenderer::new(
                     &window,
                     DmaBufFrameImporter,
                     output_preference,
+                    gui.context(),
                 )?));
             }
+            let (logical_width, logical_height) = window.size();
             let (width, height) = window.size_in_pixels();
+            gui.update_viewport(
+                logical_width as f32,
+                logical_height as f32,
+                width as f32 / logical_width.max(1) as f32,
+                gui_started.elapsed().as_secs_f64(),
+            );
+            let fullscreen = window.fullscreen_state() != FullscreenType::Off;
+            let diagnostics = if gui.diagnostics_visible() {
+                overlay.text("Streaming")
+            } else {
+                String::new()
+            };
+            redraw = false;
             if let Some(frame) = &last_frame {
+                let (gui_frame, gui_action) = gui.frame(PlayerGuiView {
+                    fullscreen,
+                    status: None,
+                    diagnostics: &diagnostics,
+                });
                 renderer.as_mut().unwrap().present_frame(
                     &frame.2,
                     match frame.1 {
@@ -636,7 +744,7 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
                     },
                     width.max(1),
                     height.max(1),
-                    &overlay.text("Streaming"),
+                    gui_frame,
                 )?;
                 if let Some(captured_at_micros) = pending_video_timestamp.take() {
                     video_clock = Some(VideoPlaybackClock {
@@ -650,20 +758,35 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
                     stable_since = Some(Instant::now());
                     write_event(&mut events, &PlayerEvent::Started)?;
                 }
+                if let Some(action) = gui_action {
+                    apply_gui_action(action, &mut window);
+                    redraw = true;
+                }
             } else {
+                let elapsed_seconds = loading_started.unwrap().elapsed().as_secs_f32();
                 let loading_overlay = format!(
-                    "{RENDERING_BACKEND_LABEL}\n{loading_status}\n{}",
-                    overlay.audio_text()
+                    "{RENDERING_BACKEND_LABEL}\n{loading_status}\n{}\nWaiting {:.1} seconds",
+                    overlay.audio_text(),
+                    elapsed_seconds,
                 );
+                let (gui_frame, gui_action) = gui.frame(PlayerGuiView {
+                    fullscreen,
+                    status: Some(&loading_overlay),
+                    diagnostics: &diagnostics,
+                });
                 renderer.as_mut().unwrap().present_loading(
                     width.max(1),
                     height.max(1),
-                    loading_started.unwrap().elapsed().as_secs_f32(),
-                    &loading_overlay,
+                    elapsed_seconds,
+                    gui_frame,
                 )?;
                 loading_presented = Instant::now();
+                if let Some(action) = gui_action {
+                    apply_gui_action(action, &mut window);
+                    redraw = true;
+                }
             }
-            redraw = false;
+            redraw |= gui.context().has_requested_repaint();
         }
         if should_reset_reconnect_backoff(recovering, stable_since.map(|started| started.elapsed()))
         {
@@ -699,6 +822,66 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
         Err(error) => write_event(&mut events, &PlayerEvent::Error(error))?,
     }
     Ok(())
+}
+
+fn apply_gui_action(action: PlayerGuiAction, window: &mut Window) {
+    match action {
+        PlayerGuiAction::ToggleFullscreen => {
+            let fullscreen = window.fullscreen_state() == FullscreenType::Off;
+            if let Err(error) = window.set_fullscreen(fullscreen) {
+                eprintln!("rustconsole-player: could not change fullscreen state: {error}");
+            }
+        }
+    }
+}
+
+fn gui_pointer_button(button: MouseButton) -> Option<PointerButton> {
+    match button {
+        MouseButton::Left => Some(PointerButton::Primary),
+        MouseButton::Right => Some(PointerButton::Secondary),
+        MouseButton::Middle => Some(PointerButton::Middle),
+        MouseButton::X1 => Some(PointerButton::Extra1),
+        MouseButton::X2 => Some(PointerButton::Extra2),
+        _ => None,
+    }
+}
+
+#[derive(Default)]
+struct PointerRouting {
+    gui_buttons: u8,
+    host_buttons: u8,
+}
+
+impl PointerRouting {
+    fn press(&mut self, button: u8, captured_by_gui: bool) -> bool {
+        let mask = pointer_button_mask(button);
+        if self.host_buttons & mask != 0 {
+            return true;
+        }
+        if self.gui_buttons & mask != 0 {
+            return false;
+        }
+        if captured_by_gui {
+            self.gui_buttons |= mask;
+            false
+        } else {
+            self.host_buttons |= mask;
+            true
+        }
+    }
+
+    fn release(&mut self, button: u8) -> bool {
+        let mask = pointer_button_mask(button);
+        self.gui_buttons &= !mask;
+        let sent_to_host = self.host_buttons & mask != 0;
+        self.host_buttons &= !mask;
+        sent_to_host
+    }
+}
+
+fn pointer_button_mask(button: u8) -> u8 {
+    1_u8.checked_shl(u32::from(button.saturating_sub(1)))
+        .unwrap_or(0)
 }
 
 fn mouse_button(button: MouseButton) -> Option<u8> {
@@ -896,6 +1079,21 @@ mod tests {
             false,
             Some(Duration::from_secs(30))
         ));
+    }
+
+    #[test]
+    fn pointer_release_follows_a_gui_captured_press() {
+        let mut routing = PointerRouting::default();
+        assert!(!routing.press(1, true));
+        assert!(!routing.release(1));
+    }
+
+    #[test]
+    fn pointer_release_reaches_the_host_after_crossing_the_gui() {
+        let mut routing = PointerRouting::default();
+        assert!(routing.press(1, false));
+        assert!(routing.release(1));
+        assert!(!routing.release(1));
     }
 
     #[test]

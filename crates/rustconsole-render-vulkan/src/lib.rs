@@ -1,17 +1,17 @@
 //! Cross-platform Vulkan presentation through an SDL window.
 
 mod color;
-mod overlay;
 
 pub use color::{VideoColorMode, VideoColorParameters};
 
 use ash::{Entry, vk};
+use egui::epaint::Primitive;
+use egui::{ClippedPrimitive, Color32, FullOutput, TextureId};
+use egui_ash_renderer::{Options as EguiRendererOptions, Renderer as EguiRenderer};
 use rustconsole_render::{DecodedVideoColor, PlayerVideoBackend};
 use std::ffi::{CStr, CString};
 use std::io::Cursor;
 use std::marker::PhantomData;
-
-use overlay::VulkanOverlay;
 
 const FRAMES_IN_FLIGHT: usize = 2;
 
@@ -75,7 +75,8 @@ where
     descriptor_pool: vk::DescriptorPool,
     sampler: vk::Sampler,
     command_pool: vk::CommandPool,
-    overlay: VulkanOverlay,
+    gui_context: egui::Context,
+    gui_renderer: Option<EguiRenderer>,
     frames: Vec<FrameState<Importer::Imported>>,
     frame_index: usize,
     memory_properties: vk::PhysicalDeviceMemoryProperties,
@@ -95,6 +96,7 @@ where
         window: &sdl3::video::Window,
         importer: Importer,
         output_preference: VulkanOutputPreference,
+        gui_context: egui::Context,
     ) -> Result<Self, String> {
         let entry = unsafe { Entry::load() }.map_err(|error| error.to_string())?;
         let application = vk::ApplicationInfo::default()
@@ -194,15 +196,21 @@ where
             .command_buffer_count(FRAMES_IN_FLIGHT as u32);
         let command_buffers = unsafe { device.allocate_command_buffers(&command_info) }
             .map_err(|error| error.to_string())?;
-        let overlay = VulkanOverlay::new(
-            &device,
-            &memory_properties,
-            queue,
-            command_pool,
+        let gui_renderer = EguiRenderer::with_default_allocator(
+            &instance,
+            physical_device,
+            device.clone(),
             render_pass,
-            FRAMES_IN_FLIGHT,
-            hdr10_output,
-        )?;
+            EguiRendererOptions {
+                in_flight_frames: FRAMES_IN_FLIGHT,
+                srgb_framebuffer: matches!(
+                    swapchain_format,
+                    vk::Format::B8G8R8A8_SRGB | vk::Format::R8G8B8A8_SRGB
+                ),
+                ..Default::default()
+            },
+        )
+        .map_err(|error| error.to_string())?;
         let mut frames = Vec::with_capacity(FRAMES_IN_FLIGHT);
         for (descriptor_set, command_buffer) in descriptor_sets.into_iter().zip(command_buffers) {
             let semaphore_info = vk::SemaphoreCreateInfo::default();
@@ -217,6 +225,7 @@ where
                 command_buffer,
                 descriptor_set,
                 imported: None,
+                gui_textures_to_free: Vec::new(),
             });
         }
 
@@ -239,7 +248,8 @@ where
             descriptor_pool,
             sampler,
             command_pool,
-            overlay,
+            gui_context,
+            gui_renderer: Some(gui_renderer),
             frames,
             frame_index: 0,
             memory_properties,
@@ -269,32 +279,40 @@ where
         width: u32,
         height: u32,
         elapsed_seconds: f32,
-        status: &str,
+        gui: FullOutput,
     ) -> Result<(), String> {
         if self.swapchain.as_ref().is_none_or(|swapchain| {
             swapchain.extent.width != width || swapchain.extent.height != height
         }) {
             self.recreate_swapchain(width, height)?;
         }
-        let swapchain = self
+        let swapchain_handle = self
             .swapchain
             .as_ref()
-            .ok_or("Vulkan swapchain is unavailable")?;
-        let frame_state = &mut self.frames[self.frame_index];
-        let command_buffer = frame_state.command_buffer;
-        let image_available = frame_state.image_available;
-        let render_finished = frame_state.render_finished;
-        let fence = frame_state.fence;
+            .ok_or("Vulkan swapchain is unavailable")?
+            .handle;
+        let frame_index = self.frame_index;
+        let (command_buffer, image_available, render_finished, fence) = {
+            let frame = &mut self.frames[frame_index];
+            frame.imported = None;
+            (
+                frame.command_buffer,
+                frame.image_available,
+                frame.render_finished,
+                frame.fence,
+            )
+        };
         unsafe {
             self.device
                 .wait_for_fences(&[fence], true, u64::MAX)
                 .map_err(|error| error.to_string())?;
         }
-        frame_state.imported = None;
+        self.release_gui_textures(frame_index)?;
+        let prepared_gui = self.prepare_gui(gui)?;
 
         let acquired = unsafe {
             self.swapchain_loader.acquire_next_image(
-                swapchain.handle,
+                swapchain_handle,
                 u64::MAX,
                 image_available,
                 vk::Fence::null(),
@@ -304,6 +322,11 @@ where
             Ok(value) => value,
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
                 self.recreate_swapchain(width, height)?;
+                self.gui_renderer
+                    .as_mut()
+                    .unwrap()
+                    .free_textures(&prepared_gui.textures_to_free)
+                    .map_err(|error| error.to_string())?;
                 return Ok(());
             }
             Err(error) => return Err(error.to_string()),
@@ -313,7 +336,7 @@ where
                 .reset_fences(&[fence])
                 .map_err(|error| error.to_string())?;
         }
-        self.record_loading_commands(command_buffer, image_index, elapsed_seconds, status)?;
+        self.record_loading_commands(command_buffer, image_index, elapsed_seconds, &prepared_gui)?;
 
         let wait_semaphores = [image_available];
         let signal_semaphores = [render_finished];
@@ -329,8 +352,9 @@ where
                 .queue_submit(self.queue, &[submit], fence)
                 .map_err(|error| error.to_string())?;
         }
+        self.frames[frame_index].gui_textures_to_free = prepared_gui.textures_to_free;
 
-        let swapchains = [swapchain.handle];
+        let swapchains = [swapchain_handle];
         let indices = [image_index];
         let present = vk::PresentInfoKHR::default()
             .wait_semaphores(&signal_semaphores)
@@ -353,33 +377,41 @@ where
         frame: &Frame,
         width: u32,
         height: u32,
-        overlay_text: &str,
+        gui: FullOutput,
     ) -> Result<(), String> {
         if self.swapchain.as_ref().is_none_or(|swapchain| {
             swapchain.extent.width != width || swapchain.extent.height != height
         }) {
             self.recreate_swapchain(width, height)?;
         }
-        let swapchain = self
+        let swapchain_handle = self
             .swapchain
             .as_ref()
-            .ok_or("Vulkan swapchain is unavailable")?;
-        let frame_state = &mut self.frames[self.frame_index];
-        let command_buffer = frame_state.command_buffer;
-        let descriptor_set = frame_state.descriptor_set;
-        let image_available = frame_state.image_available;
-        let render_finished = frame_state.render_finished;
-        let fence = frame_state.fence;
+            .ok_or("Vulkan swapchain is unavailable")?
+            .handle;
+        let frame_index = self.frame_index;
+        let (command_buffer, descriptor_set, image_available, render_finished, fence) = {
+            let frame = &mut self.frames[frame_index];
+            frame.imported = None;
+            (
+                frame.command_buffer,
+                frame.descriptor_set,
+                frame.image_available,
+                frame.render_finished,
+                frame.fence,
+            )
+        };
         unsafe {
             self.device
                 .wait_for_fences(&[fence], true, u64::MAX)
                 .map_err(|error| error.to_string())?;
         }
-        frame_state.imported = None;
+        self.release_gui_textures(frame_index)?;
+        let prepared_gui = self.prepare_gui(gui)?;
 
         let acquired = unsafe {
             self.swapchain_loader.acquire_next_image(
-                swapchain.handle,
+                swapchain_handle,
                 u64::MAX,
                 image_available,
                 vk::Fence::null(),
@@ -389,6 +421,11 @@ where
             Ok(value) => value,
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
                 self.recreate_swapchain(width, height)?;
+                self.gui_renderer
+                    .as_mut()
+                    .unwrap()
+                    .free_textures(&prepared_gui.textures_to_free)
+                    .map_err(|error| error.to_string())?;
                 return Ok(());
             }
             Err(error) => return Err(error.to_string()),
@@ -438,7 +475,7 @@ where
             descriptor_set,
             &imported,
             image_index,
-            overlay_text,
+            &prepared_gui,
         )?;
 
         let wait_semaphores = [image_available];
@@ -456,8 +493,9 @@ where
                 .map_err(|error| error.to_string())?;
         }
         self.frames[self.frame_index].imported = Some(imported);
+        self.frames[frame_index].gui_textures_to_free = prepared_gui.textures_to_free;
 
-        let swapchains = [swapchain.handle];
+        let swapchains = [swapchain_handle];
         let indices = [image_index];
         let present = vk::PresentInfoKHR::default()
             .wait_semaphores(&signal_semaphores)
@@ -475,15 +513,49 @@ where
         Ok(())
     }
 
+    fn release_gui_textures(&mut self, frame_index: usize) -> Result<(), String> {
+        let textures = std::mem::take(&mut self.frames[frame_index].gui_textures_to_free);
+        self.gui_renderer
+            .as_mut()
+            .unwrap()
+            .free_textures(&textures)
+            .map_err(|error| error.to_string())
+    }
+
+    fn prepare_gui(&mut self, output: FullOutput) -> Result<PreparedGui, String> {
+        let FullOutput {
+            textures_delta,
+            shapes,
+            pixels_per_point,
+            ..
+        } = output;
+        self.gui_renderer
+            .as_mut()
+            .unwrap()
+            .set_textures(self.queue, self.command_pool, &textures_delta.set)
+            .map_err(|error| error.to_string())?;
+        let mut primitives = self.gui_context.tessellate(shapes, pixels_per_point);
+        if self.hdr10_output {
+            convert_gui_to_hdr10(&mut primitives);
+        }
+        Ok(PreparedGui {
+            primitives,
+            pixels_per_point,
+            textures_to_free: textures_delta.free,
+        })
+    }
+
     fn record_commands(
-        &self,
+        &mut self,
         command_buffer: vk::CommandBuffer,
         descriptor_set: vk::DescriptorSet,
         imported: &Importer::Imported,
         image_index: u32,
-        overlay_text: &str,
+        gui: &PreparedGui,
     ) -> Result<(), String> {
         let swapchain = self.swapchain.as_ref().unwrap();
+        let extent = swapchain.extent;
+        let framebuffer = swapchain.framebuffers[image_index as usize];
         unsafe {
             self.device
                 .reset_command_buffer(command_buffer, vk::CommandBufferResetFlags::empty())
@@ -526,10 +598,10 @@ where
             }];
             let render_pass = vk::RenderPassBeginInfo::default()
                 .render_pass(self.render_pass)
-                .framebuffer(swapchain.framebuffers[image_index as usize])
+                .framebuffer(framebuffer)
                 .render_area(vk::Rect2D {
                     offset: vk::Offset2D::default(),
-                    extent: swapchain.extent,
+                    extent,
                 })
                 .clear_values(&clear);
             self.device.cmd_begin_render_pass(
@@ -562,9 +634,9 @@ where
                 0,
                 &[vk::Viewport {
                     x: 0.0,
-                    y: swapchain.extent.height as f32,
-                    width: swapchain.extent.width as f32,
-                    height: -(swapchain.extent.height as f32),
+                    y: extent.height as f32,
+                    width: extent.width as f32,
+                    height: -(extent.height as f32),
                     min_depth: 0.0,
                     max_depth: 1.0,
                 }],
@@ -574,16 +646,22 @@ where
                 0,
                 &[vk::Rect2D {
                     offset: vk::Offset2D::default(),
-                    extent: swapchain.extent,
+                    extent,
                 }],
             );
             self.device.cmd_draw(command_buffer, 3, 1, 0, 0);
-            self.overlay.record(
+        }
+        self.gui_renderer
+            .as_mut()
+            .unwrap()
+            .cmd_draw(
                 command_buffer,
-                self.frame_index,
-                swapchain.extent,
-                overlay_text,
-            );
+                extent,
+                gui.pixels_per_point,
+                &gui.primitives,
+            )
+            .map_err(|error| error.to_string())?;
+        unsafe {
             self.device.cmd_end_render_pass(command_buffer);
             self.device
                 .end_command_buffer(command_buffer)
@@ -593,16 +671,18 @@ where
     }
 
     fn record_loading_commands(
-        &self,
+        &mut self,
         command_buffer: vk::CommandBuffer,
         image_index: u32,
         elapsed_seconds: f32,
-        status: &str,
+        gui: &PreparedGui,
     ) -> Result<(), String> {
         let swapchain = self.swapchain.as_ref().unwrap();
+        let extent = swapchain.extent;
+        let framebuffer = swapchain.framebuffers[image_index as usize];
         let constants = [
             elapsed_seconds,
-            swapchain.extent.width as f32 / swapchain.extent.height.max(1) as f32,
+            extent.width as f32 / extent.height.max(1) as f32,
             if self.hdr10_output { 1.0 } else { 0.0 },
         ];
         let constant_bytes = unsafe {
@@ -629,10 +709,10 @@ where
             }];
             let render_pass = vk::RenderPassBeginInfo::default()
                 .render_pass(self.render_pass)
-                .framebuffer(swapchain.framebuffers[image_index as usize])
+                .framebuffer(framebuffer)
                 .render_area(vk::Rect2D {
                     offset: vk::Offset2D::default(),
-                    extent: swapchain.extent,
+                    extent,
                 })
                 .clear_values(&clear);
             self.device.cmd_begin_render_pass(
@@ -657,9 +737,9 @@ where
                 0,
                 &[vk::Viewport {
                     x: 0.0,
-                    y: swapchain.extent.height as f32,
-                    width: swapchain.extent.width as f32,
-                    height: -(swapchain.extent.height as f32),
+                    y: extent.height as f32,
+                    width: extent.width as f32,
+                    height: -(extent.height as f32),
                     min_depth: 0.0,
                     max_depth: 1.0,
                 }],
@@ -669,13 +749,22 @@ where
                 0,
                 &[vk::Rect2D {
                     offset: vk::Offset2D::default(),
-                    extent: swapchain.extent,
+                    extent,
                 }],
             );
             self.device.cmd_draw(command_buffer, 3, 1, 0, 0);
-            let text = format!("{status}\nWaiting {:.1} seconds", elapsed_seconds);
-            self.overlay
-                .record(command_buffer, self.frame_index, swapchain.extent, &text);
+        }
+        self.gui_renderer
+            .as_mut()
+            .unwrap()
+            .cmd_draw(
+                command_buffer,
+                extent,
+                gui.pixels_per_point,
+                &gui.primitives,
+            )
+            .map_err(|error| error.to_string())?;
+        unsafe {
             self.device.cmd_end_render_pass(command_buffer);
             self.device
                 .end_command_buffer(command_buffer)
@@ -727,7 +816,7 @@ where
         if let Some(mut swapchain) = self.swapchain.take() {
             swapchain.destroy(&self.device, &self.swapchain_loader);
         }
-        self.overlay.destroy();
+        drop(self.gui_renderer.take());
         unsafe {
             self.device.destroy_command_pool(self.command_pool, None);
             self.device.destroy_sampler(self.sampler, None);
@@ -749,7 +838,7 @@ where
     }
 }
 
-impl<Importer, Frame> PlayerVideoBackend<Frame> for VulkanRenderer<Importer, Frame>
+impl<Importer, Frame> PlayerVideoBackend<Frame, FullOutput> for VulkanRenderer<Importer, Frame>
 where
     Importer: VulkanFrameImporter<Frame>,
 {
@@ -761,10 +850,10 @@ where
         color: DecodedVideoColor,
         width: u32,
         height: u32,
-        overlay_text: &str,
+        gui: FullOutput,
     ) -> Result<(), Self::Error> {
         self.color_parameters = color::parameters_for_decoded_color(color, self.hdr10_output);
-        self.present(frame, width, height, overlay_text)
+        self.present(frame, width, height, gui)
     }
 
     fn present_loading(
@@ -772,10 +861,16 @@ where
         width: u32,
         height: u32,
         elapsed_seconds: f32,
-        status: &str,
+        gui: FullOutput,
     ) -> Result<(), Self::Error> {
-        VulkanRenderer::present_loading(self, width, height, elapsed_seconds, status)
+        VulkanRenderer::present_loading(self, width, height, elapsed_seconds, gui)
     }
+}
+
+struct PreparedGui {
+    primitives: Vec<ClippedPrimitive>,
+    pixels_per_point: f32,
+    textures_to_free: Vec<TextureId>,
 }
 
 struct FrameState<Imported> {
@@ -785,6 +880,44 @@ struct FrameState<Imported> {
     command_buffer: vk::CommandBuffer,
     descriptor_set: vk::DescriptorSet,
     imported: Option<Imported>,
+    gui_textures_to_free: Vec<TextureId>,
+}
+
+fn convert_gui_to_hdr10(primitives: &mut [ClippedPrimitive]) {
+    for primitive in primitives {
+        let Primitive::Mesh(mesh) = &mut primitive.primitive else {
+            continue;
+        };
+        for vertex in &mut mesh.vertices {
+            let [red, green, blue, alpha] = vertex.color.to_srgba_unmultiplied();
+            vertex.color = Color32::from_rgba_unmultiplied(
+                gui_channel_to_hdr10(red),
+                gui_channel_to_hdr10(green),
+                gui_channel_to_hdr10(blue),
+                alpha,
+            );
+        }
+    }
+}
+
+fn gui_channel_to_hdr10(channel: u8) -> u8 {
+    let srgb = channel as f32 / 255.0;
+    let linear = if srgb <= 0.04045 {
+        srgb / 12.92
+    } else {
+        ((srgb + 0.055) / 1.055).powf(2.4)
+    };
+    (pq_encode(linear * 203.0) * 255.0).round() as u8
+}
+
+fn pq_encode(nits: f32) -> f32 {
+    let m1 = 2610.0 / 16384.0;
+    let m2 = 2523.0 / 32.0;
+    let c1 = 3424.0 / 4096.0;
+    let c2 = 2413.0 / 128.0;
+    let c3 = 2392.0 / 128.0;
+    let p = (nits.max(0.0) / 10_000.0).powf(m1);
+    ((c1 + c2 * p) / (1.0 + c3 * p)).powf(m2)
 }
 
 struct SwapchainState {
@@ -1158,5 +1291,17 @@ fn color_subresource_range() -> vk::ImageSubresourceRange {
         level_count: 1,
         base_array_layer: 0,
         layer_count: 1,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hdr_gui_channels_map_sdr_white_to_reference_white() {
+        assert_eq!(gui_channel_to_hdr10(0), 0);
+        assert!((145..=151).contains(&gui_channel_to_hdr10(255)));
+        assert!(gui_channel_to_hdr10(128) < gui_channel_to_hdr10(255));
     }
 }

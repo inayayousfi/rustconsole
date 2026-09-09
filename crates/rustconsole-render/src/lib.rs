@@ -18,7 +18,7 @@ pub enum DecodedVideoColor {
     Bt2020PqLimited,
 }
 
-pub trait PlayerVideoBackend<Frame> {
+pub trait PlayerVideoBackend<Frame, GuiFrame> {
     type Error;
 
     fn present_frame(
@@ -27,7 +27,7 @@ pub trait PlayerVideoBackend<Frame> {
         color: DecodedVideoColor,
         width: u32,
         height: u32,
-        overlay_text: &str,
+        gui: GuiFrame,
     ) -> Result<(), Self::Error>;
 
     fn present_loading(
@@ -35,6 +35,6 @@ pub trait PlayerVideoBackend<Frame> {
         width: u32,
         height: u32,
         elapsed_seconds: f32,
-        status: &str,
+        gui: GuiFrame,
     ) -> Result<(), Self::Error>;
 }

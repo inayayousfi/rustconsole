@@ -1,5 +1,5 @@
 [package]
-name = "rustconsole-render-vulkan"
+name = "rustconsole-player-gui"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,8 +10,4 @@ publish.workspace = true
 path = "src/lib.rs"
 
 [dependencies]
-ash.workspace = true
 egui.workspace = true
-egui-ash-renderer.workspace = true
-rustconsole-render.workspace = true
-sdl3.workspace = true

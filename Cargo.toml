@@ -14,10 +14,11 @@ license = "GPL-3.0-only"
 backon = { version = "=1.6.0", default-features = false, features = ["std"] }
 bytes = "=1.12.1"
 clap = { version = "4.5", features = ["derive"] }
+egui = { version = "=0.33.0", default-features = false, features = ["default_fonts"] }
+egui-ash-renderer = { version = "=0.10.0", default-features = false }
 ash = "=0.38.0"
 cc = "1.2.38"
 ffmpeg-next = { version = "9.0.0", default-features = false, features = ["format"] }
-fontdue = "=0.9.3"
 glow = "=0.16.0"
 gdk = "=0.18.2"
 gdkwayland-sys = "=0.18.2"
@@ -89,6 +90,7 @@ rustconsole-render-vulkan = { path = "crates/rustconsole-render-vulkan" }
 rustconsole-render-vulkan-linux = { path = "crates/rustconsole-render-vulkan-linux" }
 rustconsole-session = { path = "crates/rustconsole-session" }
 rustconsole-player-core = { path = "crates/rustconsole-player-core" }
+rustconsole-player-gui = { path = "crates/rustconsole-player-gui" }
 rustconsole-player-linux = { path = "crates/rustconsole-player-linux" }
 zeroize = { version = "=1.8.1", features = ["std"] }
 

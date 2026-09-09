@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 backon.workspace = true
 rustconsole-player-core.workspace = true
+rustconsole-player-gui.workspace = true
 rustconsole-player-linux.workspace = true
 rustconsole-protocol.workspace = true
 rustconsole-render.workspace = true

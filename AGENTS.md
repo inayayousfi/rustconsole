@@ -39,20 +39,24 @@ Application crates are composition roots. They may connect libraries and deal wi
 
 Core crates define policy and orchestration. They must not call operating-system, user-interface, media-library, or graphics APIs directly.
 
+### Player interface crate
+
+- `crates/rustconsole-player-gui` owns the player-specific egui layout, local interface state, backend-independent pointer input, and player actions emitted by its controls. It receives status and diagnostic text from the player components that own those facts. It must not call SDL, a graphics API, session transport, or platform code.
+
 ### Neutral mechanism crates
 
 - `crates/rustconsole-protocol` owns stable domain values, wire messages, protocol and feature versions, AV1 negotiation, and protocol encoding limits. Both ends of a network exchange must agree with this crate.
 - `crates/rustconsole-session` owns shared connection mechanics: OPAQUE authentication, QUIC setup, connection binding, media and input datagrams, packet assembly, queue behavior, lifecycle primitives, and transport statistics. It does not decide host or player UI behavior.
 - `crates/rustconsole-media` owns platform-neutral media timestamps, audio and video data types, and codec interfaces. It contains no codec or device implementation.
 - `crates/rustconsole-discovery` owns discovery sources and candidate merging. It finds possible addresses through manual, LAN, or Tailscale information; authenticated network probing belongs to player orchestration.
-- `crates/rustconsole-render` owns platform-neutral player rendering contracts and overlay statistics. It must not contain a concrete graphics API implementation.
+- `crates/rustconsole-render` owns platform-neutral player rendering contracts and overlay statistics. Its video backend contract is generic over the composed interface frame so this crate does not depend on a GUI technology. It must not contain a concrete graphics API implementation.
 
 Neutral mechanism crates should describe one capability. Do not use them as dumping grounds for application orchestration or platform convenience code.
 
 ### Technology implementation crates
 
 - `crates/rustconsole-codec-ffmpeg` owns the FFmpeg implementation of codec and hardware-context behavior, including AV1 and Opus support. It is shared by host encoding and player decoding integrations.
-- `crates/rustconsole-render-vulkan` implements the neutral player rendering contract with Vulkan. It owns presentation, color conversion, overlays, swapchain behavior, and a generic frame-import contract. It does not own operating-system-specific frame import.
+- `crates/rustconsole-render-vulkan` implements the neutral player rendering contract with Vulkan. It owns presentation, color conversion, egui output composition, swapchain behavior, and a generic frame-import contract. It does not own player interface behavior or operating-system-specific frame import.
 
 Technology crates depend toward neutral contracts when one exists. A neutral crate must never depend on a technology implementation.
 

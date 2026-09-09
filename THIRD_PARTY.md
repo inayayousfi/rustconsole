@@ -6,11 +6,11 @@ Rust Console uses `ffmpeg-next` 9.0.0, licensed under the WTFPL, to call native 
 
 Rust Console uses `sdl3` 0.18.4, licensed under MIT, to create the native player window, receive native events, create the Vulkan surface, and run the Windows fullscreen stress application. The player and Windows stress application build SDL 3.4.14 statically from the source package locked by Cargo. SDL uses the zlib license.
 
-Rust Console uses `fontdue` 0.9.3 under its `MIT OR Apache-2.0 OR Zlib` license expression to rasterize the player overlay's glyph atlas.
+Rust Console uses `egui` 0.33.0 under its `MIT OR Apache-2.0` license expression to define the player controls and diagnostic presentation independently from the graphics backend. Its default-font feature embeds Hack Regular, Noto Emoji Regular, Ubuntu Light, and emoji-icon-font through `epaint_default_fonts` 0.33.3. That package is distributed under `(MIT OR Apache-2.0) AND OFL-1.1 AND Ubuntu-font-1.0` and includes the corresponding font notices in its Cargo source package.
+
+Rust Console uses `egui-ash-renderer` 0.10.0, licensed under MIT, to record egui drawing commands into the existing Vulkan render pass. Rust Console applies its HDR10 color conversion to egui mesh colors before those commands are recorded.
 
 Rust Console uses `backon` 1.6.0, licensed under Apache-2.0, to generate bounded exponential reconnection delays. Its `fastrand` 2.5.0 dependency, licensed under `Apache-2.0 OR MIT`, supplies the random jitter. Only BackON's `std` feature is enabled; its sleeping and asynchronous runtime integrations are disabled.
-
-Rust Console embeds the unmodified Liberation Mono Regular font in `crates/rustconsole-render-vulkan/assets/LiberationMono-Regular.ttf`. The font is copyright Google Corporation and Red Hat, Inc. and is distributed under the SIL Open Font License 1.1. The required full notice is preserved beside it in `LiberationMono-LICENSE.txt`. The font is uploaded as a glyph atlas and is not relicensed under the repository's GPL terms.
 
 Rust Console vendors `ffmpeg-sys-next` 9.0.0 under `vendor/ffmpeg-sys-next-9.0.0`, licensed under the WTFPL. Its `hwcontext_wrapper.h` excludes the VA-API wrapper when `_WIN32` is defined because the verified Windows vcpkg FFmpeg package installs `hwcontext_vaapi.h` without the Linux-only `va/va_x11.h` dependency. D3D11VA bindings remain enabled. Its Windows vcpkg link list includes `ncrypt`, `crypt32`, `mfuuid`, and `strmiids`, which are static system dependencies reported by the pinned FFmpeg 8.1.2 package but omitted by the released binding. No native FFmpeg source or behavior is changed.
 
