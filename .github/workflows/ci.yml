@@ -106,8 +106,8 @@ jobs:
         shell: pwsh
         run: ./scripts/check-windows-ffmpeg.ps1
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo check --workspace --all-targets
-      - run: cargo test --workspace
+      - run: cargo check --workspace --all-targets --exclude rustconsole-player --exclude rustconsole-player-linux --exclude rustconsole-render-vulkan-linux
+      - run: cargo test --workspace --exclude rustconsole-player --exclude rustconsole-player-linux --exclude rustconsole-render-vulkan-linux
       - run: node scripts/check-dependency-direction.mjs
 
   minimum-rust:
