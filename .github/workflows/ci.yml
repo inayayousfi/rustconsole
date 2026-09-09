@@ -14,7 +14,7 @@ concurrency:
 jobs:
   linux:
     name: Linux stable
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v5
       - name: Install native dependencies
@@ -23,16 +23,51 @@ jobs:
           sudo apt-get install -y \
             build-essential \
             clang \
+            cmake \
             curl \
             file \
+            git \
+            gnome-desktop-testing \
+            libasound2-dev \
+            libaudio-dev \
             libavcodec-dev \
             libavformat-dev \
             libavutil-dev \
             libayatana-appindicator3-dev \
+            libdbus-1-dev \
+            libdecor-0-dev \
+            libdrm-dev \
+            libegl1-mesa-dev \
+            libfribidi-dev \
+            libgbm-dev \
+            libgl1-mesa-dev \
+            libgles2-mesa-dev \
+            libibus-1.0-dev \
+            libjack-dev \
+            libpipewire-0.3-dev \
+            libpulse-dev \
             librsvg2-dev \
+            libsndio-dev \
             libssl-dev \
+            libthai-dev \
+            libudev-dev \
+            liburing-dev \
+            libusb-1.0-0-dev \
+            libwayland-dev \
             libwebkit2gtk-4.1-dev \
+            libx11-dev \
+            libxcursor-dev \
             libxdo-dev \
+            libxext-dev \
+            libxfixes-dev \
+            libxi-dev \
+            libxkbcommon-dev \
+            libxrandr-dev \
+            libxss-dev \
+            libxtst-dev \
+            make \
+            ninja-build \
+            pkg-config \
             wget
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -77,7 +112,7 @@ jobs:
 
   minimum-rust:
     name: Rust 1.95
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v5
       - name: Install native dependencies
@@ -86,16 +121,51 @@ jobs:
           sudo apt-get install -y \
             build-essential \
             clang \
+            cmake \
             curl \
             file \
+            git \
+            gnome-desktop-testing \
+            libasound2-dev \
+            libaudio-dev \
             libavcodec-dev \
             libavformat-dev \
             libavutil-dev \
             libayatana-appindicator3-dev \
+            libdbus-1-dev \
+            libdecor-0-dev \
+            libdrm-dev \
+            libegl1-mesa-dev \
+            libfribidi-dev \
+            libgbm-dev \
+            libgl1-mesa-dev \
+            libgles2-mesa-dev \
+            libibus-1.0-dev \
+            libjack-dev \
+            libpipewire-0.3-dev \
+            libpulse-dev \
             librsvg2-dev \
+            libsndio-dev \
             libssl-dev \
+            libthai-dev \
+            libudev-dev \
+            liburing-dev \
+            libusb-1.0-0-dev \
+            libwayland-dev \
             libwebkit2gtk-4.1-dev \
+            libx11-dev \
+            libxcursor-dev \
             libxdo-dev \
+            libxext-dev \
+            libxfixes-dev \
+            libxi-dev \
+            libxkbcommon-dev \
+            libxrandr-dev \
+            libxss-dev \
+            libxtst-dev \
+            make \
+            ninja-build \
+            pkg-config \
             wget
       - uses: dtolnay/rust-toolchain@master
         with:
