@@ -96,3 +96,10 @@ zeroize = { version = "=1.8.1", features = ["std"] }
 
 [patch.crates-io]
 ffmpeg-sys-next = { path = "vendor/ffmpeg-sys-next-9.0.0" }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
