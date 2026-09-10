@@ -428,7 +428,7 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
     let mut latency_diagnostics = LatencyDiagnostics::open(launch.latency_diagnostics)?;
     for (name, capacity) in [
         ("video_render_queue_capacity", 2),
-        ("audio_playback_queue_capacity", 4),
+        ("audio_playback_queue_capacity", 8),
         ("input_player_queue_capacity", 1_024),
         ("video_assembly_queue_capacity", 2),
         ("diagnostic_host_stream_queue_capacity", 1_024),

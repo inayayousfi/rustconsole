@@ -9,8 +9,10 @@ use std::time::{Duration, Instant};
 
 const PACKET_FRAMES: usize = 480;
 const CHANNELS: usize = 2;
-const MAX_PACKETS: usize = 4;
+const PREBUFFER_PACKETS: usize = 4;
+const MAX_PACKETS: usize = 8;
 const MAX_SYNC_MICROS: u64 = 40_000;
+const PREBUFFER_BYTES: usize = PACKET_FRAMES * CHANNELS * PREBUFFER_PACKETS * size_of::<f32>();
 const MAX_SDL_BYTES: usize = PACKET_FRAMES * CHANNELS * MAX_PACKETS * size_of::<f32>();
 const DEVICE_RETRY: Duration = Duration::from_millis(250);
 
@@ -209,6 +211,11 @@ impl SdlAudioOutput {
         {
             self.fail(error.to_string());
         }
+        if let Some(stream) = &self.stream
+            && let Err(error) = stream.pause()
+        {
+            self.fail(error.to_string());
+        }
         self.started = false;
         self.empty = true;
         self.queued_micros = 0;
@@ -258,9 +265,20 @@ impl SdlAudioOutput {
             self.device_submission_failures += 1;
             return;
         }
-        self.started = true;
-        self.empty = false;
-        self.queued_micros = bytes_to_micros(queued + bytes);
+        let queued = queued + bytes;
+        self.queued_micros = bytes_to_micros(queued);
+        if !self.started && queued >= PREBUFFER_BYTES {
+            if let Err(error) = stream.resume() {
+                self.fail(error.to_string());
+                self.device_drops += 1;
+                self.device_submission_failures += 1;
+                return;
+            }
+            self.started = true;
+        }
+        if self.started {
+            self.empty = false;
+        }
     }
 
     pub fn poll(&mut self) {
@@ -285,6 +303,11 @@ impl SdlAudioOutput {
         if self.started && queued == 0 && !self.empty {
             self.underruns += 1;
             self.empty = true;
+            if let Err(error) = self.stream.as_ref().unwrap().pause() {
+                self.fail(error.to_string());
+                return;
+            }
+            self.started = false;
         }
     }
 
@@ -329,11 +352,7 @@ impl SdlAudioOutput {
             .as_ref()
             .unwrap()
             .open_playback_device(&spec)
-            .and_then(|device| device.open_device_stream(Some(&spec)))
-            .and_then(|stream| {
-                stream.resume()?;
-                Ok(stream)
-            });
+            .and_then(|device| device.open_device_stream(Some(&spec)));
         match result {
             Ok(stream) => {
                 self.device_name = stream
@@ -369,48 +388,72 @@ pub fn run_sdl_audio_proof(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let queue = AudioPlaybackQueue::default();
     let mut output = SdlAudioOutput::new(sdl);
-    for packet in 0..MAX_PACKETS {
-        let start = packet * PACKET_FRAMES;
-        let interleaved = (start..start + PACKET_FRAMES)
-            .flat_map(|frame| {
-                let sample =
-                    (frame as f32 * 440.0 * std::f32::consts::TAU / 48_000.0).sin() * 0.025;
-                [sample, sample]
-            })
-            .collect();
-        output.play(&AudioSamples {
-            captured_at: rustconsole_media::MediaTimestampMicros(packet as u64 * 10_000),
-            format: rustconsole_media::AudioFormat {
-                sample_rate: 48_000,
-                channels: 2,
-            },
-            interleaved,
-        });
+    for packet in 0..PREBUFFER_PACKETS - 1 {
+        play_proof_packet(&mut output, packet);
     }
-    let initial = output.snapshot(&queue);
-    if initial.device_name.is_empty()
-        || initial.queued_micros == 0
-        || initial.queued_micros > MAX_SYNC_MICROS as u32
-    {
-        return Err(format!("SDL audio output did not queue a bounded signal: {initial:?}").into());
+    let prebuffering = output.snapshot(&queue);
+    if output.started || prebuffering.queued_micros != 30_000 {
+        return Err(format!(
+            "SDL audio output started before its reserve was full: {prebuffering:?}"
+        )
+        .into());
+    }
+    play_proof_packet(&mut output, PREBUFFER_PACKETS - 1);
+    let started = output.snapshot(&queue);
+    if !output.started || started.queued_micros != 40_000 {
+        return Err(
+            format!("SDL audio output did not start with a full reserve: {started:?}").into(),
+        );
     }
     std::thread::sleep(Duration::from_millis(80));
     output.poll();
-    let final_snapshot = output.snapshot(&queue);
-    if final_snapshot.queued_micros >= initial.queued_micros {
-        return Err("SDL audio queue did not drain".into());
+    let drained = output.snapshot(&queue);
+    if output.started || drained.queued_micros != 0 || drained.underruns != 1 {
+        return Err(format!(
+            "SDL audio output did not enter rebuffering after draining: {drained:?}"
+        )
+        .into());
+    }
+    for packet in PREBUFFER_PACKETS..PREBUFFER_PACKETS * 2 {
+        play_proof_packet(&mut output, packet);
+    }
+    let rebuffered = output.snapshot(&queue);
+    if !output.started || rebuffered.queued_micros != 40_000 {
+        return Err(
+            format!("SDL audio output did not resume with a full reserve: {rebuffered:?}").into(),
+        );
     }
     std::fs::write(
         report_path,
         format!(
-            "status=ok\nformat=f32-stereo-48000\ndevice={}\ninitial_queued_micros={}\nfinal_queued_micros={}\nmaximum_queued_micros={}\n",
-            initial.device_name,
-            initial.queued_micros,
-            final_snapshot.queued_micros,
-            MAX_SYNC_MICROS,
+            "status=ok\nformat=f32-stereo-48000\ndevice={}\nprebuffered_micros={}\nstarted_micros={}\nforced_underruns={}\nrebuffered_micros={}\nmaximum_queued_micros={}\n",
+            rebuffered.device_name,
+            prebuffering.queued_micros,
+            started.queued_micros,
+            drained.underruns,
+            rebuffered.queued_micros,
+            bytes_to_micros(MAX_SDL_BYTES),
         ),
     )?;
     Ok(())
+}
+
+fn play_proof_packet(output: &mut SdlAudioOutput, packet: usize) {
+    let start = packet * PACKET_FRAMES;
+    let interleaved = (start..start + PACKET_FRAMES)
+        .flat_map(|frame| {
+            let sample = (frame as f32 * 440.0 * std::f32::consts::TAU / 48_000.0).sin() * 0.025;
+            [sample, sample]
+        })
+        .collect();
+    output.play(&AudioSamples {
+        captured_at: rustconsole_media::MediaTimestampMicros(packet as u64 * 10_000),
+        format: rustconsole_media::AudioFormat {
+            sample_rate: 48_000,
+            channels: 2,
+        },
+        interleaved,
+    });
 }
 
 #[cfg(test)]
@@ -447,11 +490,11 @@ mod tests {
     #[test]
     fn playback_queue_is_bounded_and_keeps_the_latest_audio() {
         let queue = AudioPlaybackQueue::default();
-        for timestamp in [0, 10_000, 20_000, 30_000, 40_000] {
+        for timestamp in (0..=80_000).step_by(10_000) {
             queue.push(DecodedAudioEvent::Samples(samples(timestamp)));
         }
         let snapshot = queue.snapshot();
-        assert_eq!(snapshot.pending_packets, 4);
+        assert_eq!(snapshot.pending_packets, 8);
         assert_eq!(snapshot.queue_drops, 1);
         assert!(matches!(
             queue
@@ -505,6 +548,7 @@ mod tests {
     #[test]
     fn byte_depth_uses_stereo_float_frames() {
         assert_eq!(bytes_to_micros(480 * 2 * size_of::<f32>()), 10_000);
-        assert_eq!(bytes_to_micros(MAX_SDL_BYTES), 40_000);
+        assert_eq!(bytes_to_micros(PREBUFFER_BYTES), 40_000);
+        assert_eq!(bytes_to_micros(MAX_SDL_BYTES), 80_000);
     }
 }
