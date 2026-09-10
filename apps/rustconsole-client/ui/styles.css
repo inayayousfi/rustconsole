@@ -182,6 +182,8 @@ html, body { min-width: 320px; min-height: 100%; margin: 0; background: #101114;
 #maximum-bitrate::-moz-range-thumb { width: 14px; height: 14px; border: 1px solid #f05a77; border-radius: 50%; background: #d72c4d; cursor: pointer; }
 #maximum-bitrate:focus-visible { outline: 2px solid #7c3543; outline-offset: 4px; }
 .range-labels { display: flex; justify-content: space-between; margin-top: 8px; color: #686c75; font: 9px "IBM Plex Mono", monospace; }
+.toggle-control { display: flex; align-items: center; gap: 10px; color: #b7bac1; font-size: 11px; font-weight: 500; }
+.toggle-control input { width: 16px; height: 16px; margin: 0; accent-color: #d72c4d; }
 
 dialog { width: min(420px, calc(100vw - 32px)); border: 1px solid #383b43; border-radius: 10px; background: #18191d; color: #f2f2f4; padding: 0; }
 dialog::backdrop { background: rgba(0,0,0,0.68); }

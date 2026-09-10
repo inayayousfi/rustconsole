@@ -1,4 +1,4 @@
-use crate::DecodedAudioEvent;
+use crate::{DecodedAudioEvent, DecodedAudioSamples};
 use rustconsole_media::AudioSamples;
 use sdl3::audio::{AudioFormat, AudioSpec, AudioStreamOwner};
 use std::collections::VecDeque;
@@ -21,20 +21,47 @@ pub struct AudioPlaybackSnapshot {
     pub queue_drops: u64,
     pub late_drops: u64,
     pub device_drops: u64,
+    pub invalid_format_drops: u64,
+    pub unavailable_device_drops: u64,
+    pub device_query_failures: u64,
+    pub software_capacity_drops: u64,
+    pub device_submission_failures: u64,
     pub underruns: u64,
     pub resets: u64,
+    pub decoder_failures: u64,
     pub device_name: String,
     pub detail: String,
 }
 
 #[derive(Default)]
 struct QueueState {
-    pending: VecDeque<AudioSamples>,
+    pending: VecDeque<PendingAudio>,
     reset: Option<u64>,
     queue_drops: u64,
     late_drops: u64,
     resets: u64,
+    decoder_failures: u64,
     detail: String,
+}
+
+struct PendingAudio {
+    decoded: DecodedAudioSamples,
+    queued_at: Option<Instant>,
+    sync_hold_started: Option<Instant>,
+}
+
+#[derive(Debug)]
+pub enum AudioPlaybackDecision {
+    Samples {
+        decoded: DecodedAudioSamples,
+        queue_duration: Option<Duration>,
+        sync_hold_duration: Option<Duration>,
+    },
+    Late {
+        sequence: u64,
+        queue_duration: Option<Duration>,
+        lateness_micros: u64,
+    },
 }
 
 #[derive(Clone, Default)]
@@ -57,10 +84,16 @@ impl AudioPlaybackQueue {
                     state.pending.pop_front();
                     state.queue_drops += 1;
                 }
-                state.pending.push_back(samples);
+                let queued_at = samples.diagnostics.then(Instant::now);
+                state.pending.push_back(PendingAudio {
+                    decoded: samples,
+                    queued_at,
+                    sync_hold_started: None,
+                });
             }
             DecodedAudioEvent::Failed { detail, .. } => {
                 state.pending.clear();
+                state.decoder_failures = state.decoder_failures.saturating_add(1);
                 state.detail = detail;
             }
         }
@@ -74,21 +107,45 @@ impl AudioPlaybackQueue {
             .take()
     }
 
-    pub fn pop_for_video(&self, video_timestamp_micros: Option<u64>) -> Option<AudioSamples> {
+    pub fn pop_for_video(
+        &self,
+        video_timestamp_micros: Option<u64>,
+    ) -> Option<AudioPlaybackDecision> {
         let video_timestamp_micros = video_timestamp_micros?;
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        loop {
-            let audio_timestamp = state.pending.front()?.captured_at.0;
-            if audio_timestamp > video_timestamp_micros.saturating_add(MAX_SYNC_MICROS) {
-                return None;
+        let now = state
+            .pending
+            .front()
+            .is_some_and(|pending| pending.queued_at.is_some())
+            .then(Instant::now);
+        let pending = state.pending.front_mut()?;
+        let audio_timestamp = pending.decoded.samples.captured_at.0;
+        if audio_timestamp > video_timestamp_micros.saturating_add(MAX_SYNC_MICROS) {
+            if let Some(now) = now {
+                pending.sync_hold_started.get_or_insert(now);
             }
-            if audio_timestamp.saturating_add(MAX_SYNC_MICROS) < video_timestamp_micros {
-                state.pending.pop_front();
-                state.late_drops += 1;
-                continue;
-            }
-            return state.pending.pop_front();
+            return None;
         }
+        let pending = state.pending.pop_front().unwrap();
+        let queue_duration = now
+            .zip(pending.queued_at)
+            .map(|(now, queued_at)| now.saturating_duration_since(queued_at));
+        if audio_timestamp.saturating_add(MAX_SYNC_MICROS) < video_timestamp_micros {
+            state.late_drops += 1;
+            return Some(AudioPlaybackDecision::Late {
+                sequence: pending.decoded.sequence,
+                queue_duration,
+                lateness_micros: video_timestamp_micros.saturating_sub(audio_timestamp),
+            });
+        }
+        Some(AudioPlaybackDecision::Samples {
+            decoded: pending.decoded,
+            queue_duration,
+            sync_hold_duration: pending
+                .sync_hold_started
+                .zip(now)
+                .map(|(started, now)| now.saturating_duration_since(started)),
+        })
     }
 
     pub fn snapshot(&self) -> AudioPlaybackSnapshot {
@@ -98,6 +155,7 @@ impl AudioPlaybackQueue {
             queue_drops: state.queue_drops,
             late_drops: state.late_drops,
             resets: state.resets,
+            decoder_failures: state.decoder_failures,
             detail: state.detail.clone(),
             ..AudioPlaybackSnapshot::default()
         }
@@ -113,6 +171,11 @@ pub struct SdlAudioOutput {
     empty: bool,
     queued_micros: u32,
     device_drops: u64,
+    invalid_format_drops: u64,
+    unavailable_device_drops: u64,
+    device_query_failures: u64,
+    software_capacity_drops: u64,
+    device_submission_failures: u64,
     underruns: u64,
     device_name: String,
     detail: String,
@@ -129,6 +192,11 @@ impl SdlAudioOutput {
             empty: true,
             queued_micros: 0,
             device_drops: 0,
+            invalid_format_drops: 0,
+            unavailable_device_drops: 0,
+            device_query_failures: 0,
+            software_capacity_drops: 0,
+            device_submission_failures: 0,
             underruns: 0,
             device_name: String::new(),
             detail: String::new(),
@@ -146,19 +214,21 @@ impl SdlAudioOutput {
         self.queued_micros = 0;
     }
 
-    pub fn play(&mut self, samples: AudioSamples) {
+    pub fn play(&mut self, samples: &AudioSamples) {
         if samples.format.sample_rate != 48_000
             || samples.format.channels != 2
             || samples.interleaved.is_empty()
             || !samples.interleaved.len().is_multiple_of(CHANNELS)
         {
             self.device_drops += 1;
+            self.invalid_format_drops += 1;
             self.detail = "decoded audio has an invalid format".into();
             return;
         }
         self.poll();
         let Some(stream) = &self.stream else {
             self.device_drops += 1;
+            self.unavailable_device_drops += 1;
             return;
         };
         let bytes = samples.interleaved.len() * size_of::<f32>();
@@ -167,21 +237,25 @@ impl SdlAudioOutput {
             Ok(_) => {
                 self.fail("SDL reported a negative audio queue size".into());
                 self.device_drops += 1;
+                self.device_query_failures += 1;
                 return;
             }
             Err(error) => {
                 self.fail(error.to_string());
                 self.device_drops += 1;
+                self.device_query_failures += 1;
                 return;
             }
         };
         if queued.saturating_add(bytes) > MAX_SDL_BYTES {
             self.device_drops += 1;
+            self.software_capacity_drops += 1;
             return;
         }
         if let Err(error) = stream.put_data_f32(&samples.interleaved) {
             self.fail(error.to_string());
             self.device_drops += 1;
+            self.device_submission_failures += 1;
             return;
         }
         self.started = true;
@@ -218,12 +292,21 @@ impl SdlAudioOutput {
         let mut snapshot = queue.snapshot();
         snapshot.queued_micros = self.queued_micros;
         snapshot.device_drops = self.device_drops;
+        snapshot.invalid_format_drops = self.invalid_format_drops;
+        snapshot.unavailable_device_drops = self.unavailable_device_drops;
+        snapshot.device_query_failures = self.device_query_failures;
+        snapshot.software_capacity_drops = self.software_capacity_drops;
+        snapshot.device_submission_failures = self.device_submission_failures;
         snapshot.underruns = self.underruns;
         snapshot.device_name.clone_from(&self.device_name);
         if !self.detail.is_empty() {
             snapshot.detail.clone_from(&self.detail);
         }
         snapshot
+    }
+
+    pub const fn queued_micros(&self) -> u32 {
+        self.queued_micros
     }
 
     fn open(&mut self) {
@@ -295,7 +378,7 @@ pub fn run_sdl_audio_proof(
                 [sample, sample]
             })
             .collect();
-        output.play(AudioSamples {
+        output.play(&AudioSamples {
             captured_at: rustconsole_media::MediaTimestampMicros(packet as u64 * 10_000),
             format: rustconsole_media::AudioFormat {
                 sample_rate: 48_000,
@@ -335,14 +418,29 @@ mod tests {
     use super::*;
     use rustconsole_media::{AudioFormat as MediaAudioFormat, MediaTimestampMicros};
 
-    fn samples(timestamp: u64) -> AudioSamples {
-        AudioSamples {
-            captured_at: MediaTimestampMicros(timestamp),
-            format: MediaAudioFormat {
-                sample_rate: 48_000,
-                channels: 2,
+    fn samples(timestamp: u64) -> DecodedAudioSamples {
+        DecodedAudioSamples {
+            generation: 1,
+            sequence: timestamp / 10_000,
+            diagnostics: true,
+            assembled_at: Instant::now(),
+            assembled_at_micros: timestamp,
+            decoded_at: Instant::now(),
+            decode_duration: Duration::ZERO,
+            encoded_bytes: 1,
+            concealed_packets: 0,
+            decoder_input_hash_duration: Duration::ZERO,
+            assembly_to_decoder_matched: None,
+            ordered_playout_duration: None,
+            decoder_queue_duration: None,
+            samples: AudioSamples {
+                captured_at: MediaTimestampMicros(timestamp),
+                format: MediaAudioFormat {
+                    sample_rate: 48_000,
+                    channels: 2,
+                },
+                interleaved: vec![0.0; 960],
             },
-            interleaved: vec![0.0; 960],
         }
     }
 
@@ -355,10 +453,13 @@ mod tests {
         let snapshot = queue.snapshot();
         assert_eq!(snapshot.pending_packets, 4);
         assert_eq!(snapshot.queue_drops, 1);
-        assert_eq!(
-            queue.pop_for_video(Some(10_000)).unwrap().captured_at.0,
-            10_000
-        );
+        assert!(matches!(
+            queue
+                .pop_for_video(Some(10_000))
+                .unwrap(),
+            AudioPlaybackDecision::Samples { decoded, .. }
+                if decoded.samples.captured_at.0 == 10_000
+        ));
     }
 
     #[test]
@@ -367,8 +468,28 @@ mod tests {
         queue.push(DecodedAudioEvent::Samples(samples(100_001)));
         assert!(queue.pop_for_video(Some(60_000)).is_none());
         assert_eq!(queue.snapshot().pending_packets, 1);
-        assert!(queue.pop_for_video(Some(140_002)).is_none());
+        assert!(matches!(
+            queue.pop_for_video(Some(140_002)),
+            Some(AudioPlaybackDecision::Late {
+                lateness_micros: 40_001,
+                ..
+            })
+        ));
         assert_eq!(queue.snapshot().late_drops, 1);
+    }
+
+    #[test]
+    fn playback_queue_reports_a_completed_video_sync_hold() {
+        let queue = AudioPlaybackQueue::default();
+        queue.push(DecodedAudioEvent::Samples(samples(100_001)));
+        assert!(queue.pop_for_video(Some(60_000)).is_none());
+        assert!(matches!(
+            queue.pop_for_video(Some(60_001)),
+            Some(AudioPlaybackDecision::Samples {
+                sync_hold_duration: Some(_),
+                ..
+            })
+        ));
     }
 
     #[test]

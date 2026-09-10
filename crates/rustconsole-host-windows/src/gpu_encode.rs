@@ -1,14 +1,18 @@
 use crate::desktop::attach_input_desktop;
 use rustconsole_codec_ffmpeg::{
-    Av1ColorDescription, Av1EncoderConfiguration, Av1FrameFormat, Av1NvencEncoder,
+    Av1ColorDescription, Av1D3d11Decoder, Av1EncoderConfiguration, Av1FrameFormat, Av1NvencEncoder,
     EncodedAv1Packet, HardwareDevice,
 };
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::ffi::{CStr, c_char, c_void};
 use std::fmt;
 use std::ptr::{self, NonNull};
 use std::time::{Duration, Instant};
-use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11Texture2D};
+use windows::Win32::Graphics::Direct3D11::{
+    D3D11_CPU_ACCESS_READ, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_TEXTURE2D_DESC,
+    D3D11_USAGE_STAGING, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
+};
+use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_FORMAT_P010};
 use windows::Win32::Graphics::Dxgi::{DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT};
 use windows::core::{HRESULT, Interface};
 
@@ -31,6 +35,9 @@ unsafe extern "C" {
         last_present_time: *mut i64,
         accumulated_frames: *mut u32,
         protected_content_masked: *mut i32,
+        capture_acquisition_micros: *mut u64,
+        cross_adapter_copy_micros: *mut u64,
+        color_conversion_micros: *mut u64,
     ) -> i32;
     fn rustconsole_gpu_bridge_open_external(
         bridge: *mut *mut c_void,
@@ -116,6 +123,7 @@ pub struct GpuAv1SnapshotEncoder {
     bitrate_bits_per_second: u64,
     next_presentation_timestamp: i64,
     pending_metadata: VecDeque<FrameMetadata>,
+    quality: Option<VideoQualityDiagnostics>,
 }
 
 pub struct EncodedSnapshot {
@@ -123,6 +131,24 @@ pub struct EncodedSnapshot {
     pub last_present_time: i64,
     pub accumulated_frames: u32,
     pub protected_content_masked: bool,
+    pub mirror_decode_micros: u64,
+    pub capture_acquisition_micros: u64,
+    pub cross_adapter_copy_micros: u64,
+    pub color_conversion_micros: u64,
+    pub encoder_call_micros: u64,
+    pub quality: Option<VideoQualitySample>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VideoQualitySample {
+    pub presentation_timestamp: i64,
+    pub source_readback_micros: u64,
+    pub mirror_decode_micros: u64,
+    pub decoded_readback_micros: u64,
+    pub scoring_micros: u64,
+    pub readback_bytes: u64,
+    pub luma_psnr_millidecibels: u64,
+    pub luma_mean_absolute_error_ppm: u64,
 }
 
 struct FrameMetadata {
@@ -130,6 +156,26 @@ struct FrameMetadata {
     last_present_time: i64,
     accumulated_frames: u32,
     protected_content_masked: bool,
+    quality_source: Option<QualitySource>,
+    capture_acquisition_micros: u64,
+    cross_adapter_copy_micros: u64,
+    color_conversion_micros: u64,
+    encoder_call_micros: u64,
+}
+
+struct QualitySource {
+    width: u32,
+    height: u32,
+    bit_depth: u16,
+    samples: Vec<u16>,
+    readback_micros: u64,
+    readback_bytes: u64,
+}
+
+struct VideoQualityDiagnostics {
+    decoder: Av1D3d11Decoder,
+    next_sample: Instant,
+    sources: BTreeMap<i64, QualitySource>,
 }
 
 impl GpuAv1SnapshotEncoder {
@@ -205,18 +251,35 @@ impl GpuAv1SnapshotEncoder {
             bitrate_bits_per_second,
             next_presentation_timestamp: 0,
             pending_metadata: VecDeque::with_capacity(2),
+            quality: None,
         })
+    }
+
+    pub fn enable_quality_diagnostics(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let hardware = HardwareDevice::from_d3d11_device(&self.device)
+            .map_err(|error| format!("FFmpeg D3D11 device import failed: {error}"))?;
+        let decoder = Av1D3d11Decoder::open(&hardware).map_err(|error| {
+            format!("D3D11VA AV1 mirror decoder initialization failed: {error}")
+        })?;
+        self.quality = Some(VideoQualityDiagnostics {
+            decoder,
+            next_sample: Instant::now(),
+            sources: BTreeMap::new(),
+        });
+        Ok(())
     }
 
     pub fn encode_next_frame(
         &mut self,
         timeout: Duration,
     ) -> Result<Option<EncodedSnapshot>, Box<dyn std::error::Error>> {
-        let capture = self.bridge.capture(timeout);
+        let diagnostics = self.quality.is_some();
+        let capture = self.bridge.capture(timeout, diagnostics);
         if matches!(&capture, Err(error) if error.code == DXGI_ERROR_WAIT_TIMEOUT.0) {
             return Ok(None);
         }
         if matches!(&capture, Err(error) if error.code == DXGI_ERROR_ACCESS_LOST.0) {
+            drop(capture);
             return Err(Box::new(VideoReconfigurationRequired {
                 cause: self.bridge.reconfiguration_cause(),
             }));
@@ -231,16 +294,34 @@ impl GpuAv1SnapshotEncoder {
             .next_presentation_timestamp
             .checked_add(1)
             .ok_or("NVENC presentation timestamp exhausted")?;
+        let quality_source = match self.quality.as_mut() {
+            Some(quality) if Instant::now() >= quality.next_sample => {
+                quality.next_sample = Instant::now() + Duration::from_millis(200);
+                Some(read_texture_luma(&self.device, &lease.texture)?)
+            }
+            _ => None,
+        };
         self.pending_metadata.push_back(FrameMetadata {
             presentation_timestamp,
             last_present_time: lease.last_present_time,
             accumulated_frames: lease.accumulated_frames,
             protected_content_masked: lease.protected_content_masked,
+            quality_source,
+            capture_acquisition_micros: lease.capture_acquisition_micros,
+            cross_adapter_copy_micros: lease.cross_adapter_copy_micros,
+            color_conversion_micros: lease.color_conversion_micros,
+            encoder_call_micros: 0,
         });
+        let encoder_started = diagnostics.then(Instant::now);
         let packet = self
             .encoder
             .encode_d3d11_texture(&lease.texture, presentation_timestamp)
             .map_err(|error| format!("NVENC AV1 frame submission failed: {error}"))?;
+        if let Some(started) = encoder_started
+            && let Some(metadata) = self.pending_metadata.back_mut()
+        {
+            metadata.encoder_call_micros = started.elapsed().as_micros() as u64;
+        }
         drop(lease);
 
         let Some(packet) = packet else {
@@ -260,11 +341,21 @@ impl GpuAv1SnapshotEncoder {
             )
             .into());
         }
+        let (mirror_decode_micros, quality) = match self.quality.as_mut() {
+            Some(quality) => quality.observe(&packet, metadata.quality_source)?,
+            None => (0, None),
+        };
         Ok(Some(EncodedSnapshot {
             packet,
             last_present_time: metadata.last_present_time,
             accumulated_frames: metadata.accumulated_frames,
             protected_content_masked: metadata.protected_content_masked,
+            mirror_decode_micros,
+            capture_acquisition_micros: metadata.capture_acquisition_micros,
+            cross_adapter_copy_micros: metadata.cross_adapter_copy_micros,
+            color_conversion_micros: metadata.color_conversion_micros,
+            encoder_call_micros: metadata.encoder_call_micros,
+            quality,
         }))
     }
 
@@ -317,6 +408,9 @@ impl GpuAv1SnapshotEncoder {
         self.encoder = encoder;
         self.bitrate_bits_per_second = bitrate_bits_per_second;
         self.pending_metadata.clear();
+        if self.quality.is_some() {
+            self.enable_quality_diagnostics()?;
+        }
         Ok(())
     }
 
@@ -346,7 +440,7 @@ impl GpuAv1SnapshotEncoder {
         &mut self,
         timeout: Duration,
     ) -> Result<EncodedSnapshot, SnapshotAttemptError> {
-        let lease = match self.bridge.capture(timeout) {
+        let lease = match self.bridge.capture(timeout, false) {
             Ok(lease) => lease,
             Err(error) if error.code == DXGI_ERROR_ACCESS_LOST.0 => {
                 return Err(SnapshotAttemptError::AccessLost);
@@ -375,9 +469,194 @@ impl GpuAv1SnapshotEncoder {
             last_present_time: lease.last_present_time,
             accumulated_frames: lease.accumulated_frames,
             protected_content_masked: lease.protected_content_masked,
+            mirror_decode_micros: 0,
+            capture_acquisition_micros: 0,
+            cross_adapter_copy_micros: 0,
+            color_conversion_micros: 0,
+            encoder_call_micros: 0,
+            quality: None,
         };
         drop(lease);
         Ok(snapshot)
+    }
+}
+
+impl VideoQualityDiagnostics {
+    fn observe(
+        &mut self,
+        packet: &EncodedAv1Packet,
+        source: Option<QualitySource>,
+    ) -> Result<(u64, Option<VideoQualitySample>), Box<dyn std::error::Error>> {
+        if let Some(source) = source {
+            self.sources.insert(packet.presentation_timestamp, source);
+            while self.sources.len() > 8 {
+                self.sources.pop_first();
+            }
+        }
+
+        let decode_started = Instant::now();
+        let decoded = self
+            .decoder
+            .decode_packet(&packet.data, packet.presentation_timestamp)
+            .map_err(|error| format!("D3D11VA AV1 mirror decode failed: {error}"))?;
+        let mirror_decode_micros = decode_started.elapsed().as_micros() as u64;
+        let Some(decoded) = decoded else {
+            return Ok((mirror_decode_micros, None));
+        };
+        let presentation_timestamp = decoded.presentation_timestamp();
+        let Some(source) = self.sources.remove(&presentation_timestamp) else {
+            return Ok((mirror_decode_micros, None));
+        };
+
+        let readback_started = Instant::now();
+        let decoded = decoded
+            .download_luma()
+            .map_err(|error| format!("D3D11VA decoded-frame readback failed: {error}"))?;
+        let decoded_readback_micros = readback_started.elapsed().as_micros() as u64;
+        if decoded.width != source.width
+            || decoded.height != source.height
+            || decoded.bit_depth != source.bit_depth
+            || decoded.samples.len() != source.samples.len()
+        {
+            return Err("source and mirror-decoded luma formats differ".into());
+        }
+
+        let scoring_started = Instant::now();
+        let mut squared_error = 0_u128;
+        let mut absolute_error = 0_u128;
+        for (&source, &decoded) in source.samples.iter().zip(&decoded.samples) {
+            let difference = i64::from(source) - i64::from(decoded);
+            squared_error += u128::from(difference.unsigned_abs()).pow(2);
+            absolute_error += u128::from(difference.unsigned_abs());
+        }
+        let sample_count = source.samples.len() as f64;
+        let maximum = f64::from((1_u16 << source.bit_depth) - 1);
+        let mean_squared_error = squared_error as f64 / sample_count;
+        let psnr = if mean_squared_error == 0.0 {
+            100.0
+        } else {
+            10.0 * (maximum * maximum / mean_squared_error).log10()
+        };
+        let mean_absolute_error = absolute_error as f64 / sample_count;
+        let scoring_micros = scoring_started.elapsed().as_micros() as u64;
+        let decoded_readback_bytes = u64::from(decoded.width)
+            * u64::from(decoded.height)
+            * if decoded.bit_depth == 8 { 3 } else { 6 }
+            / 2;
+        Ok((
+            mirror_decode_micros,
+            Some(VideoQualitySample {
+                presentation_timestamp,
+                source_readback_micros: source.readback_micros,
+                mirror_decode_micros,
+                decoded_readback_micros,
+                scoring_micros,
+                readback_bytes: source.readback_bytes.saturating_add(decoded_readback_bytes),
+                luma_psnr_millidecibels: (psnr * 1_000.0).round().clamp(0.0, u64::MAX as f64)
+                    as u64,
+                luma_mean_absolute_error_ppm: (mean_absolute_error * 1_000_000.0 / maximum)
+                    .round()
+                    .clamp(0.0, u64::MAX as f64)
+                    as u64,
+            }),
+        ))
+    }
+}
+
+fn read_texture_luma(
+    device: &ID3D11Device,
+    texture: &ID3D11Texture2D,
+) -> Result<QualitySource, Box<dyn std::error::Error>> {
+    let started = Instant::now();
+    let mut description = D3D11_TEXTURE2D_DESC::default();
+    // SAFETY: description is valid output and texture remains live for the call.
+    unsafe { texture.GetDesc(&mut description) };
+    let (bit_depth, row_bytes, readback_bytes) = if description.Format == DXGI_FORMAT_NV12 {
+        (
+            8,
+            usize::try_from(description.Width)?,
+            u64::from(description.Width) * u64::from(description.Height) * 3 / 2,
+        )
+    } else if description.Format == DXGI_FORMAT_P010 {
+        (
+            10,
+            usize::try_from(description.Width)? * 2,
+            u64::from(description.Width) * u64::from(description.Height) * 3,
+        )
+    } else {
+        return Err(format!(
+            "quality readback requires NV12 or P010, found DXGI format {}",
+            description.Format.0
+        )
+        .into());
+    };
+    description.Usage = D3D11_USAGE_STAGING;
+    description.BindFlags = 0;
+    description.CPUAccessFlags = u32::try_from(D3D11_CPU_ACCESS_READ.0).unwrap_or(0);
+    description.MiscFlags = 0;
+    let mut staging = None;
+    // SAFETY: description is copied from the source and adjusted for CPU readback.
+    unsafe { device.CreateTexture2D(&description, None, Some(&mut staging))? };
+    let staging = staging.ok_or("D3D11 quality readback created no staging texture")?;
+    // SAFETY: the immediate context belongs to this device.
+    let context = unsafe { device.GetImmediateContext()? };
+    // SAFETY: source and staging resources have matching dimensions and format.
+    unsafe { context.CopyResource(&staging, texture) };
+    let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+    // SAFETY: staging permits CPU reads and mapped is valid output storage.
+    unsafe { context.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))? };
+    let _mapping = TextureMapping {
+        context: &context,
+        texture: &staging,
+    };
+    let row_pitch = usize::try_from(mapped.RowPitch)?;
+    if row_pitch < row_bytes {
+        return Err("D3D11 quality readback row pitch is too small".into());
+    }
+    let width = usize::try_from(description.Width)?;
+    let height = usize::try_from(description.Height)?;
+    let mut samples = Vec::with_capacity(
+        width
+            .checked_mul(height)
+            .ok_or("D3D11 quality readback size overflowed")?,
+    );
+    for row in 0..height {
+        // SAFETY: Map exposes row_pitch bytes for each luma row.
+        let source = unsafe { mapped.pData.cast::<u8>().add(row * row_pitch) };
+        if bit_depth == 8 {
+            // SAFETY: width bytes are available in the validated row.
+            samples.extend(
+                unsafe { std::slice::from_raw_parts(source, width) }
+                    .iter()
+                    .map(|&value| u16::from(value)),
+            );
+        } else {
+            for column in 0..width {
+                // SAFETY: P010 stores one little-endian u16 luma sample per column.
+                let sample = unsafe { source.add(column * 2) };
+                samples.push(u16::from_le_bytes(unsafe { [*sample, *sample.add(1)] }) >> 6);
+            }
+        }
+    }
+    Ok(QualitySource {
+        width: description.Width,
+        height: description.Height,
+        bit_depth,
+        samples,
+        readback_micros: started.elapsed().as_micros() as u64,
+        readback_bytes,
+    })
+}
+
+struct TextureMapping<'a> {
+    context: &'a ID3D11DeviceContext,
+    texture: &'a ID3D11Texture2D,
+}
+
+impl Drop for TextureMapping<'_> {
+    fn drop(&mut self) {
+        // SAFETY: this guard is created immediately after a successful Map.
+        unsafe { self.context.Unmap(self.texture, 0) };
     }
 }
 
@@ -512,20 +791,32 @@ impl GpuBridge {
         ))
     }
 
-    fn capture(&self, timeout: Duration) -> Result<EncoderTextureLease<'_>, BridgeError> {
+    fn capture(
+        &mut self,
+        timeout: Duration,
+        diagnostics: bool,
+    ) -> Result<EncoderTextureLease<'_>, BridgeError> {
         let timeout_millis = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX);
         let mut texture = ptr::null_mut();
         let mut last_present_time = 0;
         let mut accumulated_frames = 0;
         let mut protected_content_masked = 0;
-        let result = if let Some(helper) = self.helper.as_ref() {
-            let frame = helper.next_frame().map_err(|error| BridgeError {
-                code: 0x8000_4005_u32 as i32,
-                stage: error.to_string(),
-            })?;
+        let mut capture_acquisition_micros = 0;
+        let mut cross_adapter_copy_micros = 0;
+        let mut color_conversion_micros = 0;
+        let result = if let Some(helper) = self.helper.as_mut() {
+            let frame = helper
+                .next_frame(diagnostics)
+                .map_err(|error| BridgeError {
+                    code: 0x8000_4005_u32 as i32,
+                    stage: error.to_string(),
+                })?;
             last_present_time = frame.last_present_time;
             accumulated_frames = frame.accumulated_frames;
             protected_content_masked = i32::from(frame.protected_content_masked);
+            capture_acquisition_micros = frame.capture_acquisition_micros;
+            cross_adapter_copy_micros = frame.cross_adapter_copy_micros;
+            color_conversion_micros = frame.color_conversion_micros;
             // SAFETY: the bridge owns the opened shared texture and output storage is valid.
             unsafe {
                 rustconsole_gpu_bridge_acquire_external(
@@ -544,6 +835,21 @@ impl GpuBridge {
                     &mut last_present_time,
                     &mut accumulated_frames,
                     &mut protected_content_masked,
+                    if diagnostics {
+                        &mut capture_acquisition_micros
+                    } else {
+                        ptr::null_mut()
+                    },
+                    if diagnostics {
+                        &mut cross_adapter_copy_micros
+                    } else {
+                        ptr::null_mut()
+                    },
+                    if diagnostics {
+                        &mut color_conversion_micros
+                    } else {
+                        ptr::null_mut()
+                    },
                 )
             }
         };
@@ -556,6 +862,9 @@ impl GpuBridge {
             last_present_time,
             accumulated_frames,
             protected_content_masked: protected_content_masked != 0,
+            capture_acquisition_micros,
+            cross_adapter_copy_micros,
+            color_conversion_micros,
         })
     }
 
@@ -583,6 +892,9 @@ struct EncoderTextureLease<'a> {
     last_present_time: i64,
     accumulated_frames: u32,
     protected_content_masked: bool,
+    capture_acquisition_micros: u64,
+    cross_adapter_copy_micros: u64,
+    color_conversion_micros: u64,
 }
 
 impl Drop for EncoderTextureLease<'_> {

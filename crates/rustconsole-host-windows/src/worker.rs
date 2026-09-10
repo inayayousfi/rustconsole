@@ -12,6 +12,7 @@ use crate::worker_protocol::{
 };
 use rustconsole_host_core::audio_transport::{AUDIO_QUEUE_PACKETS, MediaQueue};
 use rustconsole_host_core::{DesktopCapture, LatestQueue};
+use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io;
 use std::os::windows::ffi::OsStrExt;
@@ -370,6 +371,7 @@ impl MediaWorker {
         frames_per_second: u16,
         bitrate_bits_per_second: u64,
         enable_audio: bool,
+        diagnostics: bool,
     ) -> Result<Option<MediaWorkerStream>, Box<dyn std::error::Error>> {
         let mut event_pipe = self.events.take().ok_or("worker events already consumed")?;
         let events = Arc::new(LatestQueue::new(2));
@@ -437,6 +439,7 @@ impl MediaWorker {
                 frames_per_second,
                 bitrate_bits_per_second,
                 audio: enable_audio,
+                diagnostics,
             },
         )?;
         Ok(Some(MediaWorkerStream {
@@ -849,12 +852,14 @@ fn run_files(
                 frames_per_second,
                 bitrate_bits_per_second,
                 audio,
+                diagnostics,
             } => match run_video_stream(
                 &mut commands,
                 &mut events,
                 frames_per_second,
                 bitrate_bits_per_second,
                 if audio { Some(&audio_events) } else { None },
+                diagnostics,
                 prepared_video.take(),
             ) {
                 Ok(StreamExit::Continue) => {}
@@ -1049,6 +1054,7 @@ fn run_video_stream(
     frames_per_second: u16,
     bitrate_bits_per_second: u64,
     audio_pipe: Option<&File>,
+    diagnostics: bool,
     prepared: Option<PreparedGpuCapture>,
 ) -> Result<StreamExit, Box<dyn std::error::Error>> {
     if frames_per_second == 0 {
@@ -1058,10 +1064,14 @@ fn run_video_stream(
     let prepared = prepared.ok_or("video stream was not prepared before start")?;
     let mut encoder =
         GpuAv1SnapshotEncoder::from_prepared(prepared, frames_per_second, bitrate_bits_per_second)?;
+    if diagnostics {
+        encoder.enable_quality_diagnostics()?;
+    }
+    let clock = crate::clock::HostClock::new()?;
     let _audio = match audio_pipe {
         Some(pipe) => match pipe
             .try_clone()
-            .and_then(crate::audio_stream::WorkerAudio::start)
+            .and_then(|pipe| crate::audio_stream::WorkerAudio::start(pipe, diagnostics))
         {
             Ok(audio) => Some(audio),
             Err(error) => {
@@ -1108,6 +1118,7 @@ fn run_video_stream(
         if now < next_tick {
             thread::sleep(next_tick - now);
         }
+        let encode_started_at_micros = clock.now()?;
         let encoded = if tick.is_multiple_of(u64::from(frame_divisor)) {
             match encoder.encode_next_frame(frame_period) {
                 Ok(frame) => frame,
@@ -1128,6 +1139,14 @@ fn run_video_stream(
             None
         };
         if let Some(frame) = encoded {
+            let encoded_at_micros = clock.now()?;
+            let (payload_sha256, hash_duration_micros) = if diagnostics {
+                let started = Instant::now();
+                let digest = Sha256::digest(&frame.packet.data).into();
+                (Some(digest), started.elapsed().as_micros() as u64)
+            } else {
+                (None, 0)
+            };
             write_event(
                 events,
                 &WorkerEvent::EncodedVideoFrame {
@@ -1137,6 +1156,27 @@ fn run_video_stream(
                     protected_content_masked: frame.protected_content_masked,
                     presentation_timestamp: frame.packet.presentation_timestamp,
                     keyframe: frame.packet.keyframe,
+                    payload_sha256,
+                    hash_duration_micros,
+                    encode_started_at_micros,
+                    encoded_at_micros,
+                    worker_queued_at_micros: clock.now()?,
+                    mirror_decode_micros: frame.mirror_decode_micros,
+                    capture_acquisition_micros: frame.capture_acquisition_micros,
+                    cross_adapter_copy_micros: frame.cross_adapter_copy_micros,
+                    color_conversion_micros: frame.color_conversion_micros,
+                    encoder_call_micros: frame.encoder_call_micros,
+                    quality: frame.quality.map(|quality| {
+                        crate::worker_protocol::WorkerVideoQuality {
+                            presentation_timestamp: quality.presentation_timestamp,
+                            source_readback_micros: quality.source_readback_micros,
+                            decoded_readback_micros: quality.decoded_readback_micros,
+                            scoring_micros: quality.scoring_micros,
+                            readback_bytes: quality.readback_bytes,
+                            luma_psnr_millidecibels: quality.luma_psnr_millidecibels,
+                            luma_mean_absolute_error_ppm: quality.luma_mean_absolute_error_ppm,
+                        }
+                    }),
                     payload: frame.packet.data,
                 },
             )?;

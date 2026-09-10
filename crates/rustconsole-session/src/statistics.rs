@@ -9,6 +9,7 @@ use std::num::NonZeroU64;
 pub struct Distribution<T> {
     sample_count: NonZeroU64,
     median: T,
+    percentile_90: T,
     percentile_95: T,
     percentile_99: T,
     worst: T,
@@ -18,18 +19,24 @@ impl<T: Copy + Ord> Distribution<T> {
     pub fn new(
         sample_count: u64,
         median: T,
+        percentile_90: T,
         percentile_95: T,
         percentile_99: T,
         worst: T,
     ) -> Result<Self, InvalidDistribution> {
         let sample_count = NonZeroU64::new(sample_count).ok_or(InvalidDistribution::NoSamples)?;
-        if median > percentile_95 || percentile_95 > percentile_99 || percentile_99 > worst {
+        if median > percentile_90
+            || percentile_90 > percentile_95
+            || percentile_95 > percentile_99
+            || percentile_99 > worst
+        {
             return Err(InvalidDistribution::QuantilesOutOfOrder);
         }
 
         Ok(Self {
             sample_count,
             median,
+            percentile_90,
             percentile_95,
             percentile_99,
             worst,
@@ -47,6 +54,11 @@ impl<T: Copy + Ord> Distribution<T> {
     }
 
     #[must_use]
+    pub const fn percentile_90(self) -> T {
+        self.percentile_90
+    }
+
+    #[must_use]
     pub const fn percentile_95(self) -> T {
         self.percentile_95
     }
@@ -60,6 +72,61 @@ impl<T: Copy + Ord> Distribution<T> {
     pub const fn worst(self) -> T {
         self.worst
     }
+}
+
+pub const MAX_DISTRIBUTION_SAMPLES: usize = 65_536;
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DistributionSamples {
+    observed: u64,
+    discarded: u64,
+    worst: u64,
+    values: Vec<u64>,
+}
+
+impl DistributionSamples {
+    pub fn observe(&mut self, value: u64) {
+        self.observed = self.observed.saturating_add(1);
+        self.worst = self.worst.max(value);
+        if self.values.len() < MAX_DISTRIBUTION_SAMPLES {
+            self.values.push(value);
+        } else {
+            self.discarded = self.discarded.saturating_add(1);
+        }
+    }
+
+    #[must_use]
+    pub const fn observed(&self) -> u64 {
+        self.observed
+    }
+
+    #[must_use]
+    pub const fn discarded(&self) -> u64 {
+        self.discarded
+    }
+
+    pub fn distribution(&self) -> Option<Distribution<u64>> {
+        if self.values.is_empty() {
+            return None;
+        }
+        let mut values = self.values.clone();
+        values.sort_unstable();
+        Some(
+            Distribution::new(
+                self.observed,
+                percentile(&values, 50),
+                percentile(&values, 90),
+                percentile(&values, 95),
+                percentile(&values, 99),
+                self.worst,
+            )
+            .expect("sorted nonempty samples form a valid distribution"),
+        )
+    }
+}
+
+fn percentile(values: &[u64], percent: usize) -> u64 {
+    values[(values.len() * percent).div_ceil(100).saturating_sub(1)]
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -201,20 +268,21 @@ mod tests {
     #[test]
     fn distribution_requires_samples_and_ordered_quantiles() {
         assert_eq!(
-            Distribution::new(0, 1, 2, 3, 4),
+            Distribution::new(0, 1, 2, 3, 4, 5),
             Err(InvalidDistribution::NoSamples)
         );
         assert_eq!(
-            Distribution::new(4, 1, 3, 2, 4),
+            Distribution::new(4, 1, 3, 2, 4, 5),
             Err(InvalidDistribution::QuantilesOutOfOrder)
         );
 
-        let distribution = Distribution::new(4, 1, 2, 3, 4).unwrap();
+        let distribution = Distribution::new(4, 1, 2, 3, 4, 5).unwrap();
         assert_eq!(distribution.sample_count(), 4);
         assert_eq!(distribution.median(), 1);
-        assert_eq!(distribution.percentile_95(), 2);
-        assert_eq!(distribution.percentile_99(), 3);
-        assert_eq!(distribution.worst(), 4);
+        assert_eq!(distribution.percentile_90(), 2);
+        assert_eq!(distribution.percentile_95(), 3);
+        assert_eq!(distribution.percentile_99(), 4);
+        assert_eq!(distribution.worst(), 5);
     }
 
     #[test]
@@ -225,7 +293,7 @@ mod tests {
             QueueStatistics {
                 capacity_items: 2,
                 depth_items: 1,
-                residence_micros: Some(Distribution::new(8, 400, 700, 900, 1_100).unwrap()),
+                residence_micros: Some(Distribution::new(8, 400, 600, 700, 900, 1_100).unwrap()),
                 overflow_count: 3,
                 dropped_items: 3,
             },
@@ -268,7 +336,7 @@ mod tests {
             FullFrameCopyStatistics {
                 copy_count: 3,
                 copied_bytes: 33_177_600,
-                duration_micros: Some(Distribution::new(3, 300, 400, 450, 500).unwrap()),
+                duration_micros: Some(Distribution::new(3, 300, 350, 400, 450, 500).unwrap()),
             },
         );
 
@@ -280,6 +348,30 @@ mod tests {
         assert_eq!(
             statistics.full_frame_copies[&PipelineQueue::DecodeToPresentation].copy_count,
             3
+        );
+    }
+
+    #[test]
+    fn runtime_samples_produce_selected_percentiles_and_remain_bounded() {
+        let mut samples = DistributionSamples::default();
+        for value in 1..=100 {
+            samples.observe(value);
+        }
+        let distribution = samples.distribution().unwrap();
+        assert_eq!(distribution.sample_count(), 100);
+        assert_eq!(distribution.median(), 50);
+        assert_eq!(distribution.percentile_90(), 90);
+        assert_eq!(distribution.percentile_95(), 95);
+        assert_eq!(distribution.percentile_99(), 99);
+        assert_eq!(distribution.worst(), 100);
+
+        for value in 0..=MAX_DISTRIBUTION_SAMPLES {
+            samples.observe(value as u64);
+        }
+        assert!(samples.discarded() > 0);
+        assert_eq!(
+            samples.observed(),
+            100 + MAX_DISTRIBUTION_SAMPLES as u64 + 1
         );
     }
 }

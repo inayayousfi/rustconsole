@@ -3,7 +3,7 @@ use std::io::{self, Read, Write};
 use std::net::SocketAddr;
 use zeroize::Zeroizing;
 
-pub const VERSION: u16 = 2;
+pub const VERSION: u16 = 3;
 pub const MAX_MESSAGE_SIZE: usize = 4 * 1024;
 pub const MAX_PASSWORD_SIZE: usize = 1024;
 pub const MAX_ERROR_SIZE: usize = 2048;
@@ -22,6 +22,7 @@ pub struct LaunchRequest {
     pub password: Zeroizing<Vec<u8>>,
     pub remember_password: bool,
     pub maximum_bitrate_bits_per_second: u64,
+    pub latency_diagnostics: bool,
 }
 
 pub enum PlayerCommand {
@@ -97,6 +98,7 @@ pub fn write_launch(
     payload.extend_from_slice(address.as_bytes());
     payload.extend_from_slice(&request.maximum_bitrate_bits_per_second.to_be_bytes());
     payload.push(u8::from(request.remember_password));
+    payload.push(u8::from(request.latency_diagnostics));
     payload.extend_from_slice(&password_length.to_be_bytes());
     payload.extend_from_slice(request.password.as_slice());
     write_frame(writer, &payload)
@@ -205,6 +207,15 @@ fn decode_launch(mut payload: &[u8]) -> Result<LaunchRequest, ProcessProtocolErr
             ));
         }
     };
+    let latency_diagnostics = match take(&mut payload, 1)?[0] {
+        0 => false,
+        1 => true,
+        _ => {
+            return Err(ProcessProtocolError::InvalidMessage(
+                "latency-diagnostics flag is invalid",
+            ));
+        }
+    };
     let password_length = usize::from(take_u16(&mut payload)?);
     if password_length > MAX_PASSWORD_SIZE {
         return Err(ProcessProtocolError::MessageTooLarge {
@@ -223,6 +234,7 @@ fn decode_launch(mut payload: &[u8]) -> Result<LaunchRequest, ProcessProtocolErr
         password,
         remember_password,
         maximum_bitrate_bits_per_second,
+        latency_diagnostics,
     })
 }
 
@@ -299,6 +311,7 @@ mod tests {
             password: Zeroizing::new(b"not logged".to_vec()),
             remember_password: true,
             maximum_bitrate_bits_per_second: 100_000_000,
+            latency_diagnostics: true,
         }
     }
 
@@ -314,6 +327,7 @@ mod tests {
         assert_eq!(actual.address, expected.address);
         assert_eq!(actual.password.as_slice(), expected.password.as_slice());
         assert_eq!(actual.remember_password, expected.remember_password);
+        assert_eq!(actual.latency_diagnostics, expected.latency_diagnostics);
         assert_eq!(
             actual.maximum_bitrate_bits_per_second,
             expected.maximum_bitrate_bits_per_second

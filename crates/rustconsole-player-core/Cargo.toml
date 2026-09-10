@@ -15,5 +15,6 @@ rustconsole-discovery.workspace = true
 rustconsole-media.workspace = true
 rustconsole-protocol.workspace = true
 rustconsole-session.workspace = true
+sha2.workspace = true
 tokio.workspace = true
 zeroize.workspace = true

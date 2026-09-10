@@ -6,6 +6,7 @@ use std::num::NonZeroU16;
 
 pub mod audio;
 pub mod av1;
+pub mod diagnostics;
 pub mod wire;
 
 pub use av1::{
@@ -17,6 +18,7 @@ pub use av1::{
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InputEvent {
     Key { hid_usage: u16, pressed: bool },
+    ReleaseAll,
     PointerButton { button: u8, pressed: bool },
     PointerMotion { delta_x: i32, delta_y: i32 },
     PointerPosition { x: u16, y: u16 },
@@ -24,7 +26,7 @@ pub enum InputEvent {
 }
 
 /// The protocol version implemented by this build.
-pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 1);
+pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 2);
 
 /// A protocol version whose major number marks breaking changes.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]

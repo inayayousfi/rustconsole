@@ -1,5 +1,8 @@
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use rustconsole_test_game::{LaunchOptions, RawInputState, tile_palette_index};
+use rustconsole_test_game::{
+    AUDIO_PEAK, LaunchOptions, RawInputState, synchronization_multitone,
+    synchronization_pulse_active, tile_palette_index,
+};
 use sdl3::event::Event;
 use sdl3::pixels::Color;
 use sdl3::render::FRect;
@@ -15,12 +18,12 @@ use windows::Win32::UI::Input::{
 use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{RI_KEY_BREAK, WM_INPUT};
 
-struct QuietAudio {
+struct SynchronizedAudio {
     stream: sdl3::audio::AudioStreamOwner,
     cycle: Vec<f32>,
 }
 
-impl QuietAudio {
+impl SynchronizedAudio {
     fn open(sdl: &sdl3::Sdl) -> Result<Self, String> {
         let audio = sdl.audio().map_err(|e| e.to_string())?;
         let spec = sdl3::audio::AudioSpec {
@@ -34,7 +37,7 @@ impl QuietAudio {
         let stream = device
             .open_device_stream(Some(&spec))
             .map_err(|e| e.to_string())?;
-        let cycle = rustconsole_test_game::stereo_sweep();
+        let cycle = synchronization_multitone();
         stream.put_data_f32(&cycle).map_err(|e| e.to_string())?;
         stream.resume().map_err(|e| e.to_string())?;
         Ok(Self { stream, cycle })
@@ -114,17 +117,9 @@ pub fn run(options: LaunchOptions) -> Result<(), String> {
     let frame_interval = Duration::from_secs_f64(1.0 / f64::from(mode.refresh_rate.max(1.0)));
     let mut next_frame = started;
     let mut frames = 0_u64;
-    let mut audio_error = String::new();
-    let mut audio = match QuietAudio::open(&sdl) {
-        Ok(audio) => Some(audio),
-        Err(error) => {
-            audio_error = error;
-            eprintln!("test-game audio: {audio_error}");
-            None
-        }
-    };
-
     let loop_result = (|| -> Result<(), String> {
+        let audio = SynchronizedAudio::open(&sdl)
+            .map_err(|error| format!("audio startup failed: {error}"))?;
         loop {
             for event in events.poll_iter() {
                 if matches!(event, Event::Quit { .. }) {
@@ -141,14 +136,10 @@ pub fn run(options: LaunchOptions) -> Result<(), String> {
                 return Ok(());
             }
 
-            render_stress_frame(&mut canvas, frames, &snapshot)?;
-            if let Some(sound) = audio.as_ref()
-                && let Err(error) = sound.refill()
-            {
-                audio_error = error;
-                eprintln!("test-game audio: {audio_error}");
-                audio = None;
-            }
+            render_stress_frame(&mut canvas, frames, started.elapsed(), &snapshot)?;
+            audio
+                .refill()
+                .map_err(|error| format!("audio refill failed: {error}"))?;
             frames += 1;
             next_frame += frame_interval;
             let now = Instant::now();
@@ -159,9 +150,14 @@ pub fn run(options: LaunchOptions) -> Result<(), String> {
             }
         }
     })();
+    let audio_error = loop_result
+        .as_ref()
+        .err()
+        .filter(|error| error.starts_with("audio "))
+        .cloned()
+        .unwrap_or_default();
 
     drop(raw_input);
-    drop(audio);
     canvas.window_mut().set_mouse_grab(false);
     sdl.mouse().show_cursor(true);
     let elapsed = started.elapsed();
@@ -173,7 +169,7 @@ pub fn run(options: LaunchOptions) -> Result<(), String> {
         std::fs::write(
             path,
             format!(
-                "status={}\nrenderer={}\ndisplay={}\nwidth={}\nheight={}\nrefresh_hz={:.3}\nframes={}\nelapsed_micros={}\nmouse_packets={}\nmouse_delta_x={}\nmouse_delta_y={}\nmouse_wheels={}\nkeyboard_packets={}\npixel_readback=not-performed\naudio=looping-right-to-left\naudio_peak=0.01\naudio_error={audio_error}\n",
+                "status={}\nrenderer={}\ndisplay={}\nwidth={}\nheight={}\nrefresh_hz={:.3}\nframes={}\nelapsed_micros={}\nmouse_packets={}\nmouse_delta_x={}\nmouse_delta_y={}\nmouse_wheels={}\nkeyboard_packets={}\npixel_readback=not-performed\naudio=synchronized-stereo-multitone\naudio_peak={AUDIO_PEAK}\naudio_sync_period_micros=1000000\naudio_sync_pulse_micros=100000\naudio_error={audio_error}\n",
                 if loop_result.is_ok() { "ok" } else { "error" },
                 canvas.renderer_name,
                 display.get_name().map_err(|error| error.to_string())?,
@@ -197,6 +193,7 @@ pub fn run(options: LaunchOptions) -> Result<(), String> {
 fn render_stress_frame(
     canvas: &mut sdl3::render::WindowCanvas,
     frame: u64,
+    elapsed: Duration,
     input: &RawInputState,
 ) -> Result<(), String> {
     let (width, height) = canvas.output_size().map_err(|error| error.to_string())?;
@@ -234,6 +231,30 @@ fn render_stress_frame(
     canvas.set_draw_color(marker_color);
     canvas
         .fill_rect(FRect::new(marker_x - 36.0, marker_y - 36.0, 72.0, 72.0))
+        .map_err(|error| error.to_string())?;
+    canvas.set_draw_color(Color::RGB(255, 255, 255));
+    canvas
+        .fill_rect(FRect::new(16.0, 16.0, 32.0, 32.0))
+        .map_err(|error| error.to_string())?;
+    canvas.set_draw_color(Color::RGB(0, 0, 0));
+    canvas
+        .fill_rect(FRect::new(48.0, 16.0, 32.0, 32.0))
+        .map_err(|error| error.to_string())?;
+    canvas.set_draw_color(if input.mouse_button_presses.is_multiple_of(2) {
+        Color::RGB(255, 255, 255)
+    } else {
+        Color::RGB(0, 0, 0)
+    });
+    canvas
+        .fill_rect(FRect::new(80.0, 16.0, 32.0, 32.0))
+        .map_err(|error| error.to_string())?;
+    canvas.set_draw_color(if synchronization_pulse_active(elapsed) {
+        Color::RGB(255, 230, 0)
+    } else {
+        Color::RGB(20, 20, 20)
+    });
+    canvas
+        .fill_rect(FRect::new(112.0, 16.0, 32.0, 32.0))
         .map_err(|error| error.to_string())?;
     if !canvas.present() {
         return Err(sdl3::get_error().to_string());

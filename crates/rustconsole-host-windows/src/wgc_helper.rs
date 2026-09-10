@@ -3,7 +3,7 @@ use crate::worker_protocol::{
     WorkerCaptureEngine, WorkerVideoColor, WorkerVideoConfiguration, WorkerVideoFormat,
 };
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use windows::Win32::Foundation::{CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE};
 use windows::Win32::System::RemoteDesktop::WTSGetActiveConsoleSessionId;
@@ -12,19 +12,23 @@ use windows::Win32::System::Threading::GetCurrentProcess;
 const HELLO_MAGIC: u32 = 0x4847_4352;
 const FRAME_MAGIC: u32 = 0x4647_4352;
 const HELLO_SIZE: usize = 252;
-const FRAME_SIZE: usize = 220;
+const FRAME_SIZE: usize = 244;
 const HELPER_BYTES: &[u8] = include_bytes!(env!("RUSTCONSOLE_WGC_HELPER"));
 
 pub struct WgcHelper {
     connection: InteractiveHelperConnection,
     shared_texture: HANDLE,
     pub configuration: WorkerVideoConfiguration,
+    configured: bool,
 }
 
 pub struct WgcFrame {
     pub last_present_time: i64,
     pub accumulated_frames: u32,
     pub protected_content_masked: bool,
+    pub capture_acquisition_micros: u64,
+    pub cross_adapter_copy_micros: u64,
+    pub color_conversion_micros: u64,
 }
 
 impl WgcHelper {
@@ -95,6 +99,7 @@ impl WgcHelper {
             connection,
             shared_texture,
             configuration,
+            configured: false,
         })
     }
 
@@ -102,7 +107,14 @@ impl WgcHelper {
         self.shared_texture
     }
 
-    pub fn next_frame(&self) -> Result<WgcFrame, Box<dyn std::error::Error>> {
+    pub fn next_frame(
+        &mut self,
+        diagnostics: bool,
+    ) -> Result<WgcFrame, Box<dyn std::error::Error>> {
+        if !self.configured {
+            (&self.connection.channel).write_all(&[u8::from(diagnostics)])?;
+            self.configured = true;
+        }
         let mut frame = [0_u8; FRAME_SIZE];
         read_exact(&self.connection.channel, &mut frame)?;
         if u32_at(&frame, 0) != FRAME_MAGIC {
@@ -112,7 +124,7 @@ impl WgcHelper {
         if result < 0 {
             return Err(format!(
                 "WGC helper capture failed at {}: {}",
-                stage_at(&frame, 28),
+                stage_at(&frame, 52),
                 windows::core::Error::from_hresult(windows::core::HRESULT(result))
             )
             .into());
@@ -121,6 +133,9 @@ impl WgcHelper {
             last_present_time: i64_at(&frame, 8),
             accumulated_frames: u32_at(&frame, 16),
             protected_content_masked: i32_at(&frame, 20) != 0,
+            capture_acquisition_micros: u64_at(&frame, 28),
+            cross_adapter_copy_micros: u64_at(&frame, 36),
+            color_conversion_micros: u64_at(&frame, 44),
         })
     }
 }

@@ -19,7 +19,10 @@ rustconsole-protocol.workspace = true
 rustconsole-render.workspace = true
 rustconsole-render-vulkan.workspace = true
 rustconsole-render-vulkan-linux.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 zeroize.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
 sdl3.workspace = true

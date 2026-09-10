@@ -146,11 +146,17 @@ impl InputSession {
         self.pointer_mode
     }
 
+    #[must_use]
+    pub const fn reliable_sequence(&self) -> u64 {
+        self.reliable_sequence
+    }
+
     pub fn reliable<S: ReportSink>(
         &mut self,
         transition: InputTransition,
         sink: &mut S,
     ) -> Result<InputAck, InputSessionError<S::Error>> {
+        let player_sent_at_micros = transition.player_sent_at_micros;
         if transition.generation == 0 || transition.sequence == 0 {
             return Err(InputSessionError::InvalidTransition);
         }
@@ -233,6 +239,25 @@ impl InputSession {
         Ok(InputAck {
             generation: self.generation,
             through_sequence: self.reliable_sequence,
+            player_sent_at_micros,
+            host_received_at_micros: 0,
+            host_submitted_at_micros: 0,
+            pointer_datagrams_received: 0,
+            pointer_updates_applied: 0,
+            pointer_updates_ignored: 0,
+            mouse_reports_published: 0,
+            keyboard_reports_published: 0,
+            reliable_transitions_received: 0,
+            reliable_transitions_applied: 0,
+            reliable_transitions_rejected: 0,
+            reliable_transitions_missing: 0,
+            reliable_transitions_duplicate_or_late: 0,
+            release_all_transitions: 0,
+            pointer_missing_datagrams: 0,
+            pointer_stale_generations: 0,
+            pointer_duplicate_or_late: 0,
+            pointer_mode_rejections: 0,
+            pointer_relative_baselines: 0,
         })
     }
 
@@ -320,6 +345,7 @@ impl VirtualInputState {
     ) -> Result<(), ApplyError<S::Error>> {
         match event {
             InputEvent::Key { hid_usage, pressed } => self.key(hid_usage, pressed, sink),
+            InputEvent::ReleaseAll => self.release_all(sink),
             InputEvent::PointerButton { button, pressed } => self.button(button, pressed, sink),
             InputEvent::PointerMotion { delta_x, delta_y } => self.relative(delta_x, delta_y, sink),
             InputEvent::PointerPosition { x, y } => sink
@@ -643,12 +669,14 @@ mod tests {
                 hid_usage: 4,
                 pressed,
             })),
+            player_sent_at_micros: 0,
         };
         assert_eq!(
             session.reliable(transition(1, true), &mut sink).unwrap(),
             InputAck {
                 generation: 7,
-                through_sequence: 1
+                through_sequence: 1,
+                ..InputAck::default()
             }
         );
         assert!(matches!(
@@ -660,7 +688,8 @@ mod tests {
             session.reliable(transition(2, false), &mut sink).unwrap(),
             InputAck {
                 generation: 7,
-                through_sequence: 2
+                through_sequence: 2,
+                ..InputAck::default()
             }
         );
         session.reliable(transition(3, true), &mut sink).unwrap();
@@ -671,6 +700,7 @@ mod tests {
                     generation: 8,
                     sequence: 1,
                     action: None,
+                    player_sent_at_micros: 0,
                 },
                 &mut sink,
             ),
@@ -694,6 +724,7 @@ mod tests {
                             mode: PointerMode::Relative as i32,
                         },
                     )),
+                    player_sent_at_micros: 0,
                 },
                 &mut sink,
             )

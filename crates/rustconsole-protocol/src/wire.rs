@@ -16,7 +16,7 @@ pub const RELIABLE_FRAME_PREFIX_SIZE: usize = size_of::<u32>();
 pub struct Envelope {
     #[prost(
         oneof = "envelope::Body",
-        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18"
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20"
     )]
     pub body: Option<envelope::Body>,
 }
@@ -42,6 +42,10 @@ pub mod envelope {
         KeyboardLeds(super::KeyboardLeds),
         #[prost(message, tag = "18")]
         VideoStreamState(super::VideoStreamState),
+        #[prost(message, tag = "19")]
+        ClockPing(super::ClockPing),
+        #[prost(message, tag = "20")]
+        ClockPong(super::ClockPong),
         #[prost(message, tag = "1")]
         VersionOffer(VersionOffer),
         #[prost(message, tag = "2")]
@@ -79,6 +83,8 @@ pub struct InputTransition {
     pub sequence: u64,
     #[prost(oneof = "input_transition::Action", tags = "3, 4, 5, 6, 7")]
     pub action: Option<input_transition::Action>,
+    #[prost(uint64, tag = "8")]
+    pub player_sent_at_micros: u64,
 }
 
 pub mod input_transition {
@@ -146,6 +152,64 @@ pub struct InputAck {
     pub generation: u64,
     #[prost(uint64, tag = "2")]
     pub through_sequence: u64,
+    #[prost(uint64, tag = "3")]
+    pub player_sent_at_micros: u64,
+    #[prost(uint64, tag = "4")]
+    pub host_received_at_micros: u64,
+    #[prost(uint64, tag = "5")]
+    pub host_submitted_at_micros: u64,
+    #[prost(uint64, tag = "6")]
+    pub pointer_datagrams_received: u64,
+    #[prost(uint64, tag = "7")]
+    pub pointer_updates_applied: u64,
+    #[prost(uint64, tag = "8")]
+    pub pointer_updates_ignored: u64,
+    #[prost(uint64, tag = "9")]
+    pub mouse_reports_published: u64,
+    #[prost(uint64, tag = "10")]
+    pub keyboard_reports_published: u64,
+    #[prost(uint64, tag = "11")]
+    pub reliable_transitions_received: u64,
+    #[prost(uint64, tag = "12")]
+    pub reliable_transitions_applied: u64,
+    #[prost(uint64, tag = "13")]
+    pub reliable_transitions_rejected: u64,
+    #[prost(uint64, tag = "14")]
+    pub reliable_transitions_missing: u64,
+    #[prost(uint64, tag = "15")]
+    pub reliable_transitions_duplicate_or_late: u64,
+    #[prost(uint64, tag = "16")]
+    pub release_all_transitions: u64,
+    #[prost(uint64, tag = "17")]
+    pub pointer_missing_datagrams: u64,
+    #[prost(uint64, tag = "18")]
+    pub pointer_stale_generations: u64,
+    #[prost(uint64, tag = "19")]
+    pub pointer_duplicate_or_late: u64,
+    #[prost(uint64, tag = "20")]
+    pub pointer_mode_rejections: u64,
+    #[prost(uint64, tag = "21")]
+    pub pointer_relative_baselines: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Message)]
+pub struct ClockPing {
+    #[prost(uint64, tag = "1")]
+    pub sequence: u64,
+    #[prost(uint64, tag = "2")]
+    pub player_sent_at_micros: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Message)]
+pub struct ClockPong {
+    #[prost(uint64, tag = "1")]
+    pub sequence: u64,
+    #[prost(uint64, tag = "2")]
+    pub player_sent_at_micros: u64,
+    #[prost(uint64, tag = "3")]
+    pub host_received_at_micros: u64,
+    #[prost(uint64, tag = "4")]
+    pub host_sent_at_micros: u64,
 }
 
 #[derive(Clone, Copy, PartialEq, Message)]
@@ -342,6 +406,8 @@ pub struct Av1CapabilityOffer {
     pub viewer_settings: Option<Av1ViewerSettings>,
     #[prost(message, optional, tag = "4")]
     pub audio_transport: Option<AudioConfiguration>,
+    #[prost(bool, tag = "5")]
+    pub full_diagnostics: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Message)]
@@ -475,6 +541,8 @@ pub struct SelectedAv1Configuration {
     // Field 6 was the minimum bitrate and must not be reused.
     #[prost(message, optional, tag = "7")]
     pub audio_transport: Option<AudioConfiguration>,
+    #[prost(bool, tag = "8")]
+    pub full_diagnostics: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, prost::Enumeration)]
@@ -707,6 +775,7 @@ mod tests {
             maximum_bitrate_bits_per_second: 100_000_000,
         };
         let selected = SelectedAv1Configuration {
+            full_diagnostics: false,
             audio_transport: None,
             width: 2_560,
             height: 1_440,
@@ -922,6 +991,7 @@ mod tests {
 #[test]
 fn audio_offer_has_a_fixed_fixture_and_is_optional_to_older_peers() {
     let offer = Av1CapabilityOffer {
+        full_diagnostics: false,
         encoder_capabilities: Vec::new(),
         decoder_capabilities: Vec::new(),
         viewer_settings: None,

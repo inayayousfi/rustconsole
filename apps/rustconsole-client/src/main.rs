@@ -328,6 +328,7 @@ fn start(
     password: String,
     remember: bool,
     maximum_bitrate_mbps: u64,
+    latency_diagnostics: bool,
 ) -> Result<(), String> {
     let maximum_bitrate_bits_per_second = maximum_bitrate(maximum_bitrate_mbps)?;
     let address = resolve_host_addresses(host.trim())?
@@ -344,6 +345,7 @@ fn start(
         password: Zeroizing::new(password.to_vec()),
         remember_password: remember,
         maximum_bitrate_bits_per_second,
+        latency_diagnostics,
     };
     let player = Arc::new(
         PlayerProcess::launch(&player_executable()?, &request)
@@ -394,7 +396,7 @@ fn player_executable() -> Result<PathBuf, String> {
 }
 
 fn supervise_player(app: &tauri::AppHandle, player: Arc<PlayerProcess>) {
-    loop {
+    let error = loop {
         match player.next_event() {
             Ok(PlayerEvent::Authenticated { host_identity }) => {
                 let identity = host_identity
@@ -407,13 +409,11 @@ fn supervise_player(app: &tauri::AppHandle, player: Arc<PlayerProcess>) {
                 let _ = app.emit("player-started", ());
             }
             Ok(PlayerEvent::Ended) => {
-                let _ = app.emit("player-ended", Option::<String>::None);
-                break;
+                break None;
             }
             Ok(PlayerEvent::Error(error)) => {
                 eprintln!("rustconsole-player: {error}");
-                let _ = app.emit("player-ended", Some(error));
-                break;
+                break Some(error);
             }
             Err(error) => {
                 let message = match player.wait() {
@@ -425,11 +425,10 @@ fn supervise_player(app: &tauri::AppHandle, player: Arc<PlayerProcess>) {
                     ),
                 };
                 eprintln!("rustconsole-player: {message}");
-                let _ = app.emit("player-ended", Some(message));
-                break;
+                break Some(message);
             }
         }
-    }
+    };
     let _ = player.wait();
     let state = app.state::<ClientRuntime>();
     let mut active = state.player.lock().unwrap();
@@ -439,6 +438,8 @@ fn supervise_player(app: &tauri::AppHandle, player: Arc<PlayerProcess>) {
     {
         *active = None;
     }
+    drop(active);
+    let _ = app.emit("player-ended", error);
 }
 
 fn main() -> ExitCode {

@@ -33,6 +33,7 @@ struct DeviceState {
     config: DeviceConfig,
     pending_reads: WDFQUEUE,
     ipc: InputIpc,
+    pumping: bool,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -174,6 +175,7 @@ extern "C" fn evt_driver_device_add(
             config,
             pending_reads,
             ipc,
+            pumping: false,
             worker: None,
         },
     );
@@ -432,33 +434,67 @@ fn input_worker(key: usize) {
 }
 
 fn pump_reports(key: usize) {
+    let pending_reads = {
+        let Ok(mut devices) = devices().lock() else {
+            return;
+        };
+        let Some(state) = devices.get_mut(&key) else {
+            return;
+        };
+        if state.pumping {
+            return;
+        }
+        state.pumping = true;
+        state.pending_reads
+    };
     loop {
-        let Ok(devices) = devices().lock() else {
-            return;
-        };
-        let Some(state) = devices.get(&key) else {
-            return;
-        };
-        let report = match ipc::read_report(&state.ipc, state.config.kind) {
-            Ok(Some(report)) => report,
-            Ok(None) | Err(()) => return,
+        let report = {
+            let Ok(mut devices) = devices().lock() else {
+                return;
+            };
+            let Some(state) = devices.get_mut(&key) else {
+                return;
+            };
+            match ipc::read_report(&state.ipc, state.config.kind) {
+                Ok(Some(report)) => report,
+                Ok(None) | Err(()) => {
+                    state.pumping = false;
+                    return;
+                }
+            }
         };
         let mut request: WDFREQUEST = WDF_NO_HANDLE.cast();
         // SAFETY: pending_reads is live and request points to output storage.
         let status = unsafe {
             call_unsafe_wdf_function_binding!(
                 WdfIoQueueRetrieveNextRequest,
-                state.pending_reads,
+                pending_reads,
                 &mut request,
             )
         };
         if status != STATUS_SUCCESS {
+            if let Ok(mut devices) = devices().lock()
+                && let Some(state) = devices.get_mut(&key)
+            {
+                state.pumping = false;
+            }
             return;
         }
         // SAFETY: the retrieved request is exclusively owned until completion.
         if unsafe { complete_bytes(request, &report.1) } {
+            let Ok(devices) = devices().lock() else {
+                return;
+            };
+            let Some(state) = devices.get(&key) else {
+                return;
+            };
             ipc::consume(&state.ipc, report.0);
         } else {
+            if let Ok(mut devices) = devices().lock()
+                && let Some(state) = devices.get_mut(&key)
+            {
+                state.pumping = false;
+            }
             return;
         }
     }

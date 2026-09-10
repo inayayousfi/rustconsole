@@ -3,6 +3,7 @@ const { listen } = window.__TAURI__.event;
 
 const machineStorageKey = "rustconsole-recent-hosts";
 const bitrateStorageKey = "rustconsole-maximum-bitrate";
+const latencyDiagnosticsStorageKey = "rustconsole-latency-diagnostics";
 const defaultPort = 47999;
 const defaultBitrate = 20;
 const discoveryAuthQueue = new window.RustConsoleDiscoveryAuth.UniqueAsyncQueue();
@@ -39,6 +40,7 @@ const elements = {
   credentialSubmit: document.querySelector("#credential-submit"),
   bitrate: document.querySelector("#maximum-bitrate"),
   bitrateValue: document.querySelector("#maximum-bitrate-value"),
+  latencyDiagnostics: document.querySelector("#latency-diagnostics"),
   disconnect: document.querySelector("#disconnect-button"),
   appMessage: document.querySelector("#app-message"),
   audioPrerequisiteDialog: document.querySelector("#audio-prerequisite-dialog"),
@@ -287,6 +289,14 @@ async function probeAllMachines() {
   await Promise.allSettled(machines.map((item) => probeMachine(item)));
 }
 
+async function probeUntilSessionReleased(item) {
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    await new Promise((resolve) => window.setTimeout(resolve, 500));
+    const result = await probeMachine(item);
+    if (result.availability !== "busy") return;
+  }
+}
+
 function discoveredRoute(value, storedEndpoint = null) {
   return {
     endpoint: value.endpoint,
@@ -514,6 +524,7 @@ async function startPlayer(item, password = "", remember = false) {
       password,
       remember,
       maximumBitrateMbps: Number(elements.bitrate.value),
+      latencyDiagnostics: elements.latencyDiagnostics.checked,
     });
     activeEndpoint = item.preferredEndpoint;
     playerActive = true;
@@ -750,6 +761,10 @@ elements.bitrate.addEventListener("input", () => {
   updateBitrate(value);
 });
 
+elements.latencyDiagnostics.addEventListener("change", () => {
+  localStorage.setItem(latencyDiagnosticsStorageKey, String(elements.latencyDiagnostics.checked));
+});
+
 elements.disconnect.addEventListener("click", async () => {
   if (!playerActive) return;
   await invoke("disconnect");
@@ -796,11 +811,15 @@ await listen("player-ended", ({ payload }) => {
       item.detail = "Stream failed";
     }
     showAppMessage(payload);
+  } else if (item) {
+    item.state = "available";
+    item.detail = "Available";
   }
   renderMachines();
-  if (!payload) window.setTimeout(probeAllMachines, 500);
+  if (!payload && item) void probeUntilSessionReleased(item);
 });
 
 updateBitrate(loadBitrate());
+elements.latencyDiagnostics.checked = localStorage.getItem(latencyDiagnosticsStorageKey) === "true";
 renderMachines();
 setPage(location.hash === "#settings" ? "settings" : "machines");

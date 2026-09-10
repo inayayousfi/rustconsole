@@ -414,6 +414,13 @@ pub struct DecodedNv12Frame {
     pub uv_plane: Vec<u8>,
 }
 
+pub struct DecodedLumaFrame {
+    pub width: u32,
+    pub height: u32,
+    pub bit_depth: u16,
+    pub samples: Vec<u16>,
+}
+
 #[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DmaBufObject {
@@ -534,6 +541,12 @@ struct AvDrmFrameDescriptor {
 
 impl DecodedAv1Frame {
     #[must_use]
+    pub fn presentation_timestamp(&self) -> i64 {
+        // SAFETY: frame remains owned and the decoder initialized its timestamp.
+        unsafe { (*self.frame.0.as_ptr()).pts }
+    }
+
+    #[must_use]
     pub fn width(&self) -> u32 {
         // SAFETY: frame remains owned and its dimensions were validated on receipt.
         unsafe { (*self.frame.0.as_ptr()).width as u32 }
@@ -594,6 +607,130 @@ impl DecodedAv1Frame {
             height: height as u32,
             y_plane,
             uv_plane,
+        })
+    }
+
+    pub fn download_luma_samples(
+        &self,
+        coordinates: &[(u32, u32)],
+    ) -> Result<(Vec<u16>, u16, u64), Av1CodecError> {
+        let software = Frame::allocate()?;
+        // SAFETY: both frames are live; FFmpeg transfers the complete hardware frame.
+        let result =
+            unsafe { ffi::av_hwframe_transfer_data(software.0.as_ptr(), self.frame.0.as_ptr(), 0) };
+        if result < 0 {
+            return Err(Av1CodecError::TransferFrame(result));
+        }
+        // SAFETY: transfer succeeded and initialized the destination frame.
+        let frame = unsafe { &*software.0.as_ptr() };
+        let width = u32::try_from(frame.width)
+            .map_err(|_| Av1CodecError::InvalidHardwareFrame("negative decoded width"))?;
+        let height = u32::try_from(frame.height)
+            .map_err(|_| Av1CodecError::InvalidHardwareFrame("negative decoded height"))?;
+        let stride = usize::try_from(frame.linesize[0])
+            .map_err(|_| Av1CodecError::InvalidHardwareFrame("negative decoded luma stride"))?;
+        if coordinates.iter().any(|&(x, y)| x >= width || y >= height) {
+            return Err(Av1CodecError::InvalidHardwareFrame(
+                "luma sample is outside the decoded frame",
+            ));
+        }
+        match frame.format {
+            value if value == ffi::AVPixelFormat::AV_PIX_FMT_NV12 as i32 => {
+                if stride < width as usize {
+                    return Err(Av1CodecError::InvalidHardwareFrame(
+                        "decoded NV12 luma stride is too small",
+                    ));
+                }
+                // SAFETY: the validated coordinates address bytes in the transferred Y plane.
+                let samples = coordinates
+                    .iter()
+                    .map(|&(x, y)| unsafe {
+                        u16::from(*frame.data[0].add(y as usize * stride + x as usize))
+                    })
+                    .collect();
+                let bytes = u64::from(width) * u64::from(height) * 3 / 2;
+                Ok((samples, 8, bytes))
+            }
+            value if value == ffi::AVPixelFormat::AV_PIX_FMT_P010LE as i32 => {
+                if stride < width as usize * 2 {
+                    return Err(Av1CodecError::InvalidHardwareFrame(
+                        "decoded P010 luma stride is too small",
+                    ));
+                }
+                // SAFETY: the validated coordinates address two-byte samples in the transferred Y plane.
+                let samples = coordinates
+                    .iter()
+                    .map(|&(x, y)| {
+                        let pointer =
+                            unsafe { frame.data[0].add(y as usize * stride + x as usize * 2) };
+                        u16::from_le_bytes(unsafe { [*pointer, *pointer.add(1)] }) >> 6
+                    })
+                    .collect();
+                let bytes = u64::from(width) * u64::from(height) * 3;
+                Ok((samples, 10, bytes))
+            }
+            _ => Err(Av1CodecError::InvalidHardwareFrame(
+                "decoded software format is neither NV12 nor P010LE",
+            )),
+        }
+    }
+
+    pub fn download_luma(&self) -> Result<DecodedLumaFrame, Av1CodecError> {
+        let software = Frame::allocate()?;
+        // SAFETY: both frames are live; FFmpeg allocates and fills a software frame.
+        let result =
+            unsafe { ffi::av_hwframe_transfer_data(software.0.as_ptr(), self.frame.0.as_ptr(), 0) };
+        if result < 0 {
+            return Err(Av1CodecError::TransferFrame(result));
+        }
+        // SAFETY: transfer succeeded and initialized the destination frame.
+        let frame = unsafe { &*software.0.as_ptr() };
+        let width = usize::try_from(frame.width)
+            .map_err(|_| Av1CodecError::InvalidHardwareFrame("negative decoded width"))?;
+        let height = usize::try_from(frame.height)
+            .map_err(|_| Av1CodecError::InvalidHardwareFrame("negative decoded height"))?;
+        let stride = usize::try_from(frame.linesize[0])
+            .map_err(|_| Av1CodecError::InvalidHardwareFrame("negative decoded luma stride"))?;
+        let (bit_depth, row_bytes) = match frame.format {
+            value if value == ffi::AVPixelFormat::AV_PIX_FMT_NV12 as i32 => (8, width),
+            value if value == ffi::AVPixelFormat::AV_PIX_FMT_P010LE as i32 => (10, width * 2),
+            _ => {
+                return Err(Av1CodecError::InvalidHardwareFrame(
+                    "decoded software format is neither NV12 nor P010LE",
+                ));
+            }
+        };
+        if stride < row_bytes {
+            return Err(Av1CodecError::InvalidHardwareFrame(
+                "decoded luma stride is too small",
+            ));
+        }
+        let mut samples = Vec::with_capacity(width.checked_mul(height).ok_or(
+            Av1CodecError::InvalidHardwareFrame("decoded luma size overflowed"),
+        )?);
+        for row in 0..height {
+            // SAFETY: the validated stride and dimensions keep each row in the frame plane.
+            let source = unsafe { frame.data[0].add(row * stride) };
+            if bit_depth == 8 {
+                // SAFETY: row_bytes bytes are available in this row.
+                samples.extend(
+                    unsafe { std::slice::from_raw_parts(source, width) }
+                        .iter()
+                        .map(|&value| u16::from(value)),
+                );
+            } else {
+                for column in 0..width {
+                    // SAFETY: P010 stores one little-endian u16 luma sample per column.
+                    let sample = unsafe { source.add(column * 2) };
+                    samples.push(u16::from_le_bytes(unsafe { [*sample, *sample.add(1)] }) >> 6);
+                }
+            }
+        }
+        Ok(DecodedLumaFrame {
+            width: width as u32,
+            height: height as u32,
+            bit_depth,
+            samples,
         })
     }
 
@@ -835,6 +972,105 @@ impl Av1VaApiDecoder {
         {
             return Err(Av1CodecError::InvalidHardwareFrame(
                 "decoder did not return a VA-API frame",
+            ));
+        }
+        Ok(Some(DecodedAv1Frame { frame }))
+    }
+}
+
+#[cfg(windows)]
+pub struct Av1D3d11Decoder {
+    context: CodecContext,
+}
+
+#[cfg(windows)]
+impl Av1D3d11Decoder {
+    pub fn open(device: &HardwareDevice) -> Result<Self, Av1CodecError> {
+        const CODEC_NAME: &str = "av1";
+        require_device(device, HardwareDeviceType::D3d11Va)?;
+        ffmpeg_next::init().map_err(Av1CodecError::Initialization)?;
+
+        let codec_name = c"av1";
+        // SAFETY: codec_name is a static null-terminated string.
+        let codec = unsafe { ffi::avcodec_find_decoder_by_name(codec_name.as_ptr()) };
+        if codec.is_null() {
+            return Err(Av1CodecError::DecoderNotFound);
+        }
+        require_hardware_configuration(
+            codec,
+            CODEC_NAME,
+            HardwareDeviceType::D3d11Va,
+            ffi::AVPixelFormat::AV_PIX_FMT_D3D11,
+            ffi::AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX as i32,
+        )?;
+
+        let context = CodecContext::allocate(codec, CODEC_NAME)?;
+        let device_reference = device
+            .reference()
+            .ok_or(Av1CodecError::ReferenceHardwareDevice)?;
+        // SAFETY: context is exclusively owned, and FFmpeg takes ownership of
+        // the device reference. The callback selects D3D11VA or fails.
+        unsafe {
+            (*context.0.as_ptr()).hw_device_ctx = device_reference.as_ptr();
+            (*context.0.as_ptr()).get_format = Some(select_d3d11_format);
+        }
+        // SAFETY: context and codec match and all required fields are initialized.
+        let result = unsafe { ffi::avcodec_open2(context.0.as_ptr(), codec, ptr::null_mut()) };
+        if result < 0 {
+            return Err(Av1CodecError::Open {
+                codec: CODEC_NAME,
+                code: result,
+            });
+        }
+        Ok(Self { context })
+    }
+
+    pub fn decode_packet(
+        &mut self,
+        payload: &[u8],
+        presentation_timestamp: i64,
+    ) -> Result<Option<DecodedAv1Frame>, Av1CodecError> {
+        if payload.is_empty() || payload.len() > i32::MAX as usize {
+            return Err(Av1CodecError::InvalidHardwareFrame(
+                "invalid AV1 packet size",
+            ));
+        }
+        let packet = Packet::allocate()?;
+        // SAFETY: packet is exclusively owned and the requested size is valid.
+        let result = unsafe { ffi::av_new_packet(packet.0.as_ptr(), payload.len() as i32) };
+        if result < 0 {
+            return Err(Av1CodecError::AllocatePacketPayload(result));
+        }
+        // SAFETY: av_new_packet allocated the payload and packet is exclusively owned.
+        unsafe {
+            ptr::copy_nonoverlapping(payload.as_ptr(), (*packet.0.as_ptr()).data, payload.len());
+            (*packet.0.as_ptr()).pts = presentation_timestamp;
+        }
+        // SAFETY: codec and packet are initialized and exclusively accessed.
+        let result =
+            unsafe { ffi::avcodec_send_packet(self.context.0.as_ptr(), packet.0.as_ptr()) };
+        if result < 0 {
+            return Err(Av1CodecError::SendPacket(result));
+        }
+
+        let frame = Frame::allocate()?;
+        // SAFETY: codec and frame are initialized and exclusively accessed.
+        let result =
+            unsafe { ffi::avcodec_receive_frame(self.context.0.as_ptr(), frame.0.as_ptr()) };
+        if result == -11 {
+            return Ok(None);
+        }
+        if result < 0 {
+            return Err(Av1CodecError::ReceiveFrame(result));
+        }
+        // SAFETY: successful receive initialized all public frame fields.
+        let received = unsafe { &*frame.0.as_ptr() };
+        if received.format != ffi::AVPixelFormat::AV_PIX_FMT_D3D11 as i32
+            || received.width <= 0
+            || received.height <= 0
+        {
+            return Err(Av1CodecError::InvalidHardwareFrame(
+                "decoder did not return a D3D11VA frame",
             ));
         }
         Ok(Some(DecodedAv1Frame { frame }))
@@ -1231,6 +1467,27 @@ unsafe extern "C" fn select_vaapi_format(
     unsafe {
         while *format != ffi::AVPixelFormat::AV_PIX_FMT_NONE {
             if *format == ffi::AVPixelFormat::AV_PIX_FMT_VAAPI {
+                return *format;
+            }
+            format = format.add(1);
+        }
+    }
+    ffi::AVPixelFormat::AV_PIX_FMT_NONE
+}
+
+#[cfg(windows)]
+unsafe extern "C" fn select_d3d11_format(
+    _context: *mut ffi::AVCodecContext,
+    formats: *const ffi::AVPixelFormat,
+) -> ffi::AVPixelFormat {
+    if formats.is_null() {
+        return ffi::AVPixelFormat::AV_PIX_FMT_NONE;
+    }
+    let mut format = formats;
+    // SAFETY: FFmpeg provides an AV_PIX_FMT_NONE-terminated format array.
+    unsafe {
+        while *format != ffi::AVPixelFormat::AV_PIX_FMT_NONE {
+            if *format == ffi::AVPixelFormat::AV_PIX_FMT_D3D11 {
                 return *format;
             }
             format = format.add(1);

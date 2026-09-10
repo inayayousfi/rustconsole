@@ -14,6 +14,7 @@ rustconsole-codec-ffmpeg.workspace = true
 rustconsole-media.workspace = true
 rustconsole-protocol.workspace = true
 rustconsole-player-core.workspace = true
+sha2.workspace = true
 zeroize.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]

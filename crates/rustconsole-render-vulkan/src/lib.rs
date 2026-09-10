@@ -8,12 +8,95 @@ use ash::{Entry, vk};
 use egui::epaint::Primitive;
 use egui::{ClippedPrimitive, Color32, FullOutput, TextureId};
 use egui_ash_renderer::{Options as EguiRendererOptions, Renderer as EguiRenderer};
-use rustconsole_render::{DecodedVideoColor, PlayerVideoBackend};
+use rustconsole_render::{
+    DecodedVideoColor, PlayerVideoBackend, PresentationDiagnostics, PresentationFeedback,
+    PresentationSubmission,
+};
 use std::ffi::{CStr, CString};
 use std::io::Cursor;
 use std::marker::PhantomData;
+use std::sync::mpsc;
+use std::thread;
+use std::time::Instant;
 
 const FRAMES_IN_FLIGHT: usize = 2;
+
+enum PresentationCommand {
+    Wait {
+        swapchain: vk::SwapchainKHR,
+        id: u64,
+    },
+    Drain(mpsc::SyncSender<()>),
+    Stop,
+}
+
+struct PresentationTracker {
+    commands: mpsc::SyncSender<PresentationCommand>,
+    feedback: mpsc::Receiver<PresentationFeedback>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl PresentationTracker {
+    fn new(instance: &ash::Instance, device: &ash::Device) -> Self {
+        let wait = ash::khr::present_wait::Device::new(instance, device);
+        let (commands, command_rx) = mpsc::sync_channel(32);
+        let (feedback_tx, feedback) = mpsc::sync_channel(32);
+        let thread = thread::spawn(move || {
+            while let Ok(command) = command_rx.recv() {
+                match command {
+                    PresentationCommand::Wait { swapchain, id } => {
+                        if unsafe { wait.wait_for_present(swapchain, id, u64::MAX) }.is_ok() {
+                            let _ = feedback_tx.try_send(PresentationFeedback {
+                                id,
+                                presented_at: Instant::now(),
+                            });
+                        }
+                    }
+                    PresentationCommand::Drain(complete) => {
+                        let _ = complete.send(());
+                    }
+                    PresentationCommand::Stop => break,
+                }
+            }
+        });
+        Self {
+            commands,
+            feedback,
+            thread: Some(thread),
+        }
+    }
+
+    fn track(&self, swapchain: vk::SwapchainKHR, id: u64) -> bool {
+        self.commands
+            .try_send(PresentationCommand::Wait { swapchain, id })
+            .is_ok()
+    }
+
+    fn drain(&self) {
+        let (complete, completed) = mpsc::sync_channel(1);
+        if self
+            .commands
+            .send(PresentationCommand::Drain(complete))
+            .is_ok()
+        {
+            let _ = completed.recv();
+        }
+    }
+
+    fn take(&self) -> Option<PresentationFeedback> {
+        self.feedback.try_recv().ok()
+    }
+}
+
+impl Drop for PresentationTracker {
+    fn drop(&mut self) {
+        self.drain();
+        let _ = self.commands.send(PresentationCommand::Stop);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum VulkanOutputPreference {
@@ -85,6 +168,8 @@ where
     hdr10_output: bool,
     importer: Importer,
     color_parameters: VideoColorParameters,
+    presentation_tracker: Option<PresentationTracker>,
+    next_present_id: u64,
     frame_type: PhantomData<fn(&Frame)>,
 }
 
@@ -135,6 +220,28 @@ where
         required_extensions.extend_from_slice(importer.required_device_extensions());
         let (physical_device, queue_family) =
             select_device(&instance, &surface_loader, surface, &required_extensions)?;
+        let presentation_feedback =
+            supports_device_extension(&instance, physical_device, ash::khr::present_id::NAME)?
+                && supports_device_extension(
+                    &instance,
+                    physical_device,
+                    ash::khr::present_wait::NAME,
+                )?;
+        let presentation_feedback = if presentation_feedback {
+            let mut present_id = vk::PhysicalDevicePresentIdFeaturesKHR::default();
+            let mut present_wait = vk::PhysicalDevicePresentWaitFeaturesKHR::default();
+            let mut features = vk::PhysicalDeviceFeatures2::default()
+                .push_next(&mut present_id)
+                .push_next(&mut present_wait);
+            unsafe { instance.get_physical_device_features2(physical_device, &mut features) };
+            present_id.present_id != 0 && present_wait.present_wait != 0
+        } else {
+            false
+        };
+        if presentation_feedback {
+            required_extensions.push(ash::khr::present_id::NAME);
+            required_extensions.push(ash::khr::present_wait::NAME);
+        }
         let priorities = [1.0_f32];
         let queue_info = vk::DeviceQueueCreateInfo::default()
             .queue_family_index(queue_family)
@@ -143,13 +250,24 @@ where
             .iter()
             .map(|extension| extension.as_ptr())
             .collect::<Vec<_>>();
-        let device_info = vk::DeviceCreateInfo::default()
+        let mut present_id =
+            vk::PhysicalDevicePresentIdFeaturesKHR::default().present_id(presentation_feedback);
+        let mut present_wait =
+            vk::PhysicalDevicePresentWaitFeaturesKHR::default().present_wait(presentation_feedback);
+        let mut device_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(std::slice::from_ref(&queue_info))
             .enabled_extension_names(&device_extensions);
+        if presentation_feedback {
+            device_info = device_info
+                .push_next(&mut present_id)
+                .push_next(&mut present_wait);
+        }
         let device = unsafe { instance.create_device(physical_device, &device_info, None) }
             .map_err(|error| error.to_string())?;
         let queue = unsafe { device.get_device_queue(queue_family, 0) };
         let swapchain_loader = ash::khr::swapchain::Device::new(&instance, &device);
+        let presentation_tracker =
+            presentation_feedback.then(|| PresentationTracker::new(&instance, &device));
         let memory_properties =
             unsafe { instance.get_physical_device_memory_properties(physical_device) };
         let surface_format = select_surface_format(
@@ -258,6 +376,8 @@ where
             hdr10_output,
             importer,
             color_parameters: VideoColorParameters::default(),
+            presentation_tracker,
+            next_present_id: 1,
             frame_type: PhantomData,
         };
         let (width, height) = window.size_in_pixels();
@@ -377,8 +497,10 @@ where
         frame: &Frame,
         width: u32,
         height: u32,
+        collect_diagnostics: bool,
         gui: FullOutput,
-    ) -> Result<(), String> {
+    ) -> Result<PresentationSubmission, String> {
+        let render_started = collect_diagnostics.then(Instant::now);
         if self.swapchain.as_ref().is_none_or(|swapchain| {
             swapchain.extent.width != width || swapchain.extent.height != height
         }) {
@@ -426,7 +548,12 @@ where
                     .unwrap()
                     .free_textures(&prepared_gui.textures_to_free)
                     .map_err(|error| error.to_string())?;
-                return Ok(());
+                return Ok(PresentationSubmission {
+                    id: 0,
+                    queued_at: Instant::now(),
+                    feedback_available: false,
+                    diagnostics: None,
+                });
             }
             Err(error) => return Err(error.to_string()),
         };
@@ -436,6 +563,7 @@ where
                 .map_err(|error| error.to_string())?;
         }
 
+        let import_started = collect_diagnostics.then(Instant::now);
         let imported = self.importer.import(
             VulkanImportContext {
                 instance: &self.instance,
@@ -446,6 +574,7 @@ where
             },
             frame,
         )?;
+        let import_finished = collect_diagnostics.then(Instant::now);
         let planes = imported.sampled_planes();
         let image_infos = [
             vk::DescriptorImageInfo::default()
@@ -477,6 +606,7 @@ where
             image_index,
             &prepared_gui,
         )?;
+        let commands_finished = collect_diagnostics.then(Instant::now);
 
         let wait_semaphores = [image_available];
         let signal_semaphores = [render_finished];
@@ -487,30 +617,68 @@ where
             .wait_dst_stage_mask(&wait_stages)
             .command_buffers(&command_buffers)
             .signal_semaphores(&signal_semaphores);
+        let submit_started = collect_diagnostics.then(Instant::now);
         unsafe {
             self.device
                 .queue_submit(self.queue, &[submit], fence)
                 .map_err(|error| error.to_string())?;
         }
+        let submit_finished = collect_diagnostics.then(Instant::now);
         self.frames[self.frame_index].imported = Some(imported);
         self.frames[frame_index].gui_textures_to_free = prepared_gui.textures_to_free;
 
         let swapchains = [swapchain_handle];
         let indices = [image_index];
-        let present = vk::PresentInfoKHR::default()
+        let present_id = self.next_present_id;
+        self.next_present_id = self.next_present_id.checked_add(1).unwrap_or(1);
+        let ids = [present_id];
+        let mut id_info = vk::PresentIdKHR::default().present_ids(&ids);
+        let mut present = vk::PresentInfoKHR::default()
             .wait_semaphores(&signal_semaphores)
             .swapchains(&swapchains)
             .image_indices(&indices);
-        let changed = match unsafe { self.swapchain_loader.queue_present(self.queue, &present) } {
-            Ok(changed) => changed || suboptimal,
-            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => true,
-            Err(error) => return Err(error.to_string()),
-        };
+        if self.presentation_tracker.is_some() {
+            present = present.push_next(&mut id_info);
+        }
+        let queued_at = Instant::now();
+        let (changed, present_queued) =
+            match unsafe { self.swapchain_loader.queue_present(self.queue, &present) } {
+                Ok(changed) => (changed || suboptimal, true),
+                Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => (true, false),
+                Err(error) => return Err(error.to_string()),
+            };
+        let present_finished = collect_diagnostics.then(Instant::now);
+        let feedback_available = present_queued
+            && self
+                .presentation_tracker
+                .as_ref()
+                .is_some_and(|tracker| tracker.track(swapchain_handle, present_id));
         self.frame_index = (self.frame_index + 1) % self.frames.len();
         if changed {
             self.recreate_swapchain(width, height)?;
         }
-        Ok(())
+        Ok(PresentationSubmission {
+            id: present_id,
+            queued_at,
+            feedback_available,
+            diagnostics: render_started.map(|render_started| PresentationDiagnostics {
+                pre_import: import_started
+                    .unwrap()
+                    .saturating_duration_since(render_started),
+                native_frame_import: import_finished
+                    .unwrap()
+                    .saturating_duration_since(import_started.unwrap()),
+                command_preparation: commands_finished
+                    .unwrap()
+                    .saturating_duration_since(import_finished.unwrap()),
+                queue_submission: submit_finished
+                    .unwrap()
+                    .saturating_duration_since(submit_started.unwrap()),
+                presentation_queueing: present_finished
+                    .unwrap()
+                    .saturating_duration_since(queued_at),
+            }),
+        })
     }
 
     fn release_gui_textures(&mut self, frame_index: usize) -> Result<(), String> {
@@ -775,6 +943,9 @@ where
 
     fn recreate_swapchain(&mut self, width: u32, height: u32) -> Result<(), String> {
         unsafe { self.device.device_wait_idle() }.map_err(|error| error.to_string())?;
+        if let Some(tracker) = &self.presentation_tracker {
+            tracker.drain();
+        }
         for frame in &mut self.frames {
             frame.imported = None;
         }
@@ -813,6 +984,7 @@ where
                 self.device.destroy_semaphore(frame.image_available, None);
             }
         }
+        drop(self.presentation_tracker.take());
         if let Some(mut swapchain) = self.swapchain.take() {
             swapchain.destroy(&self.device, &self.swapchain_loader);
         }
@@ -850,10 +1022,17 @@ where
         color: DecodedVideoColor,
         width: u32,
         height: u32,
+        diagnostics: bool,
         gui: FullOutput,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<PresentationSubmission, Self::Error> {
         self.color_parameters = color::parameters_for_decoded_color(color, self.hdr10_output);
-        self.present(frame, width, height, gui)
+        self.present(frame, width, height, diagnostics, gui)
+    }
+
+    fn take_presentation_feedback(&mut self) -> Option<PresentationFeedback> {
+        self.presentation_tracker
+            .as_ref()
+            .and_then(PresentationTracker::take)
     }
 
     fn present_loading(
@@ -1075,6 +1254,21 @@ fn select_device(
         }
     }
     Err("no Vulkan device supports this SDL surface and frame importer".into())
+}
+
+fn supports_device_extension(
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    required: &CStr,
+) -> Result<bool, String> {
+    Ok(
+        unsafe { instance.enumerate_device_extension_properties(physical_device) }
+            .map_err(|error| error.to_string())?
+            .iter()
+            .any(|extension| {
+                (unsafe { CStr::from_ptr(extension.extension_name.as_ptr()) }) == required
+            }),
+    )
 }
 
 fn select_surface_format(

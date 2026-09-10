@@ -4,24 +4,45 @@ use std::time::Duration;
 pub const MAXIMUM_DURATION_SECONDS: u64 = 3_600;
 pub const ESCAPE_VIRTUAL_KEY: u16 = 0x1b;
 pub const AUDIO_SAMPLE_RATE: usize = 48_000;
-pub const SWEEP_FRAMES: usize = AUDIO_SAMPLE_RATE * 4;
-pub const AUDIO_PEAK: f32 = 0.01;
+pub const SYNCHRONIZATION_CYCLE_FRAMES: usize = AUDIO_SAMPLE_RATE * 4;
+pub const AUDIO_PEAK: f32 = 0.24;
+pub const SYNCHRONIZATION_PERIOD: Duration = Duration::from_secs(1);
+pub const SYNCHRONIZATION_PULSE: Duration = Duration::from_millis(100);
 
-/// One loop, packed left/right stereo, with fades at both boundaries.
-pub fn stereo_sweep() -> Vec<f32> {
+/// One loop with distinct channel tones and a shared pulse aligned to the visual cue.
+pub fn synchronization_multitone() -> Vec<f32> {
     let fade_frames = AUDIO_SAMPLE_RATE / 50;
-    let mut samples = Vec::with_capacity(SWEEP_FRAMES * 2);
-    for frame in 0..SWEEP_FRAMES {
-        let position = frame as f64 / (SWEEP_FRAMES - 1) as f64;
-        let fade = (frame.min(SWEEP_FRAMES - 1 - frame) as f64 / fade_frames as f64).min(1.0);
-        let tone = (frame as f64 * 440.0 * std::f64::consts::TAU / AUDIO_SAMPLE_RATE as f64).sin()
-            * f64::from(AUDIO_PEAK)
-            * fade;
-        let pan = position * std::f64::consts::FRAC_PI_2;
-        samples.push((tone * pan.sin()) as f32);
-        samples.push((tone * pan.cos()) as f32);
+    let pulse_frames = SYNCHRONIZATION_PULSE.as_secs_f64() * AUDIO_SAMPLE_RATE as f64;
+    let mut samples = Vec::with_capacity(SYNCHRONIZATION_CYCLE_FRAMES * 2);
+    for frame in 0..SYNCHRONIZATION_CYCLE_FRAMES {
+        let fade = (frame.min(SYNCHRONIZATION_CYCLE_FRAMES - 1 - frame) as f64
+            / fade_frames as f64)
+            .min(1.0);
+        let phase = frame as f64 / AUDIO_SAMPLE_RATE as f64;
+        let pulse_position = (frame % AUDIO_SAMPLE_RATE) as f64;
+        let pulse_envelope = if pulse_position < pulse_frames {
+            (std::f64::consts::PI * pulse_position / pulse_frames)
+                .sin()
+                .powi(2)
+        } else {
+            0.0
+        };
+        let pulse = 0.08 * pulse_envelope * (880.0 * std::f64::consts::TAU * phase).sin();
+        let left = 0.08 * (220.0 * std::f64::consts::TAU * phase).sin()
+            + 0.06 * (440.0 * std::f64::consts::TAU * phase).sin()
+            + pulse;
+        let right = 0.08 * (330.0 * std::f64::consts::TAU * phase).sin()
+            + 0.06 * (550.0 * std::f64::consts::TAU * phase).sin()
+            + pulse;
+        samples.push((left * fade) as f32);
+        samples.push((right * fade) as f32);
     }
     samples
+}
+
+#[must_use]
+pub fn synchronization_pulse_active(elapsed: Duration) -> bool {
+    elapsed.as_nanos() % SYNCHRONIZATION_PERIOD.as_nanos() < SYNCHRONIZATION_PULSE.as_nanos()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -31,6 +52,7 @@ pub struct RawInputState {
     pub mouse_delta_x: i64,
     pub mouse_delta_y: i64,
     pub mouse_buttons: u8,
+    pub mouse_button_presses: u64,
     pub mouse_wheels: u64,
     pub pressed_keys: u16,
     pub exit_requested: bool,
@@ -45,6 +67,7 @@ impl Default for RawInputState {
             mouse_delta_x: 0,
             mouse_delta_y: 0,
             mouse_buttons: 0,
+            mouse_button_presses: 0,
             mouse_wheels: 0,
             pressed_keys: 0,
             exit_requested: false,
@@ -68,6 +91,7 @@ impl RawInputState {
         ] {
             if button_flags & down != 0 {
                 self.mouse_buttons |= 1 << index;
+                self.mouse_button_presses = self.mouse_button_presses.saturating_add(1);
             }
             if button_flags & up != 0 {
                 self.mouse_buttons &= !(1 << index);
@@ -159,10 +183,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn stereo_sweep_is_quiet_repeatable_and_moves_right_to_left() {
-        let samples = stereo_sweep();
-        assert_eq!(samples.len(), SWEEP_FRAMES * 2);
-        assert_eq!(samples, stereo_sweep());
+    fn synchronization_multitone_is_moderate_bounded_and_repeatable() {
+        let samples = synchronization_multitone();
+        assert_eq!(samples.len(), SYNCHRONIZATION_CYCLE_FRAMES * 2);
+        assert_eq!(samples, synchronization_multitone());
         assert!(
             samples
                 .iter()
@@ -174,17 +198,13 @@ mod tests {
                 .iter()
                 .all(|sample| *sample == 0.0)
         );
-        let energy = |start: usize, channel: usize| {
-            samples[start * 2 + channel..(start + 4800) * 2]
-                .iter()
-                .step_by(2)
-                .map(|v| v * v)
-                .sum::<f32>()
-        };
-        assert!(energy(4800, 1) > energy(4800, 0) * 10.0);
-        assert!(energy(SWEEP_FRAMES - 9600, 0) > energy(SWEEP_FRAMES - 9600, 1) * 10.0);
-        let middle = SWEEP_FRAMES / 2 - 2400;
-        assert!((energy(middle, 0) - energy(middle, 1)).abs() < 0.001);
+        let rms = (samples.iter().map(|sample| sample * sample).sum::<f32>()
+            / samples.len() as f32)
+            .sqrt();
+        assert!(rms > 0.05);
+        assert!(synchronization_pulse_active(Duration::from_millis(50)));
+        assert!(!synchronization_pulse_active(Duration::from_millis(150)));
+        assert!(synchronization_pulse_active(Duration::from_millis(1_050)));
     }
 
     #[test]
@@ -201,6 +221,7 @@ mod tests {
         assert_eq!(state.mouse_packets, 1);
         assert_eq!((state.mouse_delta_x, state.mouse_delta_y), (7, -3));
         assert_eq!(state.mouse_buttons, 1);
+        assert_eq!(state.mouse_button_presses, 1);
         assert_eq!(state.mouse_wheels, 1);
     }
 

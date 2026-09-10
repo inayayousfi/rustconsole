@@ -110,7 +110,10 @@ mod windows {
         AdaptiveBitrateController, BITRATE_DECREASE_INTERVAL, BITRATE_INCREASE_INTERVAL,
         DesktopCapture, VIDEO_BITRATE_BOOTSTRAP, VideoPathReport,
     };
-    use rustconsole_input_windows::{InputSession, PointerUpdate, VirtualInputOwner};
+    use rustconsole_input_windows::{
+        HidReport, InputSession, PointerUpdate, ReportSink, VirtualInputOwner,
+    };
+    use rustconsole_protocol::diagnostics::{MediaKind, PayloadDigest, STREAM_PREAMBLE};
     use rustconsole_protocol::wire::{
         self, Av1CapabilityOffer, Av1HardwareCapability, Av1Mode, EncodedVideoPacket, Envelope,
         KeyboardLeds as WireKeyboardLeds, SelectedAv1Configuration, SessionAvailabilityResult,
@@ -122,11 +125,12 @@ mod windows {
         negotiate_av1_configuration,
     };
     use rustconsole_session::input_datagram::{PointerSnapshot, PointerSnapshotReceiver};
+    use sha2::{Digest, Sha256};
     use std::fs;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex, OnceLock};
     use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -600,11 +604,14 @@ mod windows {
             }
             return Ok(());
         }
-        let audio_configuration = match &request.body {
-            Some(envelope::Body::Av1CapabilityOffer(offer)) => offer
-                .audio_transport
-                .filter(|configuration| configuration.supported()),
-            _ => None,
+        let (audio_configuration, full_diagnostics) = match &request.body {
+            Some(envelope::Body::Av1CapabilityOffer(offer)) => (
+                offer
+                    .audio_transport
+                    .filter(|configuration| configuration.supported()),
+                offer.full_diagnostics,
+            ),
+            _ => (None, false),
         };
         let (decoder_capabilities, settings) = parse_viewer_offer(request)?;
         if active_stream
@@ -642,6 +649,7 @@ mod windows {
             &mut send,
             Envelope {
                 body: Some(envelope::Body::Av1CapabilityOffer(Av1CapabilityOffer {
+                    full_diagnostics,
                     audio_transport: audio_configuration,
                     encoder_capabilities: vec![wire_capability(encoder_capability)],
                     decoder_capabilities: Vec::new(),
@@ -652,6 +660,7 @@ mod windows {
         .await?;
         let mut selected_wire = wire_selected(selected);
         selected_wire.audio_transport = audio_configuration;
+        selected_wire.full_diagnostics = full_diagnostics;
         match read_envelope(&mut receive).await?.body {
             Some(envelope::Body::SelectedAv1Configuration(peer)) if peer == selected_wire => {}
             _ => return Err("viewer selected a different AV1 configuration".into()),
@@ -664,7 +673,37 @@ mod windows {
         )
         .await?;
 
+        let diagnostic_tx = if full_diagnostics {
+            let (diagnostic_tx, mut diagnostic_rx) =
+                tokio::sync::mpsc::channel::<PayloadDigest>(1024);
+            let diagnostic_connection = connection.clone();
+            tokio::spawn(async move {
+                let result = async {
+                    let mut stream = diagnostic_connection.open_uni().await?;
+                    stream.write_all(&STREAM_PREAMBLE).await?;
+                    while let Some(record) = diagnostic_rx.recv().await {
+                        stream.write_all(&record.encode()).await?;
+                    }
+                    stream.finish()?;
+                    Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+                }
+                .await;
+                if let Err(error) = result {
+                    eprintln!("diagnostic stream: {error}");
+                    diagnostic_connection
+                        .close(VarInt::from_u32(0x104), b"diagnostic stream failed");
+                }
+            });
+            Some(DiagnosticSender {
+                tx: diagnostic_tx,
+                dropped: Arc::new(AtomicU64::new(0)),
+            })
+        } else {
+            None
+        };
+
         let (control_tx, control_rx) = std::sync::mpsc::sync_channel(16);
+        let latest_input = Arc::new(Mutex::new((0_u64, 0_u64)));
         let (audio_state_tx, mut audio_state_rx) =
             tokio::sync::watch::channel(wire::AudioStreamState::new(
                 0,
@@ -679,6 +718,7 @@ mod windows {
         let mut audio_state_open = audio_configuration.is_some();
         let media_connection = connection.clone();
         let runtime = tokio::runtime::Handle::current();
+        let media_latest_input = Arc::clone(&latest_input);
         let mut media = tokio::task::spawn_blocking(move || {
             run_worker_video_stream(
                 media_connection,
@@ -688,12 +728,33 @@ mod windows {
                 control_rx,
                 audio_configuration.is_some(),
                 audio_state_tx,
+                media_latest_input,
+                diagnostic_tx,
             )
         });
         let mut control_error = None::<String>;
         let mut media_finished = false;
         let mut input_session = InputSession::default();
+        let input_clock = full_diagnostics
+            .then(crate::clock::HostClock::new)
+            .transpose()?;
         let mut pointer_receiver = PointerSnapshotReceiver::default();
+        let mut pointer_datagrams_received = 0_u64;
+        let mut pointer_updates_applied = 0_u64;
+        let mut pointer_updates_ignored = 0_u64;
+        let mut mouse_reports_published = 0_u64;
+        let mut keyboard_reports_published = 0_u64;
+        let mut reliable_transitions_received = 0_u64;
+        let mut reliable_transitions_applied = 0_u64;
+        let reliable_transitions_rejected = 0_u64;
+        let mut reliable_transitions_missing = 0_u64;
+        let mut reliable_transitions_duplicate_or_late = 0_u64;
+        let mut release_all_transitions = 0_u64;
+        let mut pointer_missing_datagrams = 0_u64;
+        let mut pointer_stale_generations = 0_u64;
+        let mut pointer_duplicate_or_late = 0_u64;
+        let mut pointer_mode_rejections = 0_u64;
+        let mut pointer_relative_baselines = 0_u64;
         let mut input_tick = tokio::time::interval(Duration::from_millis(5));
         input_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         'control: loop {
@@ -754,6 +815,9 @@ mod windows {
                             Ok(bytes) => bytes,
                             Err(error) => { control_error = Some(error.to_string()); break 'control; }
                         };
+                        if full_diagnostics {
+                            pointer_datagrams_received = pointer_datagrams_received.saturating_add(1);
+                        }
                         let snapshot = match PointerSnapshot::decode(&bytes) {
                             Ok(snapshot) => snapshot,
                             Err(error) => { control_error = Some(error.to_string()); break 'control; }
@@ -766,11 +830,45 @@ mod windows {
                         if snapshot.generation() != input_session.generation()
                             || input_session.pointer_mode() != Some(expected_mode)
                         {
+                            if full_diagnostics {
+                                pointer_updates_ignored = pointer_updates_ignored.saturating_add(1);
+                                pointer_mode_rejections = pointer_mode_rejections.saturating_add(1);
+                            }
                             continue;
+                        }
+                        if full_diagnostics {
+                            if pointer_receiver
+                                .generation()
+                                .is_some_and(|generation| snapshot.generation() < generation)
+                            {
+                                pointer_stale_generations =
+                                    pointer_stale_generations.saturating_add(1);
+                            } else if pointer_receiver.generation() == Some(snapshot.generation()) {
+                                if snapshot.sequence() <= pointer_receiver.sequence() {
+                                    pointer_duplicate_or_late =
+                                        pointer_duplicate_or_late.saturating_add(1);
+                                } else {
+                                    pointer_missing_datagrams = pointer_missing_datagrams
+                                        .saturating_add(
+                                            snapshot
+                                                .sequence()
+                                                .saturating_sub(pointer_receiver.sequence())
+                                                .saturating_sub(1),
+                                        );
+                                }
+                            } else if !snapshot.is_absolute() {
+                                pointer_relative_baselines =
+                                    pointer_relative_baselines.saturating_add(1);
+                            }
                         }
                         let update = match pointer_receiver.push(snapshot) {
                             Ok(Some(update)) => update,
-                            Ok(None) => continue,
+                            Ok(None) => {
+                                if full_diagnostics {
+                                    pointer_updates_ignored = pointer_updates_ignored.saturating_add(1);
+                                }
+                                continue;
+                            }
                             Err(error) => { control_error = Some(error.to_string()); break 'control; }
                         };
                         let update = match update {
@@ -778,12 +876,26 @@ mod windows {
                             rustconsole_session::input_datagram::PointerUpdate::Relative { delta_x, delta_y } => PointerUpdate::Relative { delta_x, delta_y },
                         };
                         let result = match input_owner.lock() {
+                            Ok(mut owner) if full_diagnostics => {
+                                let mut sink = DiagnosticReportSink::new(owner.sink_mut());
+                                let result = input_session
+                                    .pointer(update, &mut sink)
+                                    .map_err(|error| format!("pointer input failed: {error:?}"));
+                                mouse_reports_published = mouse_reports_published
+                                    .saturating_add(sink.mouse_reports);
+                                keyboard_reports_published = keyboard_reports_published
+                                    .saturating_add(sink.keyboard_reports);
+                                result
+                            }
                             Ok(mut owner) => input_session
                                 .pointer(update, owner.sink_mut())
                                 .map_err(|error| format!("pointer input failed: {error:?}")),
                             Err(_) => Err("virtual input owner lock poisoned".to_owned()),
                         };
                         if let Err(error) = result { control_error = Some(error); break 'control; }
+                        if full_diagnostics {
+                            pointer_updates_applied = pointer_updates_applied.saturating_add(1);
+                        }
                         continue;
                     }
                     envelope = &mut next_control => match envelope {
@@ -794,7 +906,48 @@ mod windows {
             };
             let command = match envelope.body {
                 Some(envelope::Body::InputTransition(transition)) => {
-                    let ack = match input_owner.lock() {
+                    let host_received_at_micros = input_clock
+                        .as_ref()
+                        .map(crate::clock::HostClock::now)
+                        .transpose()?
+                        .unwrap_or(0);
+                    if full_diagnostics {
+                        reliable_transitions_received =
+                            reliable_transitions_received.saturating_add(1);
+                        let expected = input_session.reliable_sequence().saturating_add(1);
+                        if transition.generation == input_session.generation() {
+                            if transition.sequence > expected {
+                                reliable_transitions_missing = reliable_transitions_missing
+                                    .saturating_add(transition.sequence - expected);
+                            } else if transition.sequence < expected {
+                                reliable_transitions_duplicate_or_late =
+                                    reliable_transitions_duplicate_or_late.saturating_add(1);
+                            }
+                        }
+                        if matches!(
+                            transition.action,
+                            Some(wire::input_transition::Action::ReleaseAll(_))
+                        ) {
+                            release_all_transitions = release_all_transitions.saturating_add(1);
+                        }
+                    }
+                    let mut ack = match input_owner.lock() {
+                        Ok(mut owner) if full_diagnostics => {
+                            let mut sink = DiagnosticReportSink::new(owner.sink_mut());
+                            let result = input_session.reliable(transition, &mut sink);
+                            mouse_reports_published =
+                                mouse_reports_published.saturating_add(sink.mouse_reports);
+                            keyboard_reports_published =
+                                keyboard_reports_published.saturating_add(sink.keyboard_reports);
+                            match result {
+                                Ok(ack) => ack,
+                                Err(error) => {
+                                    control_error =
+                                        Some(format!("input transition failed: {error:?}"));
+                                    break;
+                                }
+                            }
+                        }
                         Ok(mut owner) => match input_session.reliable(transition, owner.sink_mut())
                         {
                             Ok(ack) => ack,
@@ -808,10 +961,70 @@ mod windows {
                             break;
                         }
                     };
+                    ack.host_received_at_micros = host_received_at_micros;
+                    ack.host_submitted_at_micros = input_clock
+                        .as_ref()
+                        .map(crate::clock::HostClock::now)
+                        .transpose()?
+                        .unwrap_or(0);
+                    if full_diagnostics {
+                        reliable_transitions_applied =
+                            reliable_transitions_applied.saturating_add(1);
+                        ack.pointer_datagrams_received = pointer_datagrams_received;
+                        ack.pointer_updates_applied = pointer_updates_applied;
+                        ack.pointer_updates_ignored = pointer_updates_ignored;
+                        ack.mouse_reports_published = mouse_reports_published;
+                        ack.keyboard_reports_published = keyboard_reports_published;
+                        ack.reliable_transitions_received = reliable_transitions_received;
+                        ack.reliable_transitions_applied = reliable_transitions_applied;
+                        ack.reliable_transitions_rejected = reliable_transitions_rejected;
+                        ack.reliable_transitions_missing = reliable_transitions_missing;
+                        ack.reliable_transitions_duplicate_or_late =
+                            reliable_transitions_duplicate_or_late;
+                        ack.release_all_transitions = release_all_transitions;
+                        ack.pointer_missing_datagrams = pointer_missing_datagrams;
+                        ack.pointer_stale_generations = pointer_stale_generations;
+                        ack.pointer_duplicate_or_late = pointer_duplicate_or_late;
+                        ack.pointer_mode_rejections = pointer_mode_rejections;
+                        ack.pointer_relative_baselines = pointer_relative_baselines;
+                    }
+                    *latest_input
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner()) =
+                        (ack.through_sequence, ack.host_submitted_at_micros);
                     if let Err(error) = write_envelope(
                         &mut send,
                         Envelope {
                             body: Some(envelope::Body::InputAck(ack)),
+                        },
+                    )
+                    .await
+                    {
+                        control_error = Some(error.to_string());
+                        break;
+                    }
+                    continue;
+                }
+                Some(envelope::Body::ClockPing(ping)) => {
+                    let host_received_at_micros = input_clock
+                        .as_ref()
+                        .map(crate::clock::HostClock::now)
+                        .transpose()?
+                        .unwrap_or(0);
+                    let pong = wire::ClockPong {
+                        sequence: ping.sequence,
+                        player_sent_at_micros: ping.player_sent_at_micros,
+                        host_received_at_micros,
+                        host_sent_at_micros: input_clock
+                            .as_ref()
+                            .map(crate::clock::HostClock::now)
+                            .transpose()?
+                            .unwrap_or(0),
+                    };
+                    if let Err(error) = write_envelope(
+                        &mut send,
+                        Envelope {
+                            body: Some(envelope::Body::ClockPong(pong)),
                         },
                     )
                     .await
@@ -905,6 +1118,146 @@ mod windows {
         ReconfigurationRequired(wire::VideoReconfigurationCause),
     }
 
+    struct DiagnosticReportSink<'a, S> {
+        inner: &'a mut S,
+        mouse_reports: u64,
+        keyboard_reports: u64,
+    }
+
+    impl<'a, S> DiagnosticReportSink<'a, S> {
+        fn new(inner: &'a mut S) -> Self {
+            Self {
+                inner,
+                mouse_reports: 0,
+                keyboard_reports: 0,
+            }
+        }
+    }
+
+    impl<S: ReportSink> ReportSink for DiagnosticReportSink<'_, S> {
+        type Error = S::Error;
+
+        fn submit(&mut self, report: HidReport) -> Result<(), Self::Error> {
+            let mouse = matches!(report, HidReport::Mouse(_));
+            self.inner.submit(report)?;
+            if mouse {
+                self.mouse_reports = self.mouse_reports.saturating_add(1);
+            } else {
+                self.keyboard_reports = self.keyboard_reports.saturating_add(1);
+            }
+            Ok(())
+        }
+    }
+
+    #[derive(Clone)]
+    struct DiagnosticSender {
+        tx: tokio::sync::mpsc::Sender<PayloadDigest>,
+        dropped: Arc<AtomicU64>,
+    }
+
+    fn prepare_payload_digest(
+        diagnostics: Option<&DiagnosticSender>,
+        clock: &crate::clock::HostClock,
+        kind: MediaKind,
+        generation: u64,
+        sequence: u64,
+        payload: &[u8],
+        producer_sha256: Option<[u8; 32]>,
+        producer_hash_duration_micros: u64,
+        encode_started_at_micros: u64,
+        encoded_at_micros: u64,
+        worker_queued_at_micros: u64,
+        service_received_at_micros: u64,
+        packetized_at_micros: u64,
+        captured_at_micros: u64,
+        mirror_decode_micros: u64,
+        capture_acquisition_micros: u64,
+        cross_adapter_copy_micros: u64,
+        color_conversion_micros: u64,
+        encoder_call_micros: u64,
+        audio_capture_buffer_frames: u64,
+        audio_capture_discontinuities: u64,
+        audio_invalid_capture_timestamps: u64,
+        audio_device_reopens: u64,
+        audio_encoder_resets: u64,
+        audio_capture_queue_depth: u64,
+        audio_capture_queue_capacity: u64,
+        audio_capture_queue_drops: u64,
+        quality: Option<crate::worker_protocol::WorkerVideoQuality>,
+    ) -> Result<Option<PayloadDigest>, Box<dyn std::error::Error + Send + Sync>> {
+        let Some(diagnostics) = diagnostics else {
+            return Ok(None);
+        };
+        let started = Instant::now();
+        let boundary_sha256 = Sha256::digest(payload).into();
+        let boundary_matched = producer_sha256 == Some(boundary_sha256);
+        let record = PayloadDigest {
+            kind,
+            generation,
+            sequence,
+            payload_size: payload.len() as u64,
+            hashed_at_micros: clock.now()?,
+            producer_hash_duration_micros,
+            boundary_hash_duration_micros: started.elapsed().as_micros() as u64,
+            producer_dropped_records: diagnostics.dropped.load(Ordering::Relaxed),
+            boundary_matched,
+            sha256: producer_sha256.unwrap_or(boundary_sha256),
+            encode_started_at_micros,
+            encoded_at_micros,
+            worker_queued_at_micros,
+            service_received_at_micros,
+            packetized_at_micros,
+            captured_at_micros,
+            mirror_decode_micros,
+            quality_present: quality.is_some(),
+            quality_presentation_timestamp: quality
+                .map_or(0, |quality| quality.presentation_timestamp),
+            source_readback_micros: quality.map_or(0, |quality| quality.source_readback_micros),
+            decoded_readback_micros: quality.map_or(0, |quality| quality.decoded_readback_micros),
+            scoring_micros: quality.map_or(0, |quality| quality.scoring_micros),
+            readback_bytes: quality.map_or(0, |quality| quality.readback_bytes),
+            luma_psnr_millidecibels: quality.map_or(0, |quality| quality.luma_psnr_millidecibels),
+            luma_mean_absolute_error_ppm: quality
+                .map_or(0, |quality| quality.luma_mean_absolute_error_ppm),
+            packetization_completed_at_micros: 0,
+            first_send_attempt_at_micros: 0,
+            last_send_completed_at_micros: 0,
+            capture_acquisition_micros,
+            cross_adapter_copy_micros,
+            color_conversion_micros,
+            encoder_call_micros,
+            audio_capture_buffer_frames,
+            audio_capture_discontinuities,
+            audio_invalid_capture_timestamps,
+            audio_device_reopens,
+            audio_encoder_resets,
+            audio_capture_queue_depth,
+            audio_capture_queue_capacity,
+            audio_capture_queue_drops,
+        };
+        Ok(Some(record))
+    }
+
+    fn submit_payload_digest(
+        diagnostics: Option<&DiagnosticSender>,
+        mut record: PayloadDigest,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let Some(diagnostics) = diagnostics else {
+            return Ok(());
+        };
+        record.producer_dropped_records = diagnostics.dropped.load(Ordering::Relaxed);
+        match diagnostics.tx.try_send(record) {
+            Ok(()) => Ok(()),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                diagnostics.dropped.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                Err("diagnostic stream writer stopped".into())
+            }
+        }
+    }
+
     fn run_worker_video_stream(
         connection: Connection,
         runtime: tokio::runtime::Handle,
@@ -913,6 +1266,8 @@ mod windows {
         controls: std::sync::mpsc::Receiver<WorkerVideoControl>,
         enable_audio: bool,
         audio_state: tokio::sync::watch::Sender<wire::AudioStreamState>,
+        latest_input: Arc<Mutex<(u64, u64)>>,
+        diagnostic_tx: Option<DiagnosticSender>,
     ) -> Result<WorkerVideoExit, Box<dyn std::error::Error + Send + Sync>> {
         let _audio_recovery = AudioRecoveryGuard;
         let frames_per_second = selected.frames_per_second;
@@ -928,14 +1283,17 @@ mod windows {
                     .target_bits_per_second()
                     .min(VIDEO_BITRATE_BOOTSTRAP),
                 enable_audio,
+                diagnostic_tx.is_some(),
             )
             .map_err(|error| error.to_string())?
         else {
             return Ok(WorkerVideoExit::Stopped);
         };
         let mut video_pending = std::collections::VecDeque::<bytes::Bytes>::new();
+        let mut video_pending_diagnostic = None::<PayloadDigest>;
         let mut video_started = Instant::now();
         let mut audio_pending = std::collections::VecDeque::<bytes::Bytes>::new();
+        let mut audio_pending_diagnostic = None::<PayloadDigest>;
         let mut audio_queued_at = 0_u64;
         let mut local_audio_drops = 0_u64;
         let mut worker_audio_drops = 0_u64;
@@ -986,8 +1344,51 @@ mod windows {
                 match event {
                     Ok(crate::worker_protocol::AudioWorkerEvent::Packet {
                         queued_at_micros,
+                        payload_sha256,
+                        hash_duration_micros,
+                        encode_started_at_micros,
+                        encoded_at_micros,
+                        capture_buffer_frames,
+                        capture_discontinuities,
+                        invalid_capture_timestamps,
+                        device_reopens,
+                        encoder_resets,
+                        capture_queue_depth,
+                        capture_queue_capacity,
+                        capture_queue_drops,
                         packet,
                     }) => {
+                        let service_received_at_micros = clock.now()?;
+                        let mut prepared_diagnostic = prepare_payload_digest(
+                            diagnostic_tx.as_ref(),
+                            &clock,
+                            MediaKind::Audio,
+                            packet.generation,
+                            packet.sequence,
+                            &packet.payload,
+                            payload_sha256,
+                            hash_duration_micros,
+                            encode_started_at_micros,
+                            encoded_at_micros,
+                            queued_at_micros,
+                            service_received_at_micros,
+                            clock.now()?,
+                            packet.captured_at_micros,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            capture_buffer_frames,
+                            capture_discontinuities,
+                            invalid_capture_timestamps,
+                            device_reopens,
+                            encoder_resets,
+                            capture_queue_depth,
+                            capture_queue_capacity,
+                            capture_queue_drops,
+                            None,
+                        )?;
                         audio_state.send_if_modified(|state| {
                             if packet.generation > state.generation {
                                 state.generation = packet.generation;
@@ -1003,6 +1404,9 @@ mod windows {
                             clock.now()?,
                         ) {
                             local_audio_drops += 1;
+                            if let Some(record) = prepared_diagnostic.take() {
+                                submit_payload_digest(diagnostic_tx.as_ref(), record)?;
+                            }
                         } else if let Some(maximum) = connection.max_datagram_size() {
                             match rustconsole_host_core::audio_transport::packetize(
                                 &packet, maximum,
@@ -1011,11 +1415,23 @@ mod windows {
                                     audio_pending =
                                         pieces.into_iter().map(bytes::Bytes::from).collect();
                                     audio_queued_at = queued_at_micros;
+                                    if let Some(record) = prepared_diagnostic.as_mut() {
+                                        record.packetization_completed_at_micros = clock.now()?;
+                                    }
+                                    audio_pending_diagnostic = prepared_diagnostic;
                                 }
-                                Err(_) => local_audio_drops += 1,
+                                Err(_) => {
+                                    local_audio_drops += 1;
+                                    if let Some(record) = prepared_diagnostic.take() {
+                                        submit_payload_digest(diagnostic_tx.as_ref(), record)?;
+                                    }
+                                }
                             }
                         } else {
                             local_audio_drops += 1;
+                            if let Some(record) = prepared_diagnostic.take() {
+                                submit_payload_digest(diagnostic_tx.as_ref(), record)?;
+                            }
                         }
                     }
                     Ok(crate::worker_protocol::AudioWorkerEvent::State(mut state)) => {
@@ -1042,8 +1458,16 @@ mod windows {
             {
                 audio_pending.clear();
                 local_audio_drops += 1;
+                if let Some(record) = audio_pending_diagnostic.take() {
+                    submit_payload_digest(diagnostic_tx.as_ref(), record)?;
+                }
             }
             if let Some(datagram) = audio_pending.front() {
+                if let Some(record) = audio_pending_diagnostic.as_mut()
+                    && record.first_send_attempt_at_micros == 0
+                {
+                    record.first_send_attempt_at_micros = clock.now()?;
+                }
                 match runtime.block_on(rustconsole_host_core::authentication::send_media_datagram(
                     &connection,
                     datagram.clone(),
@@ -1051,6 +1475,12 @@ mod windows {
                 )) {
                     Ok(true) => {
                         audio_pending.pop_front();
+                        if audio_pending.is_empty()
+                            && let Some(mut record) = audio_pending_diagnostic.take()
+                        {
+                            record.last_send_completed_at_micros = clock.now()?;
+                            submit_payload_digest(diagnostic_tx.as_ref(), record)?;
+                        }
                     }
                     Ok(false) => {}
                     Err(
@@ -1060,6 +1490,9 @@ mod windows {
                     ) => {
                         audio_pending.clear();
                         local_audio_drops += 1;
+                        if let Some(record) = audio_pending_diagnostic.take() {
+                            submit_payload_digest(diagnostic_tx.as_ref(), record)?;
+                        }
                     }
                     Err(error) => return Err(error.into()),
                 }
@@ -1075,6 +1508,9 @@ mod windows {
             });
             if !video_pending.is_empty() && video_started.elapsed() >= Duration::from_millis(100) {
                 video_pending.clear();
+                if let Some(record) = video_pending_diagnostic.take() {
+                    submit_payload_digest(diagnostic_tx.as_ref(), record)?;
+                }
                 if last_keyframe.elapsed() >= Duration::from_secs(1) {
                     stream.request_keyframe()?;
                     last_keyframe = Instant::now();
@@ -1090,15 +1526,72 @@ mod windows {
                         sequence,
                         last_present_time,
                         keyframe,
+                        payload_sha256,
+                        hash_duration_micros,
+                        encode_started_at_micros,
+                        encoded_at_micros,
+                        worker_queued_at_micros,
+                        mirror_decode_micros,
+                        capture_acquisition_micros,
+                        cross_adapter_copy_micros,
+                        color_conversion_micros,
+                        encoder_call_micros,
+                        quality,
                         payload,
                         ..
                     } => {
+                        let service_received_at_micros = clock.now()?;
                         let Some(maximum_datagram_size) = connection.max_datagram_size() else {
                             return Err("QUIC peer does not support datagrams".into());
                         };
+                        let captured_at_micros = clock.ticks_to_micros(last_present_time)?;
+                        let (input_sequence, input_submitted_at_micros) = *latest_input
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner());
+                        let input_sequence = if input_submitted_at_micros != 0
+                            && captured_at_micros >= input_submitted_at_micros
+                        {
+                            input_sequence
+                        } else {
+                            0
+                        };
+                        let packetized_at_micros = clock.now()?;
+                        let mut prepared_diagnostic = prepare_payload_digest(
+                            diagnostic_tx.as_ref(),
+                            &clock,
+                            MediaKind::Video,
+                            1,
+                            sequence,
+                            &payload,
+                            payload_sha256,
+                            hash_duration_micros,
+                            encode_started_at_micros,
+                            encoded_at_micros,
+                            worker_queued_at_micros,
+                            service_received_at_micros,
+                            packetized_at_micros,
+                            captured_at_micros,
+                            mirror_decode_micros,
+                            capture_acquisition_micros,
+                            cross_adapter_copy_micros,
+                            color_conversion_micros,
+                            encoder_call_micros,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            quality,
+                        )?;
                         let frame = rustconsole_host_core::video_transport::VideoFramePayload {
                             sequence,
-                            captured_at_micros: clock.ticks_to_micros(last_present_time)?,
+                            captured_at_micros,
+                            encoded_at_micros,
+                            packetized_at_micros,
+                            input_sequence,
                             keyframe,
                             target_bitrate_bits_per_second: controller.target_bits_per_second(),
                             estimated_capacity_bits_per_second: controller
@@ -1110,7 +1603,11 @@ mod windows {
                                 &frame,
                                 maximum_datagram_size,
                             )?;
+                        if let Some(record) = prepared_diagnostic.as_mut() {
+                            record.packetization_completed_at_micros = clock.now()?;
+                        }
                         video_pending = datagrams.into_iter().map(bytes::Bytes::from).collect();
+                        video_pending_diagnostic = prepared_diagnostic;
                         video_started = Instant::now();
                     }
                     WorkerEvent::Failure(error) => return Err(error.into()),
@@ -1121,6 +1618,11 @@ mod windows {
                 }
             }
             if let Some(datagram) = video_pending.front() {
+                if let Some(record) = video_pending_diagnostic.as_mut()
+                    && record.first_send_attempt_at_micros == 0
+                {
+                    record.first_send_attempt_at_micros = clock.now()?;
+                }
                 match runtime.block_on(rustconsole_host_core::authentication::send_media_datagram(
                     &connection,
                     datagram.clone(),
@@ -1128,10 +1630,19 @@ mod windows {
                 )) {
                     Ok(true) => {
                         video_pending.pop_front();
+                        if video_pending.is_empty()
+                            && let Some(mut record) = video_pending_diagnostic.take()
+                        {
+                            record.last_send_completed_at_micros = clock.now()?;
+                            submit_payload_digest(diagnostic_tx.as_ref(), record)?;
+                        }
                     }
                     Ok(false) => {}
                     Err(quinn::SendDatagramError::TooLarge) => {
                         video_pending.clear();
+                        if let Some(record) = video_pending_diagnostic.take() {
+                            submit_payload_digest(diagnostic_tx.as_ref(), record)?;
+                        }
                     }
                     Err(error) => return Err(error.into()),
                 }
@@ -1324,6 +1835,7 @@ mod windows {
             &mut stream,
             Envelope {
                 body: Some(envelope::Body::Av1CapabilityOffer(Av1CapabilityOffer {
+                    full_diagnostics: false,
                     audio_transport: None,
                     encoder_capabilities: vec![wire_capability(encoder_capability)],
                     decoder_capabilities: Vec::new(),
@@ -1472,6 +1984,7 @@ mod windows {
         selected: rustconsole_protocol::NegotiatedAv1Configuration,
     ) -> SelectedAv1Configuration {
         SelectedAv1Configuration {
+            full_diagnostics: false,
             audio_transport: None,
             width: selected.width,
             height: selected.height,

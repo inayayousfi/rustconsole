@@ -32,6 +32,9 @@ struct HelperFrame {
     uint32_t accumulated_frames;
     int32_t protected_content_masked;
     uint32_t reconfiguration_cause;
+    uint64_t capture_acquisition_micros;
+    uint64_t cross_adapter_copy_micros;
+    uint64_t color_conversion_micros;
     char failure_stage[192];
 };
 #pragma pack(pop)
@@ -63,6 +66,17 @@ static bool write_all(HANDLE pipe, const void* value, DWORD size) {
         if (!WriteFile(pipe, cursor, size, &written, nullptr) || written == 0) return false;
         cursor += written;
         size -= written;
+    }
+    return true;
+}
+
+static bool read_all(HANDLE pipe, void* value, DWORD size) {
+    auto* cursor = static_cast<uint8_t*>(value);
+    while (size != 0) {
+        DWORD read = 0;
+        if (!ReadFile(pipe, cursor, size, &read, nullptr) || read == 0) return false;
+        cursor += read;
+        size -= read;
     }
     return true;
 }
@@ -100,12 +114,21 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         return 4;
     }
 
+    uint8_t diagnostics = 0;
+    if (!read_all(pipe, &diagnostics, sizeof(diagnostics)) || diagnostics > 1) {
+        rustconsole_gpu_bridge_destroy(bridge);
+        CloseHandle(pipe);
+        return 5;
+    }
     for (;;) {
         HelperFrame frame{};
         frame.magic = FRAME_MAGIC;
         frame.result = rustconsole_gpu_bridge_capture_external(
             bridge, 250, &frame.last_present_time, &frame.accumulated_frames,
-            &frame.protected_content_masked);
+            &frame.protected_content_masked,
+            diagnostics ? &frame.capture_acquisition_micros : nullptr,
+            diagnostics ? &frame.cross_adapter_copy_micros : nullptr,
+            diagnostics ? &frame.color_conversion_micros : nullptr);
         if (frame.result == DXGI_ERROR_WAIT_TIMEOUT) continue;
         if (FAILED(frame.result)) {
             frame.reconfiguration_cause = rustconsole_gpu_bridge_reconfiguration_cause(bridge);

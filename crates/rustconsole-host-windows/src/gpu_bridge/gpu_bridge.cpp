@@ -679,6 +679,9 @@ static HRESULT capture_frame(
     int64_t* last_present_time,
     uint32_t* accumulated_frames,
     int32_t* protected_content_masked,
+    uint64_t* capture_acquisition_micros,
+    uint64_t* cross_adapter_copy_micros,
+    uint64_t* color_conversion_micros,
     bool external_consumer) {
     if (bridge->encoder_texture_outstanding) return DXGI_ERROR_INVALID_CALL;
     bridge->reconfiguration_cause = RECONFIGURE_NONE;
@@ -687,6 +690,9 @@ static HRESULT capture_frame(
     DXGI_OUTDUPL_FRAME_INFO frame_info{};
     ComPtr<ID3D11Texture2D> source_texture;
     bool frame_acquired = false;
+    const bool diagnostics = capture_acquisition_micros && cross_adapter_copy_micros && color_conversion_micros;
+    const auto acquisition_started = diagnostics ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    std::chrono::steady_clock::time_point copy_started{};
     if (bridge->normal_desktop) {
         failure_stage = "acquire Windows.Graphics.Capture frame";
         winrt::Windows::Graphics::Capture::Direct3D11CaptureFrame frame{nullptr};
@@ -732,6 +738,9 @@ static HRESULT capture_frame(
         result = desktop_resource.As(&source_texture);
     }
     if (SUCCEEDED(result)) {
+        if (diagnostics) *capture_acquisition_micros = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - acquisition_started).count();
+        if (diagnostics) copy_started = std::chrono::steady_clock::now();
         failure_stage = "copy native Intel frame into D3D12 cross-adapter resource";
         bridge->intel_capture_context->CopyResource(
             bridge->intel_cross_resource11.Get(), source_texture.Get());
@@ -766,7 +775,10 @@ static HRESULT capture_frame(
     bridge->nvidia_queue->ExecuteCommandLists(ARRAYSIZE(nvidia_lists), nvidia_lists);
     if (FAILED(result = bridge->nvidia_queue->Signal(bridge->nvidia_copy_fence.Get(), value))) return result;
     if (FAILED(result = wait_for_fence(bridge, value))) return result;
+    if (diagnostics) *cross_adapter_copy_micros = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - copy_started).count();
 
+    const auto conversion_started = diagnostics ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     failure_stage = "convert NVIDIA-local capture texture to encoder format";
     if (FAILED(result = bridge->nvidia11on12_mutex->AcquireSync(0, 5000))) return result;
     ID3D11Resource* wrapped[] = {bridge->nvidia_local_source11.Get()};
@@ -799,6 +811,8 @@ static HRESULT capture_frame(
     const HRESULT released_nv12 = bridge->nvidia11on12_mutex->ReleaseSync(1);
     if (SUCCEEDED(result)) result = released_nv12;
     if (FAILED(result)) return result;
+    if (diagnostics) *color_conversion_micros = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - conversion_started).count();
     if (!external_consumer) {
         failure_stage = "acquire native NVIDIA encoder texture";
         if (FAILED(result = bridge->encoder_mutex->AcquireSync(1, 5000))) return result;
@@ -850,14 +864,18 @@ extern "C" HRESULT rustconsole_gpu_bridge_capture(
     ID3D11Texture2D** encoder_texture,
     int64_t* last_present_time,
     uint32_t* accumulated_frames,
-    int32_t* protected_content_masked) {
+    int32_t* protected_content_masked,
+    uint64_t* capture_acquisition_micros,
+    uint64_t* cross_adapter_copy_micros,
+    uint64_t* color_conversion_micros) {
     if (!bridge || !encoder_texture || !last_present_time ||
         !accumulated_frames || !protected_content_masked) return E_POINTER;
     *encoder_texture = nullptr;
     try {
         return capture_frame(
             bridge, timeout_millis, encoder_texture, last_present_time,
-            accumulated_frames, protected_content_masked, false);
+            accumulated_frames, protected_content_masked, capture_acquisition_micros,
+            cross_adapter_copy_micros, color_conversion_micros, false);
     } catch (...) {
         return winrt::to_hresult();
     }
@@ -868,13 +886,17 @@ extern "C" HRESULT rustconsole_gpu_bridge_capture_external(
     uint32_t timeout_millis,
     int64_t* last_present_time,
     uint32_t* accumulated_frames,
-    int32_t* protected_content_masked) {
+    int32_t* protected_content_masked,
+    uint64_t* capture_acquisition_micros,
+    uint64_t* cross_adapter_copy_micros,
+    uint64_t* color_conversion_micros) {
     if (!bridge || !last_present_time || !accumulated_frames ||
         !protected_content_masked) return E_POINTER;
     try {
         return capture_frame(
             bridge, timeout_millis, nullptr, last_present_time,
-            accumulated_frames, protected_content_masked, true);
+            accumulated_frames, protected_content_masked, capture_acquisition_micros,
+            cross_adapter_copy_micros, color_conversion_micros, true);
     } catch (...) {
         return winrt::to_hresult();
     }

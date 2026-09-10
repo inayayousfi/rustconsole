@@ -4,16 +4,19 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::time::{Duration, Instant};
 
-pub const VIDEO_DATAGRAM_HEADER_SIZE: usize = 44;
+pub const VIDEO_DATAGRAM_HEADER_SIZE: usize = 68;
 pub const MAX_ENCODED_FRAME_SIZE: usize = 16 * 1024 * 1024;
 const MAGIC: [u8; 2] = *b"RC";
-const VERSION: u8 = 3;
+const VERSION: u8 = 4;
 const KEYFRAME_FLAG: u8 = 1;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VideoFramePayload {
     pub sequence: u64,
     pub captured_at_micros: u64,
+    pub encoded_at_micros: u64,
+    pub packetized_at_micros: u64,
+    pub input_sequence: u64,
     pub keyframe: bool,
     pub target_bitrate_bits_per_second: u64,
     pub estimated_capacity_bits_per_second: u64,
@@ -47,6 +50,9 @@ pub fn packetize_video_frame(
             datagram.push(if frame.keyframe { KEYFRAME_FLAG } else { 0 });
             datagram.extend_from_slice(&frame.sequence.to_be_bytes());
             datagram.extend_from_slice(&frame.captured_at_micros.to_be_bytes());
+            datagram.extend_from_slice(&frame.encoded_at_micros.to_be_bytes());
+            datagram.extend_from_slice(&frame.packetized_at_micros.to_be_bytes());
+            datagram.extend_from_slice(&frame.input_sequence.to_be_bytes());
             datagram.extend_from_slice(&frame.target_bitrate_bits_per_second.to_be_bytes());
             datagram.extend_from_slice(&frame.estimated_capacity_bits_per_second.to_be_bytes());
             datagram.extend_from_slice(&frame_size.to_be_bytes());
@@ -62,6 +68,9 @@ pub fn packetize_video_frame(
 struct Header {
     sequence: u64,
     captured_at: u64,
+    encoded_at: u64,
+    packetized_at: u64,
+    input_sequence: u64,
     target_bitrate_bits_per_second: u64,
     estimated_capacity_bits_per_second: u64,
     frame_size: usize,
@@ -77,9 +86,9 @@ fn parse_header(datagram: &[u8]) -> Result<(Header, &[u8]), VideoDatagramError> 
     if datagram[..2] != MAGIC || datagram[2] != VERSION || datagram[3] & !KEYFRAME_FLAG != 0 {
         return Err(VideoDatagramError::MalformedHeader);
     }
-    let frame_size = u32::from_be_bytes(datagram[36..40].try_into().unwrap()) as usize;
-    let chunk_index = u16::from_be_bytes(datagram[40..42].try_into().unwrap()) as usize;
-    let chunk_count = u16::from_be_bytes(datagram[42..44].try_into().unwrap()) as usize;
+    let frame_size = u32::from_be_bytes(datagram[60..64].try_into().unwrap()) as usize;
+    let chunk_index = u16::from_be_bytes(datagram[64..66].try_into().unwrap()) as usize;
+    let chunk_count = u16::from_be_bytes(datagram[66..68].try_into().unwrap()) as usize;
     let payload = &datagram[VIDEO_DATAGRAM_HEADER_SIZE..];
     if frame_size == 0
         || frame_size > MAX_ENCODED_FRAME_SIZE
@@ -94,11 +103,14 @@ fn parse_header(datagram: &[u8]) -> Result<(Header, &[u8]), VideoDatagramError> 
         Header {
             sequence: u64::from_be_bytes(datagram[4..12].try_into().unwrap()),
             captured_at: u64::from_be_bytes(datagram[12..20].try_into().unwrap()),
+            encoded_at: u64::from_be_bytes(datagram[20..28].try_into().unwrap()),
+            packetized_at: u64::from_be_bytes(datagram[28..36].try_into().unwrap()),
+            input_sequence: u64::from_be_bytes(datagram[36..44].try_into().unwrap()),
             target_bitrate_bits_per_second: u64::from_be_bytes(
-                datagram[20..28].try_into().unwrap(),
+                datagram[44..52].try_into().unwrap(),
             ),
             estimated_capacity_bits_per_second: u64::from_be_bytes(
-                datagram[28..36].try_into().unwrap(),
+                datagram[52..60].try_into().unwrap(),
             ),
             frame_size,
             chunk_index,
@@ -230,6 +242,9 @@ impl VideoFrameAssembler {
 
         let existing = self.partial[&header.sequence].header;
         if existing.captured_at != header.captured_at
+            || existing.encoded_at != header.encoded_at
+            || existing.packetized_at != header.packetized_at
+            || existing.input_sequence != header.input_sequence
             || existing.frame_size != header.frame_size
             || existing.chunk_count != header.chunk_count
             || existing.keyframe != header.keyframe
@@ -305,6 +320,9 @@ impl VideoFrameAssembler {
             frame: Some(VideoFramePayload {
                 sequence: partial.header.sequence,
                 captured_at_micros: partial.header.captured_at,
+                encoded_at_micros: partial.header.encoded_at,
+                packetized_at_micros: partial.header.packetized_at,
+                input_sequence: partial.header.input_sequence,
                 keyframe: partial.header.keyframe,
                 target_bitrate_bits_per_second: partial.header.target_bitrate_bits_per_second,
                 estimated_capacity_bits_per_second: partial
@@ -403,6 +421,9 @@ mod tests {
         VideoFramePayload {
             sequence,
             captured_at_micros: 42,
+            encoded_at_micros: 52,
+            packetized_at_micros: 62,
+            input_sequence: 7,
             keyframe: sequence == 1,
             target_bitrate_bits_per_second: 20_000_000,
             estimated_capacity_bits_per_second: 24_000_000,

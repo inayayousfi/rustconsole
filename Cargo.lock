@@ -3486,8 +3486,7 @@ dependencies = [
 [[package]]
 name = "quinn-proto"
 version = "0.11.17"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "04759210543be93709136e28212294a659ef5001836ff4eab4d663e4529bba83"
+source = "git+https://github.com/quinn-rs/quinn?rev=a708a979c291f6b2baf0141d3096f265353cbce1#a708a979c291f6b2baf0141d3096f265353cbce1"
 dependencies = [
  "bytes",
  "getrandom 0.4.3",
@@ -3846,6 +3845,7 @@ dependencies = [
  "rustconsole-media",
  "rustconsole-protocol",
  "rustconsole-session",
+ "sha2 0.10.9",
  "tokio",
  "windows 0.62.2",
  "windows-service",
@@ -3871,6 +3871,7 @@ name = "rustconsole-player"
 version = "0.1.0"
 dependencies = [
  "backon",
+ "libc",
  "rustconsole-player-core",
  "rustconsole-player-gui",
  "rustconsole-player-linux",
@@ -3879,6 +3880,8 @@ dependencies = [
  "rustconsole-render-vulkan",
  "rustconsole-render-vulkan-linux",
  "sdl3",
+ "serde",
+ "serde_json",
  "zeroize",
 ]
 
@@ -3891,6 +3894,7 @@ dependencies = [
  "rustconsole-media",
  "rustconsole-protocol",
  "rustconsole-session",
+ "sha2 0.10.9",
  "tokio",
  "zeroize",
 ]
@@ -3917,6 +3921,7 @@ dependencies = [
  "rustconsole-player-core",
  "rustconsole-protocol",
  "sdl3",
+ "sha2 0.10.9",
  "zeroize",
 ]
 
@@ -4962,7 +4967,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",

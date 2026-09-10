@@ -22,6 +22,7 @@ rand.workspace = true
 bytes.workspace = true
 quinn.workspace = true
 rpassword.workspace = true
+sha2.workspace = true
 tokio.workspace = true
 windows.workspace = true
 windows-service.workspace = true

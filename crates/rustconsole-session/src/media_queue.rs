@@ -1,11 +1,15 @@
 use std::collections::VecDeque;
-use std::sync::{Condvar, Mutex};
+use std::sync::{
+    Condvar, Mutex,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::Duration;
 
 pub struct MediaQueue<T> {
     capacity: usize,
     state: Mutex<(VecDeque<T>, bool)>,
     ready: Condvar,
+    dropped: AtomicU64,
 }
 
 impl<T> MediaQueue<T> {
@@ -15,12 +19,14 @@ impl<T> MediaQueue<T> {
             capacity,
             state: Mutex::new((VecDeque::new(), false)),
             ready: Condvar::new(),
+            dropped: AtomicU64::new(0),
         }
     }
 
     pub fn push(&self, value: T) -> Option<T> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.1 {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
             return Some(value);
         }
         let dropped = if state.0.len() == self.capacity {
@@ -29,6 +35,9 @@ impl<T> MediaQueue<T> {
             None
         };
         state.0.push_back(value);
+        if dropped.is_some() {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
         self.ready.notify_one();
         dropped
     }
@@ -51,6 +60,25 @@ impl<T> MediaQueue<T> {
     pub fn is_closed(&self) -> bool {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).1
     }
+
+    #[must_use]
+    pub const fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    #[must_use]
+    pub fn depth(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .0
+            .len()
+    }
+
+    #[must_use]
+    pub fn dropped(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
 }
 
 #[cfg(test)]
@@ -62,8 +90,12 @@ mod tests {
         assert_eq!(queue.push(1), None);
         queue.push(2);
         assert_eq!(queue.push(3), Some(1));
+        assert_eq!(queue.capacity(), 2);
+        assert_eq!(queue.depth(), 2);
+        assert_eq!(queue.dropped(), 1);
         queue.close();
         assert_eq!(queue.push(4), Some(4));
+        assert_eq!(queue.dropped(), 2);
         assert_eq!(queue.pop_timeout(Duration::ZERO), Some(2));
         assert_eq!(queue.pop_timeout(Duration::ZERO), Some(3));
         assert_eq!(queue.pop_timeout(Duration::from_secs(10)), None);

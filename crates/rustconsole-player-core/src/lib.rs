@@ -19,7 +19,9 @@ pub use rustconsole_session::authentication::{HostIdentity, SessionIdentity};
 pub use rustconsole_session::video_datagram::VideoFramePayload;
 use rustconsole_session::video_datagram::{FrameAssemblyProgress, VideoAssemblyStats};
 use std::net::SocketAddr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+pub use rustconsole_session::statistics::{ClockOffsetEstimate, Distribution, DistributionSamples};
 
 pub const LAN_DISCOVERY_TIMEOUT: Duration = Duration::from_millis(750);
 pub const ROUTED_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(2);
@@ -296,6 +298,117 @@ pub enum StreamProgress {
         target_bitrate_bits_per_second: u64,
         estimated_capacity_bits_per_second: u64,
     },
+    ClockOffset(ClockOffsetEstimate),
+    InputSent {
+        sequence: u64,
+        occurred_at: std::time::Instant,
+        sent_at: std::time::Instant,
+        send_completed_at: std::time::Instant,
+        correlates_test_marker: bool,
+    },
+    InputAcknowledged {
+        sequence: u64,
+        player_sent_at_micros: u64,
+        player_received_at_micros: u64,
+        host_received_at_micros: u64,
+        host_submitted_at_micros: u64,
+        pointer_datagrams_received: u64,
+        pointer_updates_applied: u64,
+        pointer_updates_ignored: u64,
+        mouse_reports_published: u64,
+        keyboard_reports_published: u64,
+        reliable_transitions_received: u64,
+        reliable_transitions_applied: u64,
+        reliable_transitions_rejected: u64,
+        reliable_transitions_missing: u64,
+        reliable_transitions_duplicate_or_late: u64,
+        release_all_transitions: u64,
+        pointer_missing_datagrams: u64,
+        pointer_stale_generations: u64,
+        pointer_duplicate_or_late: u64,
+        pointer_mode_rejections: u64,
+        pointer_relative_baselines: u64,
+    },
+    PayloadIntegrity(PayloadIntegritySample),
+    PayloadIntegrityCounters(PayloadIntegrityCounters),
+    DiagnosticQueues(DiagnosticQueueSnapshot),
+    KeyframeRecovered {
+        duration: std::time::Duration,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DiagnosticQueueSnapshot {
+    pub video_depth: u64,
+    pub video_drops: u64,
+    pub audio_depth: u64,
+    pub audio_drops: u64,
+    pub event_depth: u64,
+    pub event_drops: u64,
+    pub digest_depth: u64,
+    pub digest_drops: u64,
+    pub keyframe_requests: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PayloadIntegritySample {
+    pub kind: rustconsole_protocol::diagnostics::MediaKind,
+    pub generation: u64,
+    pub sequence: u64,
+    pub payload_size: u64,
+    pub matched: bool,
+    pub producer_hash_duration_micros: u64,
+    pub host_hash_duration_micros: u64,
+    pub player_hash_duration_micros: u64,
+    pub host_dropped_records: u64,
+    pub worker_to_service_matched: bool,
+    pub encode_started_at_micros: u64,
+    pub encoded_at_micros: u64,
+    pub worker_queued_at_micros: u64,
+    pub service_received_at_micros: u64,
+    pub packetized_at_micros: u64,
+    pub assembled_at_micros: u64,
+    pub captured_at_micros: u64,
+    pub mirror_decode_micros: u64,
+    pub quality_present: bool,
+    pub quality_presentation_timestamp: i64,
+    pub source_readback_micros: u64,
+    pub decoded_readback_micros: u64,
+    pub scoring_micros: u64,
+    pub readback_bytes: u64,
+    pub luma_psnr_millidecibels: u64,
+    pub luma_mean_absolute_error_ppm: u64,
+    pub packetization_completed_at_micros: u64,
+    pub first_send_attempt_at_micros: u64,
+    pub last_send_completed_at_micros: u64,
+    pub capture_acquisition_micros: u64,
+    pub cross_adapter_copy_micros: u64,
+    pub color_conversion_micros: u64,
+    pub encoder_call_micros: u64,
+    pub audio_capture_buffer_frames: u64,
+    pub audio_capture_discontinuities: u64,
+    pub audio_invalid_capture_timestamps: u64,
+    pub audio_device_reopens: u64,
+    pub audio_encoder_resets: u64,
+    pub audio_capture_queue_depth: u64,
+    pub audio_capture_queue_capacity: u64,
+    pub audio_capture_queue_drops: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PayloadIntegrityCounters {
+    pub pending_host_records: u64,
+    pub pending_player_payloads: u64,
+    pub duplicate_host_records: u64,
+    pub duplicate_player_payloads: u64,
+    pub unmatched_host_records: u64,
+    pub unmatched_player_payloads: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct TimedInputEvent {
+    pub event: InputEvent,
+    pub occurred_at: std::time::Instant,
 }
 
 pub struct StreamConsumers<Audio, Video> {
@@ -308,6 +421,7 @@ pub struct StreamHostParameters<PasswordFor, Authenticated, Progress, Stop, Inpu
     pub password_for: PasswordFor,
     pub on_authenticated: Authenticated,
     pub on_progress: Progress,
+    pub full_diagnostics: bool,
     pub video: (Vec<DomainCapability>, DomainSettings),
     pub should_stop: Stop,
     pub next_input: Input,
@@ -431,7 +545,7 @@ where
     Authenticated: FnOnce(HostIdentity) -> Result<(), Box<dyn std::error::Error>>,
     Progress: FnMut(StreamProgress),
     Stop: Fn() -> bool,
-    Input: FnMut() -> Option<InputEvent> + Send + 'static,
+    Input: FnMut() -> Option<TimedInputEvent> + Send + 'static,
     Audio: FnMut(AudioPlaybackEvent) -> Result<(), Box<dyn std::error::Error>>,
     Video: FnMut(
         VideoFramePayload,
@@ -443,6 +557,7 @@ where
         password_for,
         on_authenticated,
         mut on_progress,
+        full_diagnostics,
         video,
         should_stop,
         next_input,
@@ -471,6 +586,7 @@ where
             &mut send,
             Envelope {
                 body: Some(envelope::Body::Av1CapabilityOffer(Av1CapabilityOffer {
+                    full_diagnostics,
                     audio_transport: Some(rustconsole_protocol::wire::AudioConfiguration::INITIAL),
                     encoder_capabilities: Vec::new(),
                     decoder_capabilities: decoder_capabilities
@@ -506,6 +622,7 @@ where
             negotiate_av1_configuration(&host_capabilities, &decoder_capabilities, &settings)?;
         let mut selected_wire = wire_selected(selected);
         selected_wire.audio_transport = audio_transport;
+        selected_wire.full_diagnostics = full_diagnostics;
         rustconsole_session::quic::write_envelope(
             &mut send,
             Envelope {
@@ -522,12 +639,22 @@ where
         }
         on_progress(StreamProgress::VideoNegotiated(selected));
         on_progress(StreamProgress::WaitingForVideoPackets);
+        let diagnostic_stream = if full_diagnostics {
+            Some(
+                tokio::time::timeout(Duration::from_secs(10), connection.accept_uni())
+                    .await
+                    .map_err(|_| "timed out waiting for diagnostic stream")??,
+            )
+        } else {
+            None
+        };
 
         let end = stream_receiver::receive_stream(stream_receiver::ReceiveStreamParameters {
             connection,
             control: (send, receive),
             fps: selected.frames_per_second,
             audio_enabled: audio_transport.is_some(),
+            diagnostic_stream,
             should_stop,
             next_input,
             progress: on_progress,
@@ -545,6 +672,10 @@ where
 pub struct StreamTransportStatistics {
     pub round_trip_time: Duration,
     pub assembly: VideoAssemblyStats,
+    pub assembled_at: Option<Instant>,
+    pub assembled_at_micros: u64,
+    pub assembly_duration: Duration,
+    pub assembled_payload_sha256: Option<[u8; 32]>,
 }
 
 fn wire_capability(capability: DomainCapability) -> Av1HardwareCapability {
@@ -626,6 +757,7 @@ fn wire_selected(
         maximum_frames_per_second: selected.frames_per_second,
     });
     SelectedAv1Configuration {
+        full_diagnostics: false,
         audio_transport: None,
         width: selected.width,
         height: selected.height,

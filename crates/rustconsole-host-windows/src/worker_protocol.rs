@@ -1,6 +1,6 @@
 use std::io::{self, Read, Write};
 
-pub const VERSION: u16 = 12;
+pub const VERSION: u16 = 14;
 const MAX_PAYLOAD: usize = 16 * 1024 * 1024;
 const COMMAND_CAPTURE_PROOF: u8 = 1;
 const COMMAND_STOP: u8 = 2;
@@ -81,6 +81,7 @@ pub enum WorkerCommand {
         frames_per_second: u16,
         bitrate_bits_per_second: u64,
         audio: bool,
+        diagnostics: bool,
     },
     SetVideoBitrate(u64),
     SetVideoFrameDivisor(u8),
@@ -115,12 +116,34 @@ pub enum WorkerEvent {
         protected_content_masked: bool,
         presentation_timestamp: i64,
         keyframe: bool,
+        payload_sha256: Option<[u8; 32]>,
+        hash_duration_micros: u64,
+        encode_started_at_micros: u64,
+        encoded_at_micros: u64,
+        worker_queued_at_micros: u64,
+        mirror_decode_micros: u64,
+        capture_acquisition_micros: u64,
+        cross_adapter_copy_micros: u64,
+        color_conversion_micros: u64,
+        encoder_call_micros: u64,
+        quality: Option<WorkerVideoQuality>,
         payload: Vec<u8>,
     },
     VideoConfiguration(WorkerVideoConfiguration),
     VideoReconfigurationRequired(rustconsole_protocol::wire::VideoReconfigurationCause),
     SystemIdentityRequired,
     Failure(String),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WorkerVideoQuality {
+    pub presentation_timestamp: i64,
+    pub source_readback_micros: u64,
+    pub decoded_readback_micros: u64,
+    pub scoring_micros: u64,
+    pub readback_bytes: u64,
+    pub luma_psnr_millidecibels: u64,
+    pub luma_mean_absolute_error_ppm: u64,
 }
 
 pub fn write_command(writer: &mut impl Write, command: WorkerCommand) -> io::Result<()> {
@@ -145,11 +168,13 @@ pub fn write_command(writer: &mut impl Write, command: WorkerCommand) -> io::Res
             frames_per_second,
             bitrate_bits_per_second,
             audio,
+            diagnostics,
         } => {
             let mut payload = vec![COMMAND_START_VIDEO_STREAM];
             payload.extend_from_slice(&frames_per_second.to_be_bytes());
             payload.extend_from_slice(&bitrate_bits_per_second.to_be_bytes());
             payload.push(u8::from(audio));
+            payload.push(u8::from(diagnostics));
             payload
         }
         WorkerCommand::SetVideoBitrate(bitrate_bits_per_second) => {
@@ -183,11 +208,14 @@ pub fn read_command(reader: &mut impl Read) -> io::Result<WorkerCommand> {
                 bitrate_bits_per_second: u64::from_be_bytes(rest[2..].try_into().unwrap()),
             })
         }
-        [COMMAND_START_VIDEO_STREAM, rest @ ..] if rest.len() == 11 && rest[10] <= 1 => {
+        [COMMAND_START_VIDEO_STREAM, rest @ ..]
+            if rest.len() == 12 && rest[10] <= 1 && rest[11] <= 1 =>
+        {
             Ok(WorkerCommand::StartVideoStream {
                 frames_per_second: u16::from_be_bytes(rest[..2].try_into().unwrap()),
                 bitrate_bits_per_second: u64::from_be_bytes(rest[2..10].try_into().unwrap()),
                 audio: rest[10] != 0,
+                diagnostics: rest[11] != 0,
             })
         }
         [COMMAND_SET_VIDEO_BITRATE, rest @ ..] if rest.len() == 8 => Ok(
@@ -251,6 +279,17 @@ pub fn write_event(writer: &mut impl Write, event: &WorkerEvent) -> io::Result<(
             protected_content_masked,
             presentation_timestamp,
             keyframe,
+            payload_sha256,
+            hash_duration_micros,
+            encode_started_at_micros,
+            encoded_at_micros,
+            worker_queued_at_micros,
+            mirror_decode_micros,
+            capture_acquisition_micros,
+            cross_adapter_copy_micros,
+            color_conversion_micros,
+            encoder_call_micros,
+            quality,
             payload: packet,
         } => {
             payload.push(EVENT_ENCODED_VIDEO_FRAME);
@@ -260,6 +299,29 @@ pub fn write_event(writer: &mut impl Write, event: &WorkerEvent) -> io::Result<(
             payload.push(u8::from(*protected_content_masked));
             payload.extend_from_slice(&presentation_timestamp.to_be_bytes());
             payload.push(u8::from(*keyframe));
+            payload.push(u8::from(payload_sha256.is_some()));
+            payload.push(u8::from(quality.is_some()));
+            payload.extend_from_slice(&hash_duration_micros.to_be_bytes());
+            payload.extend_from_slice(&encode_started_at_micros.to_be_bytes());
+            payload.extend_from_slice(&encoded_at_micros.to_be_bytes());
+            payload.extend_from_slice(&worker_queued_at_micros.to_be_bytes());
+            payload.extend_from_slice(&mirror_decode_micros.to_be_bytes());
+            payload.extend_from_slice(&capture_acquisition_micros.to_be_bytes());
+            payload.extend_from_slice(&cross_adapter_copy_micros.to_be_bytes());
+            payload.extend_from_slice(&color_conversion_micros.to_be_bytes());
+            payload.extend_from_slice(&encoder_call_micros.to_be_bytes());
+            if let Some(quality) = quality {
+                payload.extend_from_slice(&quality.presentation_timestamp.to_be_bytes());
+                payload.extend_from_slice(&quality.source_readback_micros.to_be_bytes());
+                payload.extend_from_slice(&quality.decoded_readback_micros.to_be_bytes());
+                payload.extend_from_slice(&quality.scoring_micros.to_be_bytes());
+                payload.extend_from_slice(&quality.readback_bytes.to_be_bytes());
+                payload.extend_from_slice(&quality.luma_psnr_millidecibels.to_be_bytes());
+                payload.extend_from_slice(&quality.luma_mean_absolute_error_ppm.to_be_bytes());
+            }
+            if let Some(digest) = payload_sha256 {
+                payload.extend_from_slice(digest);
+            }
             payload.extend_from_slice(packet);
         }
         WorkerEvent::Failure(error) => {
@@ -367,7 +429,17 @@ pub fn read_event(reader: &mut impl Read) -> io::Result<WorkerEvent> {
         Some(EVENT_SYSTEM_IDENTITY_REQUIRED) if payload.len() == 1 => {
             Ok(WorkerEvent::SystemIdentityRequired)
         }
-        Some(EVENT_ENCODED_VIDEO_FRAME) if payload.len() >= 31 => {
+        Some(EVENT_ENCODED_VIDEO_FRAME) if payload.len() >= 105 => {
+            let quality_end = match payload[32] {
+                0 => 105,
+                1 if payload.len() >= 161 => 161,
+                _ => return Err(invalid_data("invalid video quality flag")),
+            };
+            let digest_end = match payload[31] {
+                0 => quality_end,
+                1 if payload.len() >= quality_end + 32 => quality_end + 32,
+                _ => return Err(invalid_data("invalid video payload digest flag")),
+            };
             Ok(WorkerEvent::EncodedVideoFrame {
                 sequence: u64::from_be_bytes(payload[1..9].try_into().unwrap()),
                 last_present_time: i64::from_be_bytes(payload[9..17].try_into().unwrap()),
@@ -383,7 +455,37 @@ pub fn read_event(reader: &mut impl Read) -> io::Result<WorkerEvent> {
                     1 => true,
                     _ => return Err(invalid_data("invalid keyframe flag")),
                 },
-                payload: payload[31..].to_vec(),
+                payload_sha256: (payload[31] == 1)
+                    .then(|| payload[quality_end..digest_end].try_into().unwrap()),
+                hash_duration_micros: u64::from_be_bytes(payload[33..41].try_into().unwrap()),
+                encode_started_at_micros: u64::from_be_bytes(payload[41..49].try_into().unwrap()),
+                encoded_at_micros: u64::from_be_bytes(payload[49..57].try_into().unwrap()),
+                worker_queued_at_micros: u64::from_be_bytes(payload[57..65].try_into().unwrap()),
+                mirror_decode_micros: u64::from_be_bytes(payload[65..73].try_into().unwrap()),
+                capture_acquisition_micros: u64::from_be_bytes(payload[73..81].try_into().unwrap()),
+                cross_adapter_copy_micros: u64::from_be_bytes(payload[81..89].try_into().unwrap()),
+                color_conversion_micros: u64::from_be_bytes(payload[89..97].try_into().unwrap()),
+                encoder_call_micros: u64::from_be_bytes(payload[97..105].try_into().unwrap()),
+                quality: (payload[32] == 1).then(|| WorkerVideoQuality {
+                    presentation_timestamp: i64::from_be_bytes(
+                        payload[105..113].try_into().unwrap(),
+                    ),
+                    source_readback_micros: u64::from_be_bytes(
+                        payload[113..121].try_into().unwrap(),
+                    ),
+                    decoded_readback_micros: u64::from_be_bytes(
+                        payload[121..129].try_into().unwrap(),
+                    ),
+                    scoring_micros: u64::from_be_bytes(payload[129..137].try_into().unwrap()),
+                    readback_bytes: u64::from_be_bytes(payload[137..145].try_into().unwrap()),
+                    luma_psnr_millidecibels: u64::from_be_bytes(
+                        payload[145..153].try_into().unwrap(),
+                    ),
+                    luma_mean_absolute_error_ppm: u64::from_be_bytes(
+                        payload[153..161].try_into().unwrap(),
+                    ),
+                }),
+                payload: payload[digest_end..].to_vec(),
             })
         }
         _ => Err(invalid_data("unknown worker event")),
@@ -420,6 +522,18 @@ fn invalid_data(message: &'static str) -> io::Error {
 pub enum AudioWorkerEvent {
     Packet {
         queued_at_micros: u64,
+        payload_sha256: Option<[u8; 32]>,
+        hash_duration_micros: u64,
+        encode_started_at_micros: u64,
+        encoded_at_micros: u64,
+        capture_buffer_frames: u64,
+        capture_discontinuities: u64,
+        invalid_capture_timestamps: u64,
+        device_reopens: u64,
+        encoder_resets: u64,
+        capture_queue_depth: u64,
+        capture_queue_capacity: u64,
+        capture_queue_drops: u64,
         packet: rustconsole_protocol::audio::AudioPacket,
     },
     State(rustconsole_protocol::wire::AudioStreamState),
@@ -431,6 +545,18 @@ pub fn write_audio_event(writer: &mut impl Write, event: &AudioWorkerEvent) -> i
     match event {
         AudioWorkerEvent::Packet {
             queued_at_micros,
+            payload_sha256,
+            hash_duration_micros,
+            encode_started_at_micros,
+            encoded_at_micros,
+            capture_buffer_frames,
+            capture_discontinuities,
+            invalid_capture_timestamps,
+            device_reopens,
+            encoder_resets,
+            capture_queue_depth,
+            capture_queue_capacity,
+            capture_queue_drops,
             packet,
         } => {
             let size = u16::try_from(packet.payload.len())
@@ -450,6 +576,25 @@ pub fn write_audio_event(writer: &mut impl Write, event: &AudioWorkerEvent) -> i
             };
             data.push(1);
             data.extend_from_slice(&queued_at_micros.to_be_bytes());
+            data.push(u8::from(payload_sha256.is_some()));
+            data.extend_from_slice(&hash_duration_micros.to_be_bytes());
+            data.extend_from_slice(&encode_started_at_micros.to_be_bytes());
+            data.extend_from_slice(&encoded_at_micros.to_be_bytes());
+            for value in [
+                capture_buffer_frames,
+                capture_discontinuities,
+                invalid_capture_timestamps,
+                device_reopens,
+                encoder_resets,
+                capture_queue_depth,
+                capture_queue_capacity,
+                capture_queue_drops,
+            ] {
+                data.extend_from_slice(&value.to_be_bytes());
+            }
+            if let Some(digest) = payload_sha256 {
+                data.extend_from_slice(digest);
+            }
             data.extend_from_slice(&header.encode().map_err(invalid_data)?);
             data.extend_from_slice(&packet.payload);
         }
@@ -486,14 +631,31 @@ pub fn read_audio_event(reader: &mut impl Read) -> io::Result<AudioWorkerEvent> 
     let mut data = vec![0; size];
     reader.read_exact(&mut data)?;
     match data[0] {
-        1 if data.len() > 9 => {
+        1 if data.len() > 98 => {
             let queued_at_micros = u64::from_be_bytes(data[1..9].try_into().unwrap());
-            let (h, payload) = Header::decode(&data[9..]).map_err(invalid_data)?;
+            let header_start = match data[9] {
+                0 => 98,
+                1 if data.len() > 130 => 130,
+                _ => return Err(invalid_data("invalid audio payload digest flag")),
+            };
+            let (h, payload) = Header::decode(&data[header_start..]).map_err(invalid_data)?;
             if h.fragment_count != 1 || h.offset != 0 || h.packet_size != h.payload_size {
                 return Err(invalid_data("fragmented worker audio event"));
             }
             Ok(AudioWorkerEvent::Packet {
                 queued_at_micros,
+                payload_sha256: (header_start == 130).then(|| data[98..130].try_into().unwrap()),
+                hash_duration_micros: u64::from_be_bytes(data[10..18].try_into().unwrap()),
+                encode_started_at_micros: u64::from_be_bytes(data[18..26].try_into().unwrap()),
+                encoded_at_micros: u64::from_be_bytes(data[26..34].try_into().unwrap()),
+                capture_buffer_frames: u64::from_be_bytes(data[34..42].try_into().unwrap()),
+                capture_discontinuities: u64::from_be_bytes(data[42..50].try_into().unwrap()),
+                invalid_capture_timestamps: u64::from_be_bytes(data[50..58].try_into().unwrap()),
+                device_reopens: u64::from_be_bytes(data[58..66].try_into().unwrap()),
+                encoder_resets: u64::from_be_bytes(data[66..74].try_into().unwrap()),
+                capture_queue_depth: u64::from_be_bytes(data[74..82].try_into().unwrap()),
+                capture_queue_capacity: u64::from_be_bytes(data[82..90].try_into().unwrap()),
+                capture_queue_drops: u64::from_be_bytes(data[90..98].try_into().unwrap()),
                 packet: AudioPacket {
                     generation: h.generation,
                     sequence: h.sequence,
@@ -532,6 +694,18 @@ mod tests {
         for event in [
             AudioWorkerEvent::Packet {
                 queued_at_micros: 90,
+                payload_sha256: Some([7; 32]),
+                hash_duration_micros: 8,
+                encode_started_at_micros: 70,
+                encoded_at_micros: 80,
+                capture_buffer_frames: 480,
+                capture_discontinuities: 1,
+                invalid_capture_timestamps: 2,
+                device_reopens: 3,
+                encoder_resets: 4,
+                capture_queue_depth: 5,
+                capture_queue_capacity: 6,
+                capture_queue_drops: 7,
                 packet: AudioPacket {
                     generation: 1,
                     sequence: 2,
@@ -593,6 +767,7 @@ mod tests {
             WorkerCommand::PrepareVideoStream,
             WorkerCommand::StartVideoStream {
                 audio: true,
+                diagnostics: true,
                 frames_per_second: 120,
                 bitrate_bits_per_second: 20_000_000,
             },
@@ -683,6 +858,25 @@ mod tests {
             protected_content_masked: false,
             presentation_timestamp: 7,
             keyframe: true,
+            payload_sha256: Some([8; 32]),
+            hash_duration_micros: 9,
+            encode_started_at_micros: 70,
+            encoded_at_micros: 80,
+            worker_queued_at_micros: 90,
+            mirror_decode_micros: 10,
+            capture_acquisition_micros: 17,
+            cross_adapter_copy_micros: 18,
+            color_conversion_micros: 19,
+            encoder_call_micros: 20,
+            quality: Some(WorkerVideoQuality {
+                presentation_timestamp: 7,
+                source_readback_micros: 11,
+                decoded_readback_micros: 12,
+                scoring_micros: 13,
+                readback_bytes: 14,
+                luma_psnr_millidecibels: 15,
+                luma_mean_absolute_error_ppm: 16,
+            }),
             payload: vec![1, 2, 3],
         };
         let mut bytes = Vec::new();

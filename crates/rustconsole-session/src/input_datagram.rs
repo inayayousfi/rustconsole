@@ -38,6 +38,16 @@ pub struct PointerSnapshotReceiver {
 }
 
 impl PointerSnapshotReceiver {
+    #[must_use]
+    pub const fn generation(&self) -> Option<u64> {
+        self.generation
+    }
+
+    #[must_use]
+    pub const fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
     pub fn push(
         &mut self,
         snapshot: PointerSnapshot,
@@ -89,6 +99,11 @@ impl PointerSnapshot {
     #[must_use]
     pub const fn generation(self) -> u64 {
         self.identity().0
+    }
+
+    #[must_use]
+    pub const fn sequence(self) -> u64 {
+        self.identity().1
     }
 
     #[must_use]
