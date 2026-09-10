@@ -52,8 +52,7 @@ const elements = {
 };
 
 let machines = loadMachines();
-let activeEndpoint = null;
-let playerActive = false;
+let playerSession = { phase: "idle", endpoint: null, generation: 0 };
 let audioLaunchNoticeShown = false;
 let discoveredRoutes = [];
 let previousDiscoveredRoutes = [];
@@ -72,8 +71,8 @@ function machine(endpoint, identity = null, endpoints = [endpoint], displayName 
     resolvedEndpoint: null,
     displayName,
     operatingSystem,
-    state: "checking",
-    detail: "Checking availability",
+    availability: "checking",
+    availabilityDetail: "Checking availability",
     vbCableStatus: "unspecified",
     firewallStatus: "unknown",
     probeGeneration: 0,
@@ -226,22 +225,16 @@ function errorNeedsCredential(error) {
 
 async function probeMachine(item, password = "", announceAudio = true) {
   const endpoint = item.preferredEndpoint;
-  if (playerActive && activeEndpoint === endpoint) {
-    item.state = "connected";
-    item.detail = "Player streaming";
-    renderMachines();
-    return { availability: "connected", machine: item };
-  }
   const generation = ++item.probeGeneration;
-  item.state = "checking";
-  item.detail = "Checking availability";
+  item.availability = "checking";
+  item.availabilityDetail = "Checking availability";
   renderMachines();
   try {
     const result = await invoke("probe", { host: endpoint, password });
     if (generation !== item.probeGeneration) return { availability: result.availability, machine: item };
     const identified = mergeAuthenticatedRoute(item, endpoint, result.hostIdentity);
-    identified.state = result.availability;
-    identified.detail = availabilityText(result.availability);
+    identified.availability = result.availability;
+    identified.availabilityDetail = availabilityText(result.availability);
     identified.resolvedEndpoint = result.endpoint;
     identified.displayName = result.displayName;
     identified.operatingSystem = result.operatingSystem;
@@ -255,10 +248,10 @@ async function probeMachine(item, password = "", announceAudio = true) {
     }
     return { availability: result.availability, machine: identified };
   } catch (error) {
-    if (generation !== item.probeGeneration) return { availability: item.state, machine: item };
-    item.state = errorNeedsCredential(error) ? "authentication" : "unreachable";
-    item.detail = item.state === "authentication" ? "Authentication required" : "Could not reach machine";
-    return { availability: item.state, machine: item };
+    if (generation !== item.probeGeneration) return { availability: item.availability, machine: item };
+    item.availability = errorNeedsCredential(error) ? "authentication" : "unreachable";
+    item.availabilityDetail = item.availability === "authentication" ? "Authentication required" : "Could not reach machine";
+    return { availability: item.availability, machine: item };
   } finally {
     renderMachines();
   }
@@ -289,11 +282,13 @@ async function probeAllMachines() {
   await Promise.allSettled(machines.map((item) => probeMachine(item)));
 }
 
-async function probeUntilSessionReleased(item) {
-  for (let attempt = 0; attempt < 6; attempt += 1) {
+async function probeUntilSessionReleased(item, playerGeneration) {
+  for (let attempt = 0; attempt < 30; attempt += 1) {
+    if (playerSession.generation !== playerGeneration || window.RustConsoleMachineState.playerActive(playerSession)) return;
     await new Promise((resolve) => window.setTimeout(resolve, 500));
+    if (playerSession.generation !== playerGeneration || window.RustConsoleMachineState.playerActive(playerSession)) return;
     const result = await probeMachine(item);
-    if (result.availability !== "busy") return;
+    if (["available", "authentication", "desktop-session-unavailable"].includes(result.availability)) return;
   }
 }
 
@@ -416,8 +411,8 @@ async function authenticateRememberedDiscoveryRoute(route, generation) {
   item.displayName = result.displayName;
   item.operatingSystem = result.operatingSystem;
   item.firewallStatus = result.firewallStatus;
-  item.state = result.availability;
-  item.detail = availabilityText(result.availability);
+  item.availability = result.availability;
+  item.availabilityDetail = availabilityText(result.availability);
   item.vbCableStatus = result.vbCableStatus;
   saveMachines();
   renderMachines();
@@ -461,8 +456,8 @@ async function confirmDiscoveredRoutes(selected, password) {
   item.displayName = confirmed[0].result.displayName;
   item.operatingSystem = confirmed[0].result.operatingSystem;
   item.firewallStatus = confirmed[0].result.firewallStatus;
-  item.state = confirmed[0].result.availability;
-  item.detail = availabilityText(confirmed[0].result.availability);
+  item.availability = confirmed[0].result.availability;
+  item.availabilityDetail = availabilityText(confirmed[0].result.availability);
   item.vbCableStatus = confirmed[0].result.vbCableStatus;
   saveMachines();
   return item;
@@ -483,11 +478,14 @@ function renderDiscoveredMachines() {
     const authenticated = group.some((candidate) => candidate.authenticated) && item;
     const authenticating = group.some((candidate) => candidate.authenticating);
     const card = elements.cardTemplate.content.firstElementChild.cloneNode(true);
-    card.dataset.state = authenticated ? item.state : "authentication";
+    const status = authenticated
+      ? window.RustConsoleMachineState.presentation(item, playerSession)
+      : null;
+    card.dataset.state = status?.state ?? "authentication";
     card.querySelector("h2").textContent = route.displayName ?? route.sourceName ?? route.endpoint;
     const sources = [...new Set(group.map((candidate) => candidate.source === "tailscale" ? "Tailscale" : candidate.source === "lan" ? "LAN" : "Manual"))];
     card.querySelector(".machine-identity p").textContent = `${operatingSystemLabel(route.operatingSystem)} · ${sources.join(" + ")} · ${group.length} ${group.length === 1 ? "route" : "routes"}`;
-    card.querySelector(".machine-status span").textContent = authenticated ? item.detail : authenticating ? "Authenticating" : "Not authenticated";
+    card.querySelector(".machine-status span").textContent = authenticated ? status.detail : authenticating ? "Authenticating" : "Not authenticated";
     const routeList = card.querySelector(".route-list");
     routeList.replaceChildren(...group.map((candidate) => {
       const entry = document.createElement("li");
@@ -503,7 +501,7 @@ function renderDiscoveredMachines() {
     if (authenticated) {
       const action = machineAction(item);
       control.textContent = action.label;
-      control.disabled = action.disabled || (playerActive && activeEndpoint !== item.preferredEndpoint);
+      control.disabled = action.disabled;
       if (action.action) control.addEventListener("click", () => Promise.resolve(action.action()).catch(() => {}));
     } else if (authenticating) {
       control.textContent = "Authenticating";
@@ -518,6 +516,10 @@ function renderDiscoveredMachines() {
 
 async function startPlayer(item, password = "", remember = false) {
   clearAppMessage();
+  const generation = playerSession.generation + 1;
+  playerSession = { phase: "launching", endpoint: item.preferredEndpoint, generation };
+  elements.disconnect.hidden = false;
+  renderMachines();
   try {
     await invoke("start", {
       host: item.resolvedEndpoint ?? item.preferredEndpoint,
@@ -526,22 +528,21 @@ async function startPlayer(item, password = "", remember = false) {
       maximumBitrateMbps: Number(elements.bitrate.value),
       latencyDiagnostics: elements.latencyDiagnostics.checked,
     });
-    activeEndpoint = item.preferredEndpoint;
-    playerActive = true;
-    elements.disconnect.hidden = false;
-    item.state = "connecting";
-    item.detail = "Launching player";
-    renderMachines();
   } catch (error) {
+    if (playerSession.generation === generation) {
+      playerSession = { phase: "idle", endpoint: null, generation };
+      elements.disconnect.hidden = true;
+      renderMachines();
+    }
     showAppMessage(error);
     throw error;
   }
 }
 
 async function connectMachine(item, password = "", remember = false, alreadyProbed = false) {
-  let result = { availability: item.state, machine: item };
+  let result = { availability: item.availability, machine: item };
   if (!alreadyProbed) result = await probeMachine(item, password, false);
-  if (result.availability !== "available") throw new Error(result.machine.detail);
+  if (result.availability !== "available") throw new Error(result.machine.availabilityDetail);
   if (["unavailable", "check-failed"].includes(result.machine.vbCableStatus)) {
     const proceed = await showAudioPrerequisite(result.machine.vbCableStatus, true);
     if (!proceed) return;
@@ -613,14 +614,15 @@ function closeDialog(dialog) {
 }
 
 function machineAction(item) {
-  if (item.state === "available") return { label: "Connect", action: () => connectMachine(item) };
-  if (item.state === "authentication") return { label: "Authenticate", action: () => openCredentialDialog(item) };
-  if (item.state === "checking") return { label: "Checking", disabled: true };
-  if (item.state === "connecting" || (playerActive && activeEndpoint === item.preferredEndpoint)) {
-    return { label: "Connected", disabled: true };
-  }
-  if (item.state === "busy") return { label: "Busy", disabled: true };
-  return { label: "Retry", action: () => probeMachine(item) };
+  const state = window.RustConsoleMachineState.action(item, playerSession);
+  const action = state.kind === "connect"
+    ? () => connectMachine(item)
+    : state.kind === "authenticate"
+      ? () => openCredentialDialog(item)
+      : state.kind === "probe"
+        ? () => probeMachine(item)
+        : null;
+  return { ...state, action };
 }
 
 function renderMachines() {
@@ -629,18 +631,15 @@ function renderMachines() {
   for (const item of machines) {
     const card = elements.cardTemplate.content.firstElementChild.cloneNode(true);
     const parts = endpointParts(item.preferredEndpoint);
-    if (playerActive && activeEndpoint === item.preferredEndpoint) {
-      item.state = "connected";
-      item.detail = "Player streaming";
-    }
-    card.dataset.state = item.state;
+    const status = window.RustConsoleMachineState.presentation(item, playerSession);
+    card.dataset.state = status.state;
     card.dataset.audio = item.vbCableStatus;
     card.querySelector("h2").textContent = item.displayName ?? parts.address;
     const os = item.operatingSystem === "windows" ? "Windows" : "Unknown OS";
     card.querySelector(".machine-identity p").textContent = item.displayName
       ? `${os} · ${item.preferredEndpoint}`
       : `Port ${parts.port}`;
-    card.querySelector(".machine-status span").textContent = item.detail;
+    card.querySelector(".machine-status span").textContent = status.detail;
     const audioRequirement = card.querySelector(".audio-requirement");
     const firewallWarning = card.querySelector(".firewall-warning");
     if (item.vbCableStatus === "unavailable") {
@@ -665,7 +664,7 @@ function renderMachines() {
     firewallWarning.hidden = warnings.length === 0;
 
     const remove = card.querySelector(".remove-machine");
-    remove.disabled = playerActive && activeEndpoint === item.preferredEndpoint;
+    remove.disabled = window.RustConsoleMachineState.playerTargets(playerSession, item);
     remove.addEventListener("click", () => {
       machines = machines.filter((candidate) => candidate !== item);
       saveMachines();
@@ -675,7 +674,7 @@ function renderMachines() {
     const control = card.querySelector(".card-action");
     const action = machineAction(item);
     control.textContent = action.label;
-    control.disabled = action.disabled || (playerActive && activeEndpoint !== item.preferredEndpoint);
+    control.disabled = action.disabled;
     if (action.action) {
       control.addEventListener("click", () => Promise.resolve(action.action()).catch(() => {}));
     }
@@ -733,10 +732,10 @@ elements.credentialForm.addEventListener("submit", async (event) => {
       item = await confirmDiscoveredRoutes(target.route, password);
     } else {
       const result = await probeMachine(target.item, password, false);
-      if (result.availability !== "available") throw new Error(result.machine.detail);
+      if (result.availability !== "available") throw new Error(result.machine.availabilityDetail);
       item = result.machine;
     }
-    if (item.state !== "available") throw new Error(item.detail);
+    if (item.availability !== "available") throw new Error(item.availabilityDetail);
     closeDialog(elements.credentialDialog);
     renderMachines();
     renderDiscoveredMachines();
@@ -766,13 +765,23 @@ elements.latencyDiagnostics.addEventListener("change", () => {
 });
 
 elements.disconnect.addEventListener("click", async () => {
-  if (!playerActive) return;
-  await invoke("disconnect");
+  if (!window.RustConsoleMachineState.playerActive(playerSession)) return;
+  const previousPhase = playerSession.phase;
+  playerSession.phase = "stopping";
+  renderMachines();
+  try {
+    await invoke("disconnect");
+  } catch (error) {
+    playerSession.phase = previousPhase;
+    renderMachines();
+    showAppMessage(error);
+  }
 });
 
 await listen("player-authenticated", () => {
-  const item = machines.find((candidate) => candidate.endpoints.includes(activeEndpoint));
-  if (item) item.detail = "Authenticated";
+  if (window.RustConsoleMachineState.playerActive(playerSession)) {
+    playerSession.phase = "authenticated";
+  }
   renderMachines();
 });
 await listen("discovery-progress", ({ payload }) => {
@@ -797,26 +806,22 @@ await listen("discovery-result", ({ payload }) => {
   renderDiscoveredMachines();
 });
 await listen("player-started", () => {
+  if (window.RustConsoleMachineState.playerActive(playerSession)) {
+    playerSession.phase = "streaming";
+  }
   renderMachines();
 });
 await listen("player-ended", ({ payload }) => {
-  const endedEndpoint = activeEndpoint;
-  playerActive = false;
-  activeEndpoint = null;
+  const endedEndpoint = playerSession.endpoint;
+  const endedGeneration = playerSession.generation;
+  playerSession = { phase: "idle", endpoint: null, generation: endedGeneration };
   elements.disconnect.hidden = true;
   const item = machines.find((candidate) => candidate.endpoints.includes(endedEndpoint));
   if (payload) {
-    if (item) {
-      item.state = "unreachable";
-      item.detail = "Stream failed";
-    }
     showAppMessage(payload);
-  } else if (item) {
-    item.state = "available";
-    item.detail = "Available";
   }
   renderMachines();
-  if (!payload && item) void probeUntilSessionReleased(item);
+  if (item) void probeUntilSessionReleased(item, endedGeneration);
 });
 
 updateBitrate(loadBitrate());
