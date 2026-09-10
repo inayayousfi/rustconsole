@@ -715,8 +715,11 @@ static HRESULT capture_frame(
         const auto relative = frame.SystemRelativeTime();
         LARGE_INTEGER frequency{};
         QueryPerformanceFrequency(&frequency);
+        const auto whole_seconds = relative.count() / 10000000;
+        const auto remaining_100ns = relative.count() % 10000000;
         frame_info.LastPresentTime.QuadPart =
-            relative.count() * frequency.QuadPart / 10000000;
+            whole_seconds * frequency.QuadPart +
+            remaining_100ns * frequency.QuadPart / 10000000;
         frame_info.AccumulatedFrames = 1;
     } else {
         ComPtr<IDXGIResource> desktop_resource;
