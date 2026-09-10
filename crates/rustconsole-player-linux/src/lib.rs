@@ -695,6 +695,8 @@ pub fn run_one_frame_proof(
     };
     let offer = Envelope {
         body: Some(envelope::Body::Av1CapabilityOffer(Av1CapabilityOffer {
+            dedicated_input_stream: false,
+            host_pointer_release: false,
             full_diagnostics: false,
             audio_transport: None,
             encoder_capabilities: Vec::new(),
@@ -883,6 +885,8 @@ fn wire_selected(
     selected: rustconsole_protocol::NegotiatedAv1Configuration,
 ) -> SelectedAv1Configuration {
     SelectedAv1Configuration {
+        dedicated_input_stream: false,
+        host_pointer_release: false,
         full_diagnostics: false,
         audio_transport: None,
         width: selected.width,

@@ -173,6 +173,8 @@ fn run_surface_proof(report: &Path) -> Result<(), Box<dyn std::error::Error>> {
     );
     let (loading_gui, _) = gui.frame(PlayerGuiView {
         fullscreen: false,
+        pointer_capture_available: false,
+        pointer_captured: false,
         status: Some("Video negotiated\nWaiting for host packets\nWaiting 0.2 seconds"),
         diagnostics: "",
     });
@@ -185,6 +187,8 @@ fn run_surface_proof(report: &Path) -> Result<(), Box<dyn std::error::Error>> {
     );
     let (frame_gui, _) = gui.frame(PlayerGuiView {
         fullscreen: false,
+        pointer_capture_available: false,
+        pointer_captured: false,
         status: None,
         diagnostics: "SDL3 Vulkan DMA-BUF\nfixture frame",
     });
@@ -261,21 +265,38 @@ impl VideoPlaybackClock {
 
 struct ActiveStreamSession {
     stop: Arc<AtomicBool>,
-    input: mpsc::SyncSender<TimedInputEvent>,
+    reliable_input: mpsc::SyncSender<TimedInputEvent>,
+    pointer_input: mpsc::SyncSender<TimedInputEvent>,
     input_queue_drops: Arc<AtomicU64>,
     diagnostic_probe_sequence: Arc<AtomicU64>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
+struct InputReceivers {
+    reliable: mpsc::Receiver<TimedInputEvent>,
+    pointer: mpsc::Receiver<TimedInputEvent>,
+}
+
+impl InputReceivers {
+    fn try_recv(&self) -> Option<TimedInputEvent> {
+        self.reliable
+            .try_recv()
+            .ok()
+            .or_else(|| self.pointer.try_recv().ok())
+    }
+}
+
 impl ActiveStreamSession {
     fn send_input(&self, event: InputEvent) {
         let occurred_at = Instant::now();
-        let _ = self.input.send(TimedInputEvent { event, occurred_at });
+        let _ = self
+            .reliable_input
+            .send(TimedInputEvent { event, occurred_at });
     }
 
     fn try_send_input(&self, event: InputEvent) {
         if self
-            .input
+            .pointer_input
             .try_send(TimedInputEvent {
                 event,
                 occurred_at: Instant::now(),
@@ -304,7 +325,12 @@ fn start_stream_session(
     let stop = Arc::new(AtomicBool::new(false));
     let diagnostic_probe_sequence = Arc::new(AtomicU64::new(0));
     let input_queue_drops = Arc::new(AtomicU64::new(0));
-    let (input, input_rx) = mpsc::sync_channel(1024);
+    let (reliable_input, reliable_input_rx) = mpsc::sync_channel(1024);
+    let (pointer_input, pointer_input_rx) = mpsc::sync_channel(1024);
+    let input_receivers = InputReceivers {
+        reliable: reliable_input_rx,
+        pointer: pointer_input_rx,
+    };
     let session_stop = Arc::clone(&stop);
     let address = launch.address.to_string();
     let password = (!launch.password.is_empty()).then(|| launch.password.to_vec());
@@ -325,7 +351,7 @@ fn start_stream_session(
             latency_diagnostics,
             stream_diagnostic_probe_sequence,
             || session_stop.load(Ordering::Acquire),
-            move || input_rx.try_recv().ok(),
+            move || input_receivers.try_recv(),
             StreamCallbacks {
                 authenticated: move |host_identity| {
                     let _ = authenticated_tx.send(SessionEvent::Authenticated(host_identity));
@@ -413,7 +439,8 @@ fn start_stream_session(
     });
     ActiveStreamSession {
         stop,
-        input,
+        reliable_input,
+        pointer_input,
         input_queue_drops,
         diagnostic_probe_sequence,
         thread: Some(thread),
@@ -486,6 +513,8 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
     let mut gui = PlayerGui::default();
     let gui_started = Instant::now();
     let mut pointer_routing = PointerRouting::default();
+    let mut pointer_capture_available = false;
+    let mut pointer_captured = false;
     let mut input_focus = RemoteInputFocus::new();
     let mut renderer =
         None::<Box<dyn PlayerVideoBackend<NativeDmaBufFrame, GuiFrame, Error = String>>>;
@@ -523,6 +552,10 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
                     break 'running;
                 }
                 Ok(PlayerCommand::Reconnect) => {
+                    release_pointer_capture(&sdl, &mut window, &mut pointer_captured);
+                    session.send_input(InputEvent::ReleaseAll);
+                    pointer_routing.release_all();
+                    pointer_capture_available = false;
                     session.stop();
                     while session_rx.try_recv().is_ok() {}
                     renderer = None;
@@ -588,6 +621,19 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 SessionEvent::Progress(progress) => {
                     loading_status = match progress {
+                        StreamProgress::PointerCaptureAvailable(available) => {
+                            pointer_capture_available = available;
+                            redraw = true;
+                            continue;
+                        }
+                        StreamProgress::ReleasePointerCapture => {
+                            release_pointer_capture(&sdl, &mut window, &mut pointer_captured);
+                            session.send_input(InputEvent::ReleaseAll);
+                            pointer_routing.release_all();
+                            gui.pointer_gone();
+                            redraw = true;
+                            continue;
+                        }
                         StreamProgress::AudioTransport(snapshot) => {
                             let stopped = snapshot.stopped();
                             let changed = overlay.audio.as_ref().is_none_or(|previous| {
@@ -1289,6 +1335,9 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
                     if should_retry_session_end(ever_streamed, result.is_err()) =>
                 {
                     let error = result.expect_err("retryable session end must contain an error");
+                    release_pointer_capture(&sdl, &mut window, &mut pointer_captured);
+                    pointer_routing.release_all();
+                    pointer_capture_available = false;
                     session.stop();
                     while session_rx.try_recv().is_ok() {}
                     renderer = None;
@@ -1326,11 +1375,17 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
                 SessionEvent::Ended(result) => {
+                    release_pointer_capture(&sdl, &mut window, &mut pointer_captured);
+                    pointer_routing.release_all();
                     stream_result = Some(result);
                     break 'running;
                 }
                 SessionEvent::Reconfigure(cause) => {
                     eprintln!("video reconfiguration requested: {cause:?}");
+                    release_pointer_capture(&sdl, &mut window, &mut pointer_captured);
+                    session.send_input(InputEvent::ReleaseAll);
+                    pointer_routing.release_all();
+                    pointer_capture_available = false;
                     session.stop();
                     while session_rx.try_recv().is_ok() {}
                     renderer = None;
@@ -1398,6 +1453,17 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
                 Event::MouseButtonDown {
                     mouse_btn, x, y, ..
                 } if input_focus.accepts() => {
+                    if pointer_captured {
+                        if let Some(button) = mouse_button(mouse_btn)
+                            && pointer_routing.press(button, false)
+                        {
+                            session.send_input(InputEvent::PointerButton {
+                                button,
+                                pressed: true,
+                            });
+                        }
+                        continue;
+                    }
                     gui.pointer_moved(x, y);
                     if let Some(gui_button) = gui_pointer_button(mouse_btn) {
                         let captured = gui.captures_pointer_at(x, y);
@@ -1422,6 +1488,17 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
                 Event::MouseButtonUp {
                     mouse_btn, x, y, ..
                 } if input_focus.accepts() => {
+                    if pointer_captured {
+                        if let Some(button) = mouse_button(mouse_btn)
+                            && pointer_routing.release(button)
+                        {
+                            session.send_input(InputEvent::PointerButton {
+                                button,
+                                pressed: false,
+                            });
+                        }
+                        continue;
+                    }
                     gui.pointer_moved(x, y);
                     if let Some(gui_button) = gui_pointer_button(mouse_btn) {
                         gui.pointer_button(x, y, gui_button, false);
@@ -1436,7 +1513,17 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
                         });
                     }
                 }
-                Event::MouseMotion { x, y, .. } if input_focus.accepts() => {
+                Event::MouseMotion {
+                    x, y, xrel, yrel, ..
+                } if input_focus.accepts() => {
+                    if pointer_captured {
+                        let delta_x = xrel.clamp(i32::MIN as f32, i32::MAX as f32) as i32;
+                        let delta_y = yrel.clamp(i32::MIN as f32, i32::MAX as f32) as i32;
+                        if delta_x != 0 || delta_y != 0 {
+                            session.try_send_input(InputEvent::PointerMotion { delta_x, delta_y });
+                        }
+                        continue;
+                    }
                     gui.pointer_moved(x, y);
                     redraw = true;
                     let (width, height) = window.size();
@@ -1458,6 +1545,17 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
                     mouse_y,
                     ..
                 } if input_focus.accepts() => {
+                    if pointer_captured {
+                        let horizontal = x.clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+                        let vertical = y.clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+                        if horizontal != 0 || vertical != 0 {
+                            session.send_input(InputEvent::Wheel {
+                                horizontal,
+                                vertical,
+                            });
+                        }
+                        continue;
+                    }
                     gui.mouse_wheel(x, y);
                     redraw = true;
                     if gui.captures_pointer_at(mouse_x, mouse_y) {
@@ -1496,6 +1594,7 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
                     ..
                 } => {
                     input_focus.lose();
+                    release_pointer_capture(&sdl, &mut window, &mut pointer_captured);
                     session.send_input(InputEvent::ReleaseAll);
                     pointer_routing.release_all();
                     gui.set_focused(false);
@@ -1695,6 +1794,8 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
                 let diagnose_submission = last_diagnostic_frame != Some(frame.sequence);
                 let (gui_frame, gui_action) = gui.frame(PlayerGuiView {
                     fullscreen,
+                    pointer_capture_available,
+                    pointer_captured,
                     status: None,
                     diagnostics: &diagnostics,
                 });
@@ -1815,7 +1916,7 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
                     write_event(&mut events, &PlayerEvent::Started)?;
                 }
                 if let Some(action) = gui_action {
-                    apply_gui_action(action, &mut window);
+                    apply_gui_action(action, &sdl, &mut window, &mut pointer_captured);
                     redraw = true;
                 }
             } else {
@@ -1827,6 +1928,8 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 let (gui_frame, gui_action) = gui.frame(PlayerGuiView {
                     fullscreen,
+                    pointer_capture_available,
+                    pointer_captured,
                     status: Some(&loading_overlay),
                     diagnostics: &diagnostics,
                 });
@@ -1838,7 +1941,7 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
                 )?;
                 loading_presented = Instant::now();
                 if let Some(action) = gui_action {
-                    apply_gui_action(action, &mut window);
+                    apply_gui_action(action, &sdl, &mut window, &mut pointer_captured);
                     redraw = true;
                 }
             }
@@ -1967,6 +2070,9 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
         }
         std::thread::sleep(Duration::from_millis(2));
     }
+    release_pointer_capture(&sdl, &mut window, &mut pointer_captured);
+    session.send_input(InputEvent::ReleaseAll);
+    pointer_routing.release_all();
     session.stop();
     drop(renderer);
     drop(last_frame);
@@ -2323,8 +2429,20 @@ fn observe_presented_frame(
     }
 }
 
-fn apply_gui_action(action: PlayerGuiAction, window: &mut Window) {
+fn apply_gui_action(
+    action: PlayerGuiAction,
+    sdl: &sdl3::Sdl,
+    window: &mut Window,
+    pointer_captured: &mut bool,
+) {
     match action {
+        PlayerGuiAction::CapturePointer => {
+            sdl.mouse().set_relative_mouse_mode(window, true);
+            window.set_mouse_grab(true);
+            window.set_keyboard_grab(true);
+            sdl.mouse().show_cursor(false);
+            *pointer_captured = true;
+        }
         PlayerGuiAction::ToggleFullscreen => {
             let fullscreen = window.fullscreen_state() == FullscreenType::Off;
             if let Err(error) = window.set_fullscreen(fullscreen) {
@@ -2332,6 +2450,17 @@ fn apply_gui_action(action: PlayerGuiAction, window: &mut Window) {
             }
         }
     }
+}
+
+fn release_pointer_capture(sdl: &sdl3::Sdl, window: &mut Window, captured: &mut bool) {
+    if !*captured {
+        return;
+    }
+    sdl.mouse().set_relative_mouse_mode(window, false);
+    window.set_mouse_grab(false);
+    window.set_keyboard_grab(false);
+    sdl.mouse().show_cursor(true);
+    *captured = false;
 }
 
 fn gui_pointer_button(button: MouseButton) -> Option<PointerButton> {
@@ -2620,6 +2749,46 @@ mod tests {
         assert!(routing.press(1, false));
         assert!(routing.release(1));
         assert!(!routing.release(1));
+    }
+
+    #[test]
+    fn reliable_input_fifo_has_priority_over_pointer_backlog() {
+        let (reliable_tx, reliable) = mpsc::sync_channel(4);
+        let (pointer_tx, pointer) = mpsc::sync_channel(4);
+        let queues = InputReceivers { reliable, pointer };
+        pointer_tx
+            .send(TimedInputEvent {
+                event: InputEvent::PointerMotion {
+                    delta_x: 1,
+                    delta_y: 0,
+                },
+                occurred_at: Instant::now(),
+            })
+            .unwrap();
+        for pressed in [true, false] {
+            reliable_tx
+                .send(TimedInputEvent {
+                    event: InputEvent::Key {
+                        hid_usage: 4,
+                        pressed,
+                    },
+                    occurred_at: Instant::now(),
+                })
+                .unwrap();
+        }
+
+        assert!(matches!(
+            queues.try_recv().unwrap().event,
+            InputEvent::Key { pressed: true, .. }
+        ));
+        assert!(matches!(
+            queues.try_recv().unwrap().event,
+            InputEvent::Key { pressed: false, .. }
+        ));
+        assert!(matches!(
+            queues.try_recv().unwrap().event,
+            InputEvent::PointerMotion { .. }
+        ));
     }
 
     #[test]

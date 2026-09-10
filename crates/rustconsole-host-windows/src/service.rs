@@ -72,6 +72,10 @@ pub enum ServiceCommand {
         audio_pipe: String,
         connection_token: String,
     },
+    SessionControls {
+        pipe: String,
+        connection_token: String,
+    },
     Uninstall,
     FirewallStatus,
     FirewallEnable(crate::firewall::FirewallScope),
@@ -108,16 +112,18 @@ mod windows {
     };
     use rustconsole_host_core::{
         AdaptiveBitrateController, BITRATE_DECREASE_INTERVAL, BITRATE_INCREASE_INTERVAL,
-        DesktopCapture, VIDEO_BITRATE_BOOTSTRAP, VideoPathReport,
+        DesktopCapture, HostSessionControlAction, HostSessionControlSource,
+        VIDEO_BITRATE_BOOTSTRAP, VideoPathReport,
     };
     use rustconsole_input_windows::{
         HidReport, InputSession, PointerUpdate, ReportSink, VirtualInputOwner,
     };
     use rustconsole_protocol::diagnostics::{MediaKind, PayloadDigest, STREAM_PREAMBLE};
+    use rustconsole_protocol::input::STREAM_PREAMBLE as INPUT_STREAM_PREAMBLE;
     use rustconsole_protocol::wire::{
         self, Av1CapabilityOffer, Av1HardwareCapability, Av1Mode, EncodedVideoPacket, Envelope,
-        KeyboardLeds as WireKeyboardLeds, SelectedAv1Configuration, SessionAvailabilityResult,
-        VideoControlKind, envelope,
+        HostSessionControl, HostSessionControlKind, KeyboardLeds as WireKeyboardLeds,
+        SelectedAv1Configuration, SessionAvailabilityResult, VideoControlKind, envelope,
     };
     use rustconsole_protocol::{
         Av1HardwareCapability as DomainCapability, Av1Mode as DomainMode,
@@ -233,6 +239,10 @@ mod windows {
                 audio_pipe,
                 connection_token,
             } => crate::worker::run_named(&control_pipe, &audio_pipe, &connection_token),
+            ServiceCommand::SessionControls {
+                pipe,
+                connection_token,
+            } => crate::session_controls::run(&pipe, &connection_token),
             ServiceCommand::Uninstall => uninstall(),
             ServiceCommand::FirewallStatus => crate::firewall::print_status(),
             ServiceCommand::FirewallEnable(scope) => crate::firewall::enable(scope),
@@ -604,15 +614,18 @@ mod windows {
             }
             return Ok(());
         }
-        let (audio_configuration, full_diagnostics) = match &request.body {
-            Some(envelope::Body::Av1CapabilityOffer(offer)) => (
-                offer
-                    .audio_transport
-                    .filter(|configuration| configuration.supported()),
-                offer.full_diagnostics,
-            ),
-            _ => (None, false),
-        };
+        let (audio_configuration, dedicated_input_stream, full_diagnostics, host_pointer_release) =
+            match &request.body {
+                Some(envelope::Body::Av1CapabilityOffer(offer)) => (
+                    offer
+                        .audio_transport
+                        .filter(|configuration| configuration.supported()),
+                    offer.dedicated_input_stream,
+                    offer.full_diagnostics,
+                    offer.host_pointer_release,
+                ),
+                _ => (None, false, false, false),
+            };
         let (decoder_capabilities, settings) = parse_viewer_offer(request)?;
         if active_stream
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -649,6 +662,8 @@ mod windows {
             &mut send,
             Envelope {
                 body: Some(envelope::Body::Av1CapabilityOffer(Av1CapabilityOffer {
+                    dedicated_input_stream,
+                    host_pointer_release,
                     full_diagnostics,
                     audio_transport: audio_configuration,
                     encoder_capabilities: vec![wire_capability(encoder_capability)],
@@ -661,6 +676,8 @@ mod windows {
         let mut selected_wire = wire_selected(selected);
         selected_wire.audio_transport = audio_configuration;
         selected_wire.full_diagnostics = full_diagnostics;
+        selected_wire.host_pointer_release = host_pointer_release;
+        selected_wire.dedicated_input_stream = dedicated_input_stream;
         match read_envelope(&mut receive).await?.body {
             Some(envelope::Body::SelectedAv1Configuration(peer)) if peer == selected_wire => {}
             _ => return Err("viewer selected a different AV1 configuration".into()),
@@ -672,6 +689,34 @@ mod windows {
             },
         )
         .await?;
+
+        let mut input_receive = if dedicated_input_stream {
+            let mut input = tokio::time::timeout(Duration::from_secs(10), connection.accept_uni())
+                .await
+                .map_err(|_| "timed out waiting for dedicated input stream")??;
+            let mut preamble = [0; INPUT_STREAM_PREAMBLE.len()];
+            input.read_exact(&mut preamble).await?;
+            if preamble != INPUT_STREAM_PREAMBLE {
+                return Err("invalid dedicated input stream preamble".into());
+            }
+            Some(input)
+        } else {
+            None
+        };
+
+        let mut session_controls = if host_pointer_release {
+            let controls_executable = executable.as_ref().to_owned();
+            Some(
+                tokio::task::spawn_blocking(move || {
+                    crate::session_controls::WindowsSessionControls::launch(&controls_executable)
+                        .map_err(|error| error.to_string())
+                })
+                .await
+                .map_err(|_| "session controls launch task panicked")??,
+            )
+        } else {
+            None
+        };
 
         let diagnostic_tx = if full_diagnostics {
             let (diagnostic_tx, mut diagnostic_rx) =
@@ -759,7 +804,13 @@ mod windows {
         input_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         'control: loop {
             let mut next_control = Box::pin(read_envelope(&mut receive));
-            let envelope = loop {
+            let mut next_input = Box::pin(async {
+                match input_receive.as_mut() {
+                    Some(receive) => read_envelope(receive).await,
+                    None => std::future::pending().await,
+                }
+            });
+            let (envelope, from_input_stream) = loop {
                 tokio::select! {
                     state = audio_state_rx.changed(), if audio_state_open => {
                         if state.is_err() { audio_state_open = false; continue; }
@@ -790,6 +841,25 @@ mod windows {
                     }
                     _ = connection.closed() => break 'control,
                     _ = input_tick.tick() => {
+                        if let Some(controls) = session_controls.as_mut() {
+                            match controls.try_next_action() {
+                                Ok(Some(HostSessionControlAction::ReleasePointerCapture)) => {
+                                    if let Err(error) = write_envelope(&mut send, Envelope {
+                                        body: Some(envelope::Body::HostSessionControl(HostSessionControl {
+                                            kind: HostSessionControlKind::ReleasePointerCapture as i32,
+                                        })),
+                                    }).await {
+                                        control_error = Some(error.to_string());
+                                        break 'control;
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(error) => {
+                                    control_error = Some(error);
+                                    break 'control;
+                                }
+                            }
+                        }
                         let leds = match input_owner.lock() {
                             Ok(mut owner) => {
                                 let generation = owner.generation();
@@ -899,11 +969,22 @@ mod windows {
                         continue;
                     }
                     envelope = &mut next_control => match envelope {
-                        Ok(envelope) => break envelope,
+                        Ok(envelope) => break (envelope, false),
+                        Err(error) => { control_error = Some(error.to_string()); break 'control; }
+                    },
+                    envelope = &mut next_input => match envelope {
+                        Ok(envelope) => break (envelope, true),
                         Err(error) => { control_error = Some(error.to_string()); break 'control; }
                     },
                 }
             };
+            if from_input_stream
+                != matches!(&envelope.body, Some(envelope::Body::InputTransition(_)))
+                && dedicated_input_stream
+            {
+                control_error = Some("message arrived on the wrong session stream".to_owned());
+                break 'control;
+            }
             let command = match envelope.body {
                 Some(envelope::Body::InputTransition(transition)) => {
                     let host_received_at_micros = input_clock
@@ -1835,6 +1916,8 @@ mod windows {
             &mut stream,
             Envelope {
                 body: Some(envelope::Body::Av1CapabilityOffer(Av1CapabilityOffer {
+                    dedicated_input_stream: false,
+                    host_pointer_release: false,
                     full_diagnostics: false,
                     audio_transport: None,
                     encoder_capabilities: vec![wire_capability(encoder_capability)],
@@ -1984,6 +2067,8 @@ mod windows {
         selected: rustconsole_protocol::NegotiatedAv1Configuration,
     ) -> SelectedAv1Configuration {
         SelectedAv1Configuration {
+            dedicated_input_stream: false,
+            host_pointer_release: false,
             full_diagnostics: false,
             audio_transport: None,
             width: selected.width,

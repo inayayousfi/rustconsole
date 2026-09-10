@@ -282,6 +282,8 @@ fn vb_cable_availability(status: i32) -> Result<VbCableAvailability, &'static st
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StreamProgress {
     AudioTransport(AudioTransportSnapshot),
+    PointerCaptureAvailable(bool),
+    ReleasePointerCapture,
     KeyboardLeds {
         generation: u64,
         sequence: u64,
@@ -586,6 +588,8 @@ where
             &mut send,
             Envelope {
                 body: Some(envelope::Body::Av1CapabilityOffer(Av1CapabilityOffer {
+                    dedicated_input_stream: true,
+                    host_pointer_release: true,
                     full_diagnostics,
                     audio_transport: Some(rustconsole_protocol::wire::AudioConfiguration::INITIAL),
                     encoder_capabilities: Vec::new(),
@@ -600,6 +604,8 @@ where
         )
         .await?;
         let audio_transport;
+        let dedicated_input_stream;
+        let host_pointer_release;
         let host_capabilities = match rustconsole_session::quic::read_envelope(&mut receive)
             .await?
             .body
@@ -607,6 +613,8 @@ where
             Some(envelope::Body::Av1CapabilityOffer(offer))
                 if offer.decoder_capabilities.is_empty() && offer.viewer_settings.is_none() =>
             {
+                host_pointer_release = offer.host_pointer_release;
+                dedicated_input_stream = offer.dedicated_input_stream;
                 audio_transport = offer
                     .audio_transport
                     .filter(|configuration| configuration.supported());
@@ -623,6 +631,8 @@ where
         let mut selected_wire = wire_selected(selected);
         selected_wire.audio_transport = audio_transport;
         selected_wire.full_diagnostics = full_diagnostics;
+        selected_wire.host_pointer_release = host_pointer_release;
+        selected_wire.dedicated_input_stream = dedicated_input_stream;
         rustconsole_session::quic::write_envelope(
             &mut send,
             Envelope {
@@ -637,8 +647,20 @@ where
             Some(envelope::Body::SelectedAv1Configuration(peer)) if peer == selected_wire => {}
             _ => return Err("host selected a different AV1 configuration".into()),
         }
+        on_progress(StreamProgress::PointerCaptureAvailable(
+            host_pointer_release,
+        ));
         on_progress(StreamProgress::VideoNegotiated(selected));
         on_progress(StreamProgress::WaitingForVideoPackets);
+        let input_stream = if dedicated_input_stream {
+            let mut input = connection.open_uni().await?;
+            input
+                .write_all(&rustconsole_protocol::input::STREAM_PREAMBLE)
+                .await?;
+            Some(input)
+        } else {
+            None
+        };
         let diagnostic_stream = if full_diagnostics {
             Some(
                 tokio::time::timeout(Duration::from_secs(10), connection.accept_uni())
@@ -652,8 +674,10 @@ where
         let end = stream_receiver::receive_stream(stream_receiver::ReceiveStreamParameters {
             connection,
             control: (send, receive),
+            input_stream,
             fps: selected.frames_per_second,
             audio_enabled: audio_transport.is_some(),
+            host_pointer_release,
             diagnostic_stream,
             should_stop,
             next_input,
@@ -757,6 +781,8 @@ fn wire_selected(
         maximum_frames_per_second: selected.frames_per_second,
     });
     SelectedAv1Configuration {
+        dedicated_input_stream: false,
+        host_pointer_release: false,
         full_diagnostics: false,
         audio_transport: None,
         width: selected.width,

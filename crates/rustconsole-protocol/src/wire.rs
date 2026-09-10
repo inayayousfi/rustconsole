@@ -16,7 +16,7 @@ pub const RELIABLE_FRAME_PREFIX_SIZE: usize = size_of::<u32>();
 pub struct Envelope {
     #[prost(
         oneof = "envelope::Body",
-        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20"
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21"
     )]
     pub body: Option<envelope::Body>,
 }
@@ -46,6 +46,8 @@ pub mod envelope {
         ClockPing(super::ClockPing),
         #[prost(message, tag = "20")]
         ClockPong(super::ClockPong),
+        #[prost(message, tag = "21")]
+        HostSessionControl(super::HostSessionControl),
         #[prost(message, tag = "1")]
         VersionOffer(VersionOffer),
         #[prost(message, tag = "2")]
@@ -408,6 +410,10 @@ pub struct Av1CapabilityOffer {
     pub audio_transport: Option<AudioConfiguration>,
     #[prost(bool, tag = "5")]
     pub full_diagnostics: bool,
+    #[prost(bool, tag = "6")]
+    pub host_pointer_release: bool,
+    #[prost(bool, tag = "7")]
+    pub dedicated_input_stream: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Message)]
@@ -543,6 +549,23 @@ pub struct SelectedAv1Configuration {
     pub audio_transport: Option<AudioConfiguration>,
     #[prost(bool, tag = "8")]
     pub full_diagnostics: bool,
+    #[prost(bool, tag = "9")]
+    pub host_pointer_release: bool,
+    #[prost(bool, tag = "10")]
+    pub dedicated_input_stream: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Message)]
+pub struct HostSessionControl {
+    #[prost(enumeration = "HostSessionControlKind", tag = "1")]
+    pub kind: i32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, prost::Enumeration)]
+#[repr(i32)]
+pub enum HostSessionControlKind {
+    Unspecified = 0,
+    ReleasePointerCapture = 1,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, prost::Enumeration)]
@@ -775,6 +798,8 @@ mod tests {
             maximum_bitrate_bits_per_second: 100_000_000,
         };
         let selected = SelectedAv1Configuration {
+            dedicated_input_stream: false,
+            host_pointer_release: false,
             full_diagnostics: false,
             audio_transport: None,
             width: 2_560,
@@ -991,6 +1016,8 @@ mod tests {
 #[test]
 fn audio_offer_has_a_fixed_fixture_and_is_optional_to_older_peers() {
     let offer = Av1CapabilityOffer {
+        dedicated_input_stream: false,
+        host_pointer_release: false,
         full_diagnostics: false,
         encoder_capabilities: Vec::new(),
         decoder_capabilities: Vec::new(),
@@ -1034,6 +1061,69 @@ fn audio_offer_has_a_fixed_fixture_and_is_optional_to_older_peers() {
         }
         .supported()
     );
+}
+
+#[test]
+fn host_pointer_release_is_negotiated_as_an_optional_field() {
+    let offer = Av1CapabilityOffer {
+        dedicated_input_stream: false,
+        host_pointer_release: true,
+        full_diagnostics: false,
+        encoder_capabilities: Vec::new(),
+        decoder_capabilities: Vec::new(),
+        viewer_settings: None,
+        audio_transport: None,
+    };
+    assert!(
+        Av1CapabilityOffer::decode(offer.encode_to_vec().as_slice())
+            .unwrap()
+            .host_pointer_release
+    );
+
+    #[derive(Clone, PartialEq, Message)]
+    struct OldOffer {
+        #[prost(message, repeated, tag = "1")]
+        encoder: Vec<Av1HardwareCapability>,
+    }
+    let old = OldOffer::decode(offer.encode_to_vec().as_slice()).unwrap();
+    let decoded = Av1CapabilityOffer::decode(old.encode_to_vec().as_slice()).unwrap();
+    assert!(!decoded.host_pointer_release);
+
+    let envelope = Envelope {
+        body: Some(envelope::Body::HostSessionControl(HostSessionControl {
+            kind: HostSessionControlKind::ReleasePointerCapture as i32,
+        })),
+    };
+    let frame = encode_reliable_frame(&envelope).unwrap();
+    assert_eq!(frame, [0, 0, 0, 5, 0xaa, 0x01, 0x02, 0x08, 0x01]);
+    assert_eq!(decode_reliable_frame(&frame).unwrap(), envelope);
+}
+
+#[test]
+fn dedicated_input_stream_is_negotiated_as_an_optional_field() {
+    let offer = Av1CapabilityOffer {
+        dedicated_input_stream: true,
+        host_pointer_release: false,
+        full_diagnostics: false,
+        encoder_capabilities: Vec::new(),
+        decoder_capabilities: Vec::new(),
+        viewer_settings: None,
+        audio_transport: None,
+    };
+    assert!(
+        Av1CapabilityOffer::decode(offer.encode_to_vec().as_slice())
+            .unwrap()
+            .dedicated_input_stream
+    );
+
+    #[derive(Clone, PartialEq, Message)]
+    struct OldOffer {
+        #[prost(message, repeated, tag = "1")]
+        encoder: Vec<Av1HardwareCapability>,
+    }
+    let old = OldOffer::decode(offer.encode_to_vec().as_slice()).unwrap();
+    let decoded = Av1CapabilityOffer::decode(old.encode_to_vec().as_slice()).unwrap();
+    assert!(!decoded.dedicated_input_stream);
 }
 
 #[test]

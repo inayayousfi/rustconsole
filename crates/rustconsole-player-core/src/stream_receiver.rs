@@ -6,10 +6,10 @@ use rustconsole_protocol::InputEvent;
 use rustconsole_protocol::audio::AudioPacket;
 use rustconsole_protocol::diagnostics::{MediaKind, PayloadDigest, RECORD_SIZE, STREAM_PREAMBLE};
 use rustconsole_protocol::wire::{
-    AudioStatus, AudioStreamState, ClockPing, ClockPong, Envelope, InputTransition, KeyTransition,
-    KeyboardLeds, PointerButtonTransition, PointerMode, PointerModeTransition, ReleaseAll,
-    VideoControl, VideoControlKind, VideoReceiverReport, VideoReconfigurationCause,
-    WheelTransition, envelope, input_transition,
+    AudioStatus, AudioStreamState, ClockPing, ClockPong, Envelope, HostSessionControlKind,
+    InputTransition, KeyTransition, KeyboardLeds, PointerButtonTransition, PointerMode,
+    PointerModeTransition, ReleaseAll, VideoControl, VideoControlKind, VideoReceiverReport,
+    VideoReconfigurationCause, WheelTransition, envelope, input_transition,
 };
 use rustconsole_session::audio_datagram::{
     AUDIO_QUEUE_PACKETS, AUDIO_WAIT, AudioAssembler, AudioReceiveStatistics,
@@ -29,6 +29,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 enum DiagnosticEvent {
+    ReleasePointerCapture,
     Clock(crate::ClockOffsetEstimate),
     InputAck {
         sequence: u64,
@@ -597,8 +598,10 @@ impl Drop for ReaderGuard {
 pub(super) struct ReceiveStreamParameters<Stop, Input, Progress, Audio, Video> {
     pub(super) connection: quinn::Connection,
     pub(super) control: (quinn::SendStream, quinn::RecvStream),
+    pub(super) input_stream: Option<quinn::SendStream>,
     pub(super) fps: u16,
     pub(super) audio_enabled: bool,
+    pub(super) host_pointer_release: bool,
     pub(super) diagnostic_stream: Option<quinn::RecvStream>,
     pub(super) should_stop: Stop,
     pub(super) next_input: Input,
@@ -622,8 +625,10 @@ where
     let ReceiveStreamParameters {
         connection,
         control,
+        input_stream,
         fps,
         audio_enabled,
+        host_pointer_release,
         diagnostic_stream,
         should_stop,
         mut next_input,
@@ -635,6 +640,7 @@ where
         video: mut consume_video,
     } = consumers;
     let (mut send, mut receive) = control;
+    let mut input_send = input_stream;
     let frames = Arc::new(MediaQueue::new(2));
     let audio_events = Arc::new(MediaQueue::new(AUDIO_QUEUE_PACKETS + 1));
     let diagnostic_events = Arc::new(MediaQueue::new(1024));
@@ -778,6 +784,17 @@ where
                                     let cause = state.reconfiguration_cause().ok_or("invalid video stream state")?;
                                     break 'stream StreamEnd::ReconfigurationRequired(cause);
                                 }
+                                Some(envelope::Body::HostSessionControl(control)) => {
+                                    if !host_pointer_release {
+                                        return Err("host sent an unnegotiated session control".to_owned());
+                                    }
+                                    match HostSessionControlKind::try_from(control.kind) {
+                                        Ok(HostSessionControlKind::ReleasePointerCapture) => {
+                                            reader_diagnostics.push(DiagnosticEvent::ReleasePointerCapture);
+                                        }
+                                        _ => return Err("host sent an invalid session control".to_owned()),
+                                    }
+                                }
                                 _ => return Err("unexpected streaming control response".to_owned()),
                             }
                             break;
@@ -800,7 +817,7 @@ where
                                         if pointer_mode != Some(PointerMode::Relative) {
                                             input_sequence = input_sequence.checked_add(1).ok_or("input sequence exhausted")?;
                                             let player_sent_at_micros = reader_full_diagnostics.then(|| elapsed_micros(reader_started)).unwrap_or(0);
-                                            write_envelope(&mut send, Envelope { body: Some(envelope::Body::InputTransition(InputTransition { generation: input_generation, sequence: input_sequence, action: Some(input_transition::Action::PointerMode(PointerModeTransition { mode: PointerMode::Relative as i32 })), player_sent_at_micros })) }).await.map_err(|e| e.to_string())?;
+                                            write_envelope(input_send.as_mut().unwrap_or(&mut send), Envelope { body: Some(envelope::Body::InputTransition(InputTransition { generation: input_generation, sequence: input_sequence, action: Some(input_transition::Action::PointerMode(PointerModeTransition { mode: PointerMode::Relative as i32 })), player_sent_at_micros })) }).await.map_err(|e| e.to_string())?;
                                             pointer_mode = Some(PointerMode::Relative);
                                         }
                                         cumulative_x = cumulative_x.checked_add(i64::from(delta_x)).ok_or("relative pointer x counter overflow")?;
@@ -813,7 +830,7 @@ where
                                         if pointer_mode != Some(PointerMode::Absolute) {
                                             input_sequence = input_sequence.checked_add(1).ok_or("input sequence exhausted")?;
                                             let player_sent_at_micros = reader_full_diagnostics.then(|| elapsed_micros(reader_started)).unwrap_or(0);
-                                            write_envelope(&mut send, Envelope { body: Some(envelope::Body::InputTransition(InputTransition { generation: input_generation, sequence: input_sequence, action: Some(input_transition::Action::PointerMode(PointerModeTransition { mode: PointerMode::Absolute as i32 })), player_sent_at_micros })) }).await.map_err(|e| e.to_string())?;
+                                            write_envelope(input_send.as_mut().unwrap_or(&mut send), Envelope { body: Some(envelope::Body::InputTransition(InputTransition { generation: input_generation, sequence: input_sequence, action: Some(input_transition::Action::PointerMode(PointerModeTransition { mode: PointerMode::Absolute as i32 })), player_sent_at_micros })) }).await.map_err(|e| e.to_string())?;
                                             pointer_mode = Some(PointerMode::Absolute);
                                         }
                                         pointer_sequence = pointer_sequence.checked_add(1).ok_or("pointer sequence exhausted")?;
@@ -832,7 +849,7 @@ where
                                         };
                                         let sent_at = reader_full_diagnostics.then(Instant::now);
                                         let player_sent_at_micros = reader_full_diagnostics.then(|| elapsed_micros(reader_started)).unwrap_or(0);
-                                        write_envelope(&mut send, Envelope { body: Some(envelope::Body::InputTransition(InputTransition { generation: input_generation, sequence: input_sequence, action: Some(action), player_sent_at_micros })) }).await.map_err(|e| e.to_string())?;
+                                        write_envelope(input_send.as_mut().unwrap_or(&mut send), Envelope { body: Some(envelope::Body::InputTransition(InputTransition { generation: input_generation, sequence: input_sequence, action: Some(action), player_sent_at_micros })) }).await.map_err(|e| e.to_string())?;
                                         if let Some(sent_at) = sent_at {
                                             reader_diagnostics.push(DiagnosticEvent::InputSent { sequence: input_sequence, occurred_at, sent_at, send_completed_at: Instant::now(), correlates_test_marker });
                                         }
@@ -873,7 +890,7 @@ where
                 }
             };
             input_sequence = input_sequence.checked_add(1).ok_or("input sequence exhausted")?;
-            write_envelope(&mut send, Envelope { body: Some(envelope::Body::InputTransition(InputTransition { generation: input_generation, sequence: input_sequence, action: Some(input_transition::Action::ReleaseAll(ReleaseAll {})), player_sent_at_micros: 0 })) }).await.map_err(|e| e.to_string())?;
+            write_envelope(input_send.as_mut().unwrap_or(&mut send), Envelope { body: Some(envelope::Body::InputTransition(InputTransition { generation: input_generation, sequence: input_sequence, action: Some(input_transition::Action::ReleaseAll(ReleaseAll {})), player_sent_at_micros: 0 })) }).await.map_err(|e| e.to_string())?;
             write_envelope(&mut send, Envelope { body: Some(envelope::Body::VideoControl(VideoControl { kind: VideoControlKind::Stop as i32 })) }).await.map_err(|e| e.to_string())?;
             send.finish().map_err(|e| e.to_string())?;
             Ok(end)
@@ -902,6 +919,9 @@ where
         }
         while let Some(event) = diagnostic_events.pop_timeout(Duration::ZERO) {
             match event {
+                DiagnosticEvent::ReleasePointerCapture => {
+                    progress(StreamProgress::ReleasePointerCapture)
+                }
                 DiagnosticEvent::Clock(estimate) => progress(StreamProgress::ClockOffset(estimate)),
                 DiagnosticEvent::InputAck {
                     sequence,
@@ -1357,9 +1377,29 @@ mod tests {
             },);
         let (mut client_send, client_receive) = client_connection.open_bi().await.unwrap();
         client_send.write_all(&[0]).await.unwrap();
+        let mut client_input = client_connection.open_uni().await.unwrap();
+        client_input
+            .write_all(&rustconsole_protocol::input::STREAM_PREAMBLE)
+            .await
+            .unwrap();
         let (mut server_send, mut server_receive) = server_connection.accept_bi().await.unwrap();
         server_receive.read_exact(&mut [0]).await.unwrap();
         let sender = tokio::spawn(async move {
+            let mut server_input = server_connection.accept_uni().await.unwrap();
+            let mut input_preamble = [0; rustconsole_protocol::input::STREAM_PREAMBLE.len()];
+            server_input.read_exact(&mut input_preamble).await.unwrap();
+            assert_eq!(input_preamble, rustconsole_protocol::input::STREAM_PREAMBLE);
+            let input = read_envelope(&mut server_input).await.unwrap();
+            assert!(matches!(
+                input.body,
+                Some(envelope::Body::InputTransition(InputTransition {
+                    action: Some(input_transition::Action::Key(KeyTransition {
+                        hid_usage: 4,
+                        pressed: false,
+                    })),
+                    ..
+                }))
+            ));
             let state =
                 AudioStreamState::new(1, AudioStatus::Failed, 0, "audio-only test failure".into());
             let bytes = rustconsole_protocol::wire::encode_reliable_frame(&Envelope {
@@ -1388,6 +1428,18 @@ mod tests {
                 .unwrap();
             tokio::time::sleep(Duration::from_millis(20)).await;
             server_send.write_all(&bytes[2..]).await.unwrap();
+            write_envelope(
+                &mut server_send,
+                Envelope {
+                    body: Some(envelope::Body::HostSessionControl(
+                        rustconsole_protocol::wire::HostSessionControl {
+                            kind: HostSessionControlKind::ReleasePointerCapture as i32,
+                        },
+                    )),
+                },
+            )
+            .await
+            .unwrap();
             for sequence in 0..2 {
                 for data in rustconsole_session::video_datagram::packetize_video_frame(
                     &video(sequence),
@@ -1421,18 +1473,28 @@ mod tests {
         let mut count = 0;
         let mut audio_count = 0;
         let mut latest = None;
+        let mut release_pointer_capture = false;
+        let mut input = Some(TimedInputEvent {
+            event: InputEvent::Key {
+                hid_usage: 4,
+                pressed: false,
+            },
+            occurred_at: Instant::now(),
+        });
         let end = receive_stream(ReceiveStreamParameters {
             connection: client_connection,
             control: (client_send, client_receive),
+            input_stream: Some(client_input),
             fps: 120,
             audio_enabled: true,
+            host_pointer_release: true,
             diagnostic_stream: None,
             should_stop: || started.elapsed() >= Duration::from_millis(550),
-            next_input: || None,
-            progress: |event| {
-                if let StreamProgress::AudioTransport(state) = event {
-                    latest = Some(state);
-                }
+            next_input: move || input.take(),
+            progress: |event| match event {
+                StreamProgress::AudioTransport(state) => latest = Some(state),
+                StreamProgress::ReleasePointerCapture => release_pointer_capture = true,
+                _ => {}
             },
             consumers: StreamConsumers {
                 audio: |_| {
@@ -1454,6 +1516,7 @@ mod tests {
         assert_eq!(latest.receive.completed_packets, 1);
         assert_eq!(latest.receive.malformed_fragments, 1);
         assert_eq!(latest.host.status, AudioStatus::Failed as i32);
+        assert!(release_pointer_capture);
         assert_eq!(
             end,
             StreamEnd::ReconfigurationRequired(VideoReconfigurationCause::Color)

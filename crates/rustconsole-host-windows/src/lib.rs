@@ -26,6 +26,8 @@ mod gpu_encode;
 #[cfg(windows)]
 mod interactive_worker;
 pub mod service;
+#[cfg(windows)]
+mod session_controls;
 #[cfg(any(windows, test))]
 mod transition_proof;
 #[cfg(windows)]

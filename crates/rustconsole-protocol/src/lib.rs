@@ -7,6 +7,7 @@ use std::num::NonZeroU16;
 pub mod audio;
 pub mod av1;
 pub mod diagnostics;
+pub mod input;
 pub mod wire;
 
 pub use av1::{
@@ -26,7 +27,7 @@ pub enum InputEvent {
 }
 
 /// The protocol version implemented by this build.
-pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 2);
+pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 4);
 
 /// A protocol version whose major number marks breaking changes.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]

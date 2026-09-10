@@ -44,6 +44,11 @@ enum HostCommand {
         audio_pipe: String,
         connection_token: String,
     },
+    #[command(hide = true)]
+    SessionControls {
+        pipe: String,
+        connection_token: String,
+    },
     Uninstall,
     Firewall {
         #[command(subcommand)]
@@ -110,6 +115,13 @@ fn service_command(command: Option<HostCommand>) -> ServiceCommand {
             audio_pipe,
             connection_token,
         },
+        Some(HostCommand::SessionControls {
+            pipe,
+            connection_token,
+        }) => ServiceCommand::SessionControls {
+            pipe,
+            connection_token,
+        },
         Some(HostCommand::Uninstall) => ServiceCommand::Uninstall,
         Some(HostCommand::Firewall {
             command: FirewallCommand::Status,
@@ -173,6 +185,19 @@ mod tests {
             ServiceCommand::MediaWorkerNamed {
                 control_pipe: r"\\.\pipe\control".to_owned(),
                 audio_pipe: r"\\.\pipe\audio".to_owned(),
+                connection_token: "00112233445566778899aabbccddeeff".to_owned(),
+            }
+        );
+        assert_eq!(
+            parse(&[
+                "host",
+                "session-controls",
+                r"\\.\pipe\session",
+                "00112233445566778899aabbccddeeff",
+            ])
+            .unwrap(),
+            ServiceCommand::SessionControls {
+                pipe: r"\\.\pipe\session".to_owned(),
                 connection_token: "00112233445566778899aabbccddeeff".to_owned(),
             }
         );

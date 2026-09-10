@@ -52,6 +52,9 @@ pub struct InteractiveHelperConnection {
     pub connection_token: [u8; 16],
 }
 
+// Windows kernel handles are process-wide, and this wrapper has sole ownership.
+unsafe impl Send for InteractiveHelperConnection {}
+
 pub fn launch_helper(
     executable: &Path,
     session_id: u32,
@@ -93,6 +96,69 @@ pub fn launch_helper(
         let _ = unsafe { windows::Win32::System::Threading::TerminateProcess(process, 1) };
         let _ = unsafe { CloseHandle(process) };
         return Err("WGC helper is not running in the active console session".into());
+    }
+    task.delete()?;
+    Ok(InteractiveHelperConnection {
+        channel,
+        process,
+        process_id,
+        connection_token,
+    })
+}
+
+pub fn launch_session_controls(
+    executable: &Path,
+    session_id: u32,
+    user_token: HANDLE,
+) -> Result<InteractiveHelperConnection, Box<dyn std::error::Error>> {
+    let mut connection_token = [0; 16];
+    OsRng.fill_bytes(&mut connection_token);
+    let token_hex = hex(&connection_token);
+    let suffix = &token_hex[..16];
+    let pipe_name = format!(r"\\.\pipe\RC.{suffix}.s");
+    let expected_sid = token_sid(user_token)?;
+    let security = PipeSecurity::new(&expected_sid)?;
+    let pipe = NamedPipeServer::new(&pipe_name, security.attributes())?;
+    let account = session_account(session_id)?;
+    let task_name = format!("RustConsoleSessionControls-{suffix}");
+    let action = format!(
+        "\"{}\" session-controls \"{pipe_name}\" {token_hex}",
+        executable.display()
+    );
+    let mut task = create_and_run_task(&task_name, &account, &action)?;
+    let channel = pipe.connect()?;
+    let mut process_id = 0;
+    // SAFETY: channel is a connected local named-pipe server endpoint.
+    unsafe { GetNamedPipeClientProcessId(HANDLE(channel.as_raw_handle()), &mut process_id)? };
+    if process_id == 0 {
+        return Err("session controls returned an invalid process id".into());
+    }
+    // SAFETY: process_id came from the connected local named pipe.
+    let process = unsafe {
+        OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE | PROCESS_TERMINATE,
+            false,
+            process_id,
+        )?
+    };
+    let mut actual_session_id = u32::MAX;
+    // SAFETY: output storage is valid.
+    unsafe { ProcessIdToSessionId(process_id, &mut actual_session_id)? };
+    if actual_session_id != session_id {
+        // SAFETY: process was opened with terminate rights.
+        let _ = unsafe { windows::Win32::System::Threading::TerminateProcess(process, 1) };
+        let _ = unsafe { CloseHandle(process) };
+        return Err("session controls are not running in the active console session".into());
+    }
+    let mut process_token = HANDLE::default();
+    // SAFETY: process and output storage are valid.
+    unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut process_token)? };
+    let actual_sid = token_sid(process_token);
+    let _ = unsafe { CloseHandle(process_token) };
+    if actual_sid? != expected_sid {
+        let _ = unsafe { windows::Win32::System::Threading::TerminateProcess(process, 1) };
+        let _ = unsafe { CloseHandle(process) };
+        return Err("session controls SID does not match the active console user".into());
     }
     task.delete()?;
     Ok(InteractiveHelperConnection {
@@ -190,7 +256,7 @@ pub fn connect(
     Ok((control, events, audio))
 }
 
-fn connect_pipe(name: &str) -> Result<File, Box<dyn std::error::Error>> {
+pub(crate) fn connect_pipe(name: &str) -> Result<File, Box<dyn std::error::Error>> {
     let name = wide(name);
     let started = Instant::now();
     loop {

@@ -46,6 +46,15 @@ pub const BITRATE_DECREASE_INTERVAL: Duration = Duration::from_millis(250);
 pub const BITRATE_INCREASE_INTERVAL: Duration = Duration::from_secs(1);
 const CAPACITY_TARGET_PERCENT: u128 = 98;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HostSessionControlAction {
+    ReleasePointerCapture,
+}
+
+pub trait HostSessionControlSource {
+    fn try_next_action(&mut self) -> Result<Option<HostSessionControlAction>, String>;
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct VideoPathReport {
     pub round_trip_time: Duration,
