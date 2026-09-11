@@ -27,7 +27,7 @@ pub enum InputEvent {
 }
 
 /// The protocol version implemented by this build.
-pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 4);
+pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(2, 0);
 
 /// A protocol version whose major number marks breaking changes.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]

@@ -85,6 +85,15 @@
             </div>
             <div class="setting-item">
               <div>
+                <label for="frame-rate">Frame rate</label>
+                <output id="frame-rate-value" for="frame-rate">120 FPS</output>
+              </div>
+              <div class="setting-control">
+                <input id="frame-rate" name="frame-rate" type="number" value="120" min="1" max="65535" step="1" inputmode="numeric" />
+              </div>
+            </div>
+            <div class="setting-item">
+              <div>
                 <label for="latency-diagnostics">Full diagnostics</label>
               </div>
               <label class="toggle-control" for="latency-diagnostics">

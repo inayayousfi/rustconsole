@@ -169,6 +169,8 @@ html, body { min-width: 320px; min-height: 100%; margin: 0; background: #101114;
 .setting-item > div:first-child { display: flex; align-items: center; justify-content: space-between; gap: 20px; }
 .setting-item label, .setting-label { font-size: 13px; font-weight: 600; }
 .setting-item output { color: #b7bac1; font: 11px "IBM Plex Mono", monospace; white-space: nowrap; }
+#frame-rate { width: 100%; border: 1px solid #3a3d45; border-radius: 7px; outline: none; background: #111216; color: #f2f2f4; padding: 10px 11px; font: 12px "IBM Plex Mono", monospace; }
+#frame-rate:focus { border-color: #d72c4d; }
 #maximum-bitrate {
   appearance: none;
   width: 100%;

@@ -265,46 +265,30 @@ impl VideoPlaybackClock {
 
 struct ActiveStreamSession {
     stop: Arc<AtomicBool>,
-    reliable_input: mpsc::SyncSender<TimedInputEvent>,
-    pointer_input: mpsc::SyncSender<TimedInputEvent>,
+    input: mpsc::SyncSender<TimedInputEvent>,
     input_queue_drops: Arc<AtomicU64>,
     diagnostic_probe_sequence: Arc<AtomicU64>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
 struct InputReceivers {
-    reliable: mpsc::Receiver<TimedInputEvent>,
-    pointer: mpsc::Receiver<TimedInputEvent>,
+    input: mpsc::Receiver<TimedInputEvent>,
 }
 
 impl InputReceivers {
     fn try_recv(&self) -> Option<TimedInputEvent> {
-        self.reliable
-            .try_recv()
-            .ok()
-            .or_else(|| self.pointer.try_recv().ok())
+        self.input.try_recv().ok()
     }
 }
 
 impl ActiveStreamSession {
     fn send_input(&self, event: InputEvent) {
         let occurred_at = Instant::now();
-        let _ = self
-            .reliable_input
-            .send(TimedInputEvent { event, occurred_at });
+        let _ = self.input.send(TimedInputEvent { event, occurred_at });
     }
 
     fn try_send_input(&self, event: InputEvent) {
-        if self
-            .pointer_input
-            .try_send(TimedInputEvent {
-                event,
-                occurred_at: Instant::now(),
-            })
-            .is_err()
-        {
-            self.input_queue_drops.fetch_add(1, Ordering::Relaxed);
-        }
+        self.send_input(event);
     }
 
     fn stop(&mut self) {
@@ -325,17 +309,14 @@ fn start_stream_session(
     let stop = Arc::new(AtomicBool::new(false));
     let diagnostic_probe_sequence = Arc::new(AtomicU64::new(0));
     let input_queue_drops = Arc::new(AtomicU64::new(0));
-    let (reliable_input, reliable_input_rx) = mpsc::sync_channel(1024);
-    let (pointer_input, pointer_input_rx) = mpsc::sync_channel(1024);
-    let input_receivers = InputReceivers {
-        reliable: reliable_input_rx,
-        pointer: pointer_input_rx,
-    };
+    let (input, input_rx) = mpsc::sync_channel(1024);
+    let input_receivers = InputReceivers { input: input_rx };
     let session_stop = Arc::clone(&stop);
     let address = launch.address.to_string();
     let password = (!launch.password.is_empty()).then(|| launch.password.to_vec());
     let remember_password = launch.remember_password;
     let maximum_bitrate_bits_per_second = launch.maximum_bitrate_bits_per_second;
+    let frames_per_second = launch.frames_per_second;
     let latency_diagnostics = launch.latency_diagnostics;
     let stream_diagnostic_probe_sequence = Arc::clone(&diagnostic_probe_sequence);
     let thread = std::thread::spawn(move || {
@@ -348,6 +329,7 @@ fn start_stream_session(
             password,
             remember_password,
             maximum_bitrate_bits_per_second,
+            frames_per_second,
             latency_diagnostics,
             stream_diagnostic_probe_sequence,
             || session_stop.load(Ordering::Acquire),
@@ -439,8 +421,7 @@ fn start_stream_session(
     });
     ActiveStreamSession {
         stop,
-        reliable_input,
-        pointer_input,
+        input,
         input_queue_drops,
         diagnostic_probe_sequence,
         thread: Some(thread),
@@ -616,6 +597,13 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
                     redraw = true;
                 }
                 SessionEvent::Statistics(statistics) => {
+                    latency_diagnostics.observe(
+                        "image_transport_round_trip",
+                        u64::try_from(statistics.round_trip_time.as_micros()).unwrap_or(u64::MAX),
+                        None,
+                        None,
+                        "QUIC image transport round trip sampled",
+                    );
                     overlay.observe(statistics);
                     redraw = true;
                 }
@@ -736,6 +724,9 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
                             if let Some(round_trip_micros) =
                                 player_received_at_micros.checked_sub(player_sent_at_micros)
                             {
+                                overlay.input_round_trip =
+                                    Some(Duration::from_micros(round_trip_micros));
+                                redraw = true;
                                 latency_diagnostics.observe_classified(
                                     "input_ack_round_trip",
                                     round_trip_micros,
@@ -2559,6 +2550,7 @@ struct StreamOverlay {
     estimated_capacity_megabits_per_second: f64,
     completed_frames: u64,
     incomplete_frames: u64,
+    input_round_trip: Option<Duration>,
     interval_started: Instant,
     interval_frames: u64,
     interval_bytes: u64,
@@ -2575,6 +2567,7 @@ impl StreamOverlay {
             estimated_capacity_megabits_per_second: 1.0,
             completed_frames: 0,
             incomplete_frames: 0,
+            input_round_trip: None,
             interval_started: Instant::now(),
             interval_frames: 0,
             interval_bytes: 0,
@@ -2610,13 +2603,16 @@ impl StreamOverlay {
 
     fn text(&self, state: &str) -> String {
         let video = format!(
-            "{RENDERING_BACKEND_LABEL}\n{state}\nFPS {:5.1}\nActual bitrate {:5.2} Mbit/s\nEstimated capacity {:5.2} Mbit/s\nTarget bitrate {:5.2} Mbit/s\nMaximum bitrate {:.0} Mbit/s\nRTT {:5.1} ms\nComplete {}  Incomplete {}\nLost {}  Late {}  Overflow {}",
+            "{RENDERING_BACKEND_LABEL}\n{state}\nFPS {:5.1}\nActual bitrate {:5.2} Mbit/s\nEstimated capacity {:5.2} Mbit/s\nTarget bitrate {:5.2} Mbit/s\nMaximum bitrate {:.0} Mbit/s\nImage ping {:5.1} ms\nInput ping {}\nComplete {}  Incomplete {}\nLost {}  Late {}  Overflow {}",
             self.statistics.frames_per_second,
             self.statistics.encoded_megabits_per_second,
             self.estimated_capacity_megabits_per_second,
             self.target_megabits_per_second,
             self.maximum_megabits_per_second,
             self.statistics.round_trip_time.as_secs_f64() * 1_000.0,
+            self.input_round_trip
+                .map(|duration| format!("{:5.1} ms", duration.as_secs_f64() * 1_000.0))
+                .unwrap_or_else(|| "waiting".to_owned()),
             self.completed_frames,
             self.incomplete_frames,
             self.statistics.lost_chunks,
@@ -2752,11 +2748,10 @@ mod tests {
     }
 
     #[test]
-    fn reliable_input_fifo_has_priority_over_pointer_backlog() {
-        let (reliable_tx, reliable) = mpsc::sync_channel(4);
-        let (pointer_tx, pointer) = mpsc::sync_channel(4);
-        let queues = InputReceivers { reliable, pointer };
-        pointer_tx
+    fn input_fifo_preserves_cross_device_order() {
+        let (input_tx, input) = mpsc::sync_channel(4);
+        let queues = InputReceivers { input };
+        input_tx
             .send(TimedInputEvent {
                 event: InputEvent::PointerMotion {
                     delta_x: 1,
@@ -2766,7 +2761,7 @@ mod tests {
             })
             .unwrap();
         for pressed in [true, false] {
-            reliable_tx
+            input_tx
                 .send(TimedInputEvent {
                     event: InputEvent::Key {
                         hid_usage: 4,
@@ -2779,15 +2774,15 @@ mod tests {
 
         assert!(matches!(
             queues.try_recv().unwrap().event,
+            InputEvent::PointerMotion { .. }
+        ));
+        assert!(matches!(
+            queues.try_recv().unwrap().event,
             InputEvent::Key { pressed: true, .. }
         ));
         assert!(matches!(
             queues.try_recv().unwrap().event,
             InputEvent::Key { pressed: false, .. }
-        ));
-        assert!(matches!(
-            queues.try_recv().unwrap().event,
-            InputEvent::PointerMotion { .. }
         ));
     }
 
@@ -2851,12 +2846,14 @@ mod tests {
             completed_frames: 8,
             incomplete_frames: 1,
         });
+        overlay.input_round_trip = Some(Duration::from_millis(11));
         let text = overlay.text("Streaming");
         assert!(text.starts_with("Rendering backend: Vulkan\nStreaming\n"));
         assert!(text.contains(
             "Actual bitrate  0.00 Mbit/s\nEstimated capacity  8.00 Mbit/s\nTarget bitrate  5.00 Mbit/s\nMaximum bitrate 100 Mbit/s"
         ));
-        assert!(text.contains("RTT   7.0 ms"));
+        assert!(text.contains("Image ping   7.0 ms"));
+        assert!(text.contains("Input ping  11.0 ms"));
         assert!(text.contains("Complete 8  Incomplete 1"));
         assert!(text.contains("Lost 2  Late 3  Overflow 4"));
     }

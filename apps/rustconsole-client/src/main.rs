@@ -328,9 +328,13 @@ fn start(
     password: String,
     remember: bool,
     maximum_bitrate_mbps: u64,
+    frames_per_second: u16,
     latency_diagnostics: bool,
 ) -> Result<(), String> {
     let maximum_bitrate_bits_per_second = maximum_bitrate(maximum_bitrate_mbps)?;
+    if frames_per_second == 0 {
+        return Err("Frame rate must be a positive integer.".into());
+    }
     let address = resolve_host_addresses(host.trim())?
         .into_iter()
         .next()
@@ -345,6 +349,7 @@ fn start(
         password: Zeroizing::new(password.to_vec()),
         remember_password: remember,
         maximum_bitrate_bits_per_second,
+        frames_per_second,
         latency_diagnostics,
     };
     let player = Arc::new(

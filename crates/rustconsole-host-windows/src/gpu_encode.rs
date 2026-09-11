@@ -116,7 +116,10 @@ impl std::error::Error for VideoReconfigurationRequired {}
 pub struct GpuAv1SnapshotEncoder {
     bridge: GpuBridge,
     device: ID3D11Device,
+    context: ID3D11DeviceContext,
     encoder: Av1NvencEncoder,
+    cached_texture: Option<ID3D11Texture2D>,
+    cached_metadata: Option<CachedFrameMetadata>,
     width: u32,
     height: u32,
     frames_per_second: u16,
@@ -161,6 +164,13 @@ struct FrameMetadata {
     cross_adapter_copy_micros: u64,
     color_conversion_micros: u64,
     encoder_call_micros: u64,
+}
+
+#[derive(Clone, Copy)]
+struct CachedFrameMetadata {
+    last_present_time: i64,
+    accumulated_frames: u32,
+    protected_content_masked: bool,
 }
 
 struct QualitySource {
@@ -241,10 +251,14 @@ impl GpuAv1SnapshotEncoder {
             },
         )
         .map_err(|error| format!("NVENC AV1 encoder initialization failed: {error}"))?;
+        let context = unsafe { device.GetImmediateContext()? };
         Ok(Self {
             bridge,
             device,
+            context,
             encoder,
+            cached_texture: None,
+            cached_metadata: None,
             width,
             height,
             frames_per_second,
@@ -274,20 +288,69 @@ impl GpuAv1SnapshotEncoder {
         timeout: Duration,
     ) -> Result<Option<EncodedSnapshot>, Box<dyn std::error::Error>> {
         let diagnostics = self.quality.is_some();
-        let capture = self.bridge.capture(timeout, diagnostics);
-        if matches!(&capture, Err(error) if error.code == DXGI_ERROR_WAIT_TIMEOUT.0) {
-            return Ok(None);
-        }
-        if matches!(&capture, Err(error) if error.code == DXGI_ERROR_ACCESS_LOST.0) {
-            drop(capture);
+        let captured = match self.bridge.capture(timeout, diagnostics) {
+            Ok(lease) if lease.last_present_time != 0 => {
+                if self.cached_texture.is_none() {
+                    let mut description = D3D11_TEXTURE2D_DESC::default();
+                    unsafe { lease.texture.GetDesc(&mut description) };
+                    description.MiscFlags = 0;
+                    let mut texture = None;
+                    unsafe {
+                        self.device
+                            .CreateTexture2D(&description, None, Some(&mut texture))?
+                    };
+                    self.cached_texture =
+                        Some(texture.ok_or("D3D11 frame cache created no texture")?);
+                }
+                let metadata = CachedFrameMetadata {
+                    last_present_time: lease.last_present_time,
+                    accumulated_frames: lease.accumulated_frames,
+                    protected_content_masked: lease.protected_content_masked,
+                };
+                unsafe {
+                    self.context
+                        .CopyResource(self.cached_texture.as_ref().unwrap(), &lease.texture)
+                };
+                let timings = (
+                    lease.capture_acquisition_micros,
+                    lease.cross_adapter_copy_micros,
+                    lease.color_conversion_micros,
+                );
+                drop(lease);
+                self.cached_metadata = Some(metadata);
+                Some((metadata, timings.0, timings.1, timings.2))
+            }
+            Ok(lease) => {
+                drop(lease);
+                let Some(metadata) = self.cached_metadata else {
+                    return Ok(None);
+                };
+                Some((metadata, 0, 0, 0))
+            }
+            Err(error) if error.code == DXGI_ERROR_ACCESS_LOST.0 => None,
+            Err(error) if error.code == DXGI_ERROR_WAIT_TIMEOUT.0 => {
+                let Some(metadata) = self.cached_metadata else {
+                    return Ok(None);
+                };
+                Some((metadata, 0, 0, 0))
+            }
+            Err(error) => return Err(format!("GPU bridge capture failed: {error}").into()),
+        };
+        let Some((
+            metadata,
+            capture_acquisition_micros,
+            cross_adapter_copy_micros,
+            color_conversion_micros,
+        )) = captured
+        else {
             return Err(Box::new(VideoReconfigurationRequired {
                 cause: self.bridge.reconfiguration_cause(),
             }));
-        }
-        let lease = capture.map_err(|error| format!("GPU bridge capture failed: {error}"))?;
-        if lease.last_present_time == 0 {
-            return Ok(None);
-        }
+        };
+        let texture = self
+            .cached_texture
+            .as_ref()
+            .ok_or("video frame cache is unavailable")?;
 
         let presentation_timestamp = self.next_presentation_timestamp;
         self.next_presentation_timestamp = self
@@ -297,33 +360,31 @@ impl GpuAv1SnapshotEncoder {
         let quality_source = match self.quality.as_mut() {
             Some(quality) if Instant::now() >= quality.next_sample => {
                 quality.next_sample = Instant::now() + Duration::from_millis(200);
-                Some(read_texture_luma(&self.device, &lease.texture)?)
+                Some(read_texture_luma(&self.device, texture)?)
             }
             _ => None,
         };
         self.pending_metadata.push_back(FrameMetadata {
             presentation_timestamp,
-            last_present_time: lease.last_present_time,
-            accumulated_frames: lease.accumulated_frames,
-            protected_content_masked: lease.protected_content_masked,
+            last_present_time: metadata.last_present_time,
+            accumulated_frames: metadata.accumulated_frames,
+            protected_content_masked: metadata.protected_content_masked,
             quality_source,
-            capture_acquisition_micros: lease.capture_acquisition_micros,
-            cross_adapter_copy_micros: lease.cross_adapter_copy_micros,
-            color_conversion_micros: lease.color_conversion_micros,
+            capture_acquisition_micros,
+            cross_adapter_copy_micros,
+            color_conversion_micros,
             encoder_call_micros: 0,
         });
         let encoder_started = diagnostics.then(Instant::now);
         let packet = self
             .encoder
-            .encode_d3d11_texture(&lease.texture, presentation_timestamp)
+            .encode_d3d11_texture(texture, presentation_timestamp)
             .map_err(|error| format!("NVENC AV1 frame submission failed: {error}"))?;
         if let Some(started) = encoder_started
             && let Some(metadata) = self.pending_metadata.back_mut()
         {
             metadata.encoder_call_micros = started.elapsed().as_micros() as u64;
         }
-        drop(lease);
-
         let Some(packet) = packet else {
             if self.pending_metadata.len() > 2 {
                 self.rebuild_encoder(self.bitrate_bits_per_second)?;

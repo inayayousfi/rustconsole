@@ -127,9 +127,7 @@ mod windows {
         DesktopCapture, HostSessionControlAction, HostSessionControlSource,
         VIDEO_BITRATE_BOOTSTRAP, VideoPathReport,
     };
-    use rustconsole_input_windows::{
-        HidReport, InputSession, PointerUpdate, ReportSink, VirtualInputOwner,
-    };
+    use rustconsole_input_windows::{HidReport, InputSession, ReportSink, VirtualInputOwner};
     use rustconsole_protocol::diagnostics::{MediaKind, PayloadDigest, STREAM_PREAMBLE};
     use rustconsole_protocol::input::STREAM_PREAMBLE as INPUT_STREAM_PREAMBLE;
     use rustconsole_protocol::wire::{
@@ -142,7 +140,6 @@ mod windows {
         Av1ViewerSettings as DomainSettings, ChromaSubsampling, VideoBitDepth,
         negotiate_av1_configuration,
     };
-    use rustconsole_session::input_datagram::{PointerSnapshot, PointerSnapshotReceiver};
     use sha2::{Digest, Sha256};
     use std::fs;
     use std::io::{Read, Write};
@@ -843,10 +840,9 @@ mod windows {
         let input_clock = full_diagnostics
             .then(crate::clock::HostClock::new)
             .transpose()?;
-        let mut pointer_receiver = PointerSnapshotReceiver::default();
-        let mut pointer_datagrams_received = 0_u64;
-        let mut pointer_updates_applied = 0_u64;
-        let mut pointer_updates_ignored = 0_u64;
+        let pointer_datagrams_received = 0_u64;
+        let pointer_updates_applied = 0_u64;
+        let pointer_updates_ignored = 0_u64;
         let mut mouse_reports_published = 0_u64;
         let mut keyboard_reports_published = 0_u64;
         let mut reliable_transitions_received = 0_u64;
@@ -855,11 +851,11 @@ mod windows {
         let mut reliable_transitions_missing = 0_u64;
         let mut reliable_transitions_duplicate_or_late = 0_u64;
         let mut release_all_transitions = 0_u64;
-        let mut pointer_missing_datagrams = 0_u64;
-        let mut pointer_stale_generations = 0_u64;
-        let mut pointer_duplicate_or_late = 0_u64;
-        let mut pointer_mode_rejections = 0_u64;
-        let mut pointer_relative_baselines = 0_u64;
+        let pointer_missing_datagrams = 0_u64;
+        let pointer_stale_generations = 0_u64;
+        let pointer_duplicate_or_late = 0_u64;
+        let pointer_mode_rejections = 0_u64;
+        let pointer_relative_baselines = 0_u64;
         let mut input_tick = tokio::time::interval(Duration::from_millis(5));
         input_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         'control: loop {
@@ -945,94 +941,6 @@ mod windows {
                             }
                         }
                     }
-                    datagram = connection.read_datagram() => {
-                        let bytes = match datagram {
-                            Ok(bytes) => bytes,
-                            Err(error) => { control_error = Some(error.to_string()); break 'control; }
-                        };
-                        if full_diagnostics {
-                            pointer_datagrams_received = pointer_datagrams_received.saturating_add(1);
-                        }
-                        let snapshot = match PointerSnapshot::decode(&bytes) {
-                            Ok(snapshot) => snapshot,
-                            Err(error) => { control_error = Some(error.to_string()); break 'control; }
-                        };
-                        let expected_mode = if snapshot.is_absolute() {
-                            wire::PointerMode::Absolute
-                        } else {
-                            wire::PointerMode::Relative
-                        };
-                        if snapshot.generation() != input_session.generation()
-                            || input_session.pointer_mode() != Some(expected_mode)
-                        {
-                            if full_diagnostics {
-                                pointer_updates_ignored = pointer_updates_ignored.saturating_add(1);
-                                pointer_mode_rejections = pointer_mode_rejections.saturating_add(1);
-                            }
-                            continue;
-                        }
-                        if full_diagnostics {
-                            if pointer_receiver
-                                .generation()
-                                .is_some_and(|generation| snapshot.generation() < generation)
-                            {
-                                pointer_stale_generations =
-                                    pointer_stale_generations.saturating_add(1);
-                            } else if pointer_receiver.generation() == Some(snapshot.generation()) {
-                                if snapshot.sequence() <= pointer_receiver.sequence() {
-                                    pointer_duplicate_or_late =
-                                        pointer_duplicate_or_late.saturating_add(1);
-                                } else {
-                                    pointer_missing_datagrams = pointer_missing_datagrams
-                                        .saturating_add(
-                                            snapshot
-                                                .sequence()
-                                                .saturating_sub(pointer_receiver.sequence())
-                                                .saturating_sub(1),
-                                        );
-                                }
-                            } else if !snapshot.is_absolute() {
-                                pointer_relative_baselines =
-                                    pointer_relative_baselines.saturating_add(1);
-                            }
-                        }
-                        let update = match pointer_receiver.push(snapshot) {
-                            Ok(Some(update)) => update,
-                            Ok(None) => {
-                                if full_diagnostics {
-                                    pointer_updates_ignored = pointer_updates_ignored.saturating_add(1);
-                                }
-                                continue;
-                            }
-                            Err(error) => { control_error = Some(error.to_string()); break 'control; }
-                        };
-                        let update = match update {
-                            rustconsole_session::input_datagram::PointerUpdate::Absolute { x, y } => PointerUpdate::Absolute { x, y },
-                            rustconsole_session::input_datagram::PointerUpdate::Relative { delta_x, delta_y } => PointerUpdate::Relative { delta_x, delta_y },
-                        };
-                        let result = match input_owner.lock() {
-                            Ok(mut owner) if full_diagnostics => {
-                                let mut sink = DiagnosticReportSink::new(owner.sink_mut());
-                                let result = input_session
-                                    .pointer(update, &mut sink)
-                                    .map_err(|error| format!("pointer input failed: {error:?}"));
-                                mouse_reports_published = mouse_reports_published
-                                    .saturating_add(sink.mouse_reports);
-                                keyboard_reports_published = keyboard_reports_published
-                                    .saturating_add(sink.keyboard_reports);
-                                result
-                            }
-                            Ok(mut owner) => input_session
-                                .pointer(update, owner.sink_mut())
-                                .map_err(|error| format!("pointer input failed: {error:?}")),
-                            Err(_) => Err("virtual input owner lock poisoned".to_owned()),
-                        };
-                        if let Err(error) = result { control_error = Some(error); break 'control; }
-                        if full_diagnostics {
-                            pointer_updates_applied = pointer_updates_applied.saturating_add(1);
-                        }
-                        continue;
-                    }
                     envelope = &mut next_control => match envelope {
                         Ok(envelope) => break (envelope, false),
                         Err(error) => { control_error = Some(error.to_string()); break 'control; }
@@ -1043,70 +951,88 @@ mod windows {
                     },
                 }
             };
-            if from_input_stream
-                != matches!(&envelope.body, Some(envelope::Body::InputTransition(_)))
+            if from_input_stream != matches!(&envelope.body, Some(envelope::Body::InputPack(_)))
                 && dedicated_input_stream
             {
                 control_error = Some("message arrived on the wrong session stream".to_owned());
                 break 'control;
             }
             let command = match envelope.body {
-                Some(envelope::Body::InputTransition(transition)) => {
+                Some(envelope::Body::InputPack(pack)) => {
+                    if pack.transitions.is_empty()
+                        || pack.transitions.len() > rustconsole_protocol::input::MAX_EVENTS_PER_PACK
+                    {
+                        control_error = Some("input pack has an invalid event count".to_owned());
+                        break;
+                    }
                     let host_received_at_micros = input_clock
                         .as_ref()
                         .map(crate::clock::HostClock::now)
                         .transpose()?
                         .unwrap_or(0);
-                    if full_diagnostics {
-                        reliable_transitions_received =
-                            reliable_transitions_received.saturating_add(1);
-                        let expected = input_session.reliable_sequence().saturating_add(1);
-                        if transition.generation == input_session.generation() {
-                            if transition.sequence > expected {
-                                reliable_transitions_missing = reliable_transitions_missing
-                                    .saturating_add(transition.sequence - expected);
-                            } else if transition.sequence < expected {
-                                reliable_transitions_duplicate_or_late =
-                                    reliable_transitions_duplicate_or_late.saturating_add(1);
-                            }
-                        }
-                        if matches!(
-                            transition.action,
-                            Some(wire::input_transition::Action::ReleaseAll(_))
-                        ) {
-                            release_all_transitions = release_all_transitions.saturating_add(1);
-                        }
-                    }
-                    let mut ack = match input_owner.lock() {
-                        Ok(mut owner) if full_diagnostics => {
-                            let mut sink = DiagnosticReportSink::new(owner.sink_mut());
-                            let result = input_session.reliable(transition, &mut sink);
-                            mouse_reports_published =
-                                mouse_reports_published.saturating_add(sink.mouse_reports);
-                            keyboard_reports_published =
-                                keyboard_reports_published.saturating_add(sink.keyboard_reports);
-                            match result {
-                                Ok(ack) => ack,
-                                Err(error) => {
-                                    control_error =
-                                        Some(format!("input transition failed: {error:?}"));
-                                    break;
+                    let mut last_ack = None;
+                    for transition in pack.transitions {
+                        if full_diagnostics {
+                            reliable_transitions_received =
+                                reliable_transitions_received.saturating_add(1);
+                            let expected = input_session.reliable_sequence().saturating_add(1);
+                            if transition.generation == input_session.generation() {
+                                if transition.sequence > expected {
+                                    reliable_transitions_missing = reliable_transitions_missing
+                                        .saturating_add(transition.sequence - expected);
+                                } else if transition.sequence < expected {
+                                    reliable_transitions_duplicate_or_late =
+                                        reliable_transitions_duplicate_or_late.saturating_add(1);
                                 }
                             }
-                        }
-                        Ok(mut owner) => match input_session.reliable(transition, owner.sink_mut())
-                        {
-                            Ok(ack) => ack,
-                            Err(error) => {
-                                control_error = Some(format!("input transition failed: {error:?}"));
-                                break;
+                            if matches!(
+                                transition.action,
+                                Some(wire::input_transition::Action::ReleaseAll(_))
+                            ) {
+                                release_all_transitions = release_all_transitions.saturating_add(1);
                             }
-                        },
-                        Err(_) => {
-                            control_error = Some("virtual input owner lock poisoned".to_owned());
-                            break;
                         }
-                    };
+                        let ack = match input_owner.lock() {
+                            Ok(mut owner) if full_diagnostics => {
+                                let mut sink = DiagnosticReportSink::new(owner.sink_mut());
+                                let result = input_session.reliable(transition, &mut sink);
+                                mouse_reports_published =
+                                    mouse_reports_published.saturating_add(sink.mouse_reports);
+                                keyboard_reports_published = keyboard_reports_published
+                                    .saturating_add(sink.keyboard_reports);
+                                match result {
+                                    Ok(ack) => ack,
+                                    Err(error) => {
+                                        control_error =
+                                            Some(format!("input transition failed: {error:?}"));
+                                        break 'control;
+                                    }
+                                }
+                            }
+                            Ok(mut owner) => {
+                                match input_session.reliable(transition, owner.sink_mut()) {
+                                    Ok(ack) => ack,
+                                    Err(error) => {
+                                        control_error =
+                                            Some(format!("input transition failed: {error:?}"));
+                                        break 'control;
+                                    }
+                                }
+                            }
+                            Err(_) => {
+                                control_error =
+                                    Some("virtual input owner lock poisoned".to_owned());
+                                break 'control;
+                            }
+                        };
+                        if full_diagnostics {
+                            reliable_transitions_applied =
+                                reliable_transitions_applied.saturating_add(1);
+                        }
+                        last_ack = Some(ack);
+                    }
+                    let mut ack =
+                        last_ack.expect("nonempty input pack produced an acknowledgement");
                     ack.host_received_at_micros = host_received_at_micros;
                     ack.host_submitted_at_micros = input_clock
                         .as_ref()
@@ -1114,8 +1040,6 @@ mod windows {
                         .transpose()?
                         .unwrap_or(0);
                     if full_diagnostics {
-                        reliable_transitions_applied =
-                            reliable_transitions_applied.saturating_add(1);
                         ack.pointer_datagrams_received = pointer_datagrams_received;
                         ack.pointer_updates_applied = pointer_updates_applied;
                         ack.pointer_updates_ignored = pointer_updates_ignored;

@@ -3,9 +3,11 @@ const { listen } = window.__TAURI__.event;
 
 const machineStorageKey = "rustconsole-recent-hosts";
 const bitrateStorageKey = "rustconsole-maximum-bitrate";
+const frameRateStorageKey = "rustconsole-frame-rate";
 const latencyDiagnosticsStorageKey = "rustconsole-latency-diagnostics";
 const defaultPort = 47999;
 const defaultBitrate = 20;
+const defaultFrameRate = 120;
 const discoveryAuthQueue = new window.RustConsoleDiscoveryAuth.UniqueAsyncQueue();
 
 const elements = {
@@ -40,6 +42,8 @@ const elements = {
   credentialSubmit: document.querySelector("#credential-submit"),
   bitrate: document.querySelector("#maximum-bitrate"),
   bitrateValue: document.querySelector("#maximum-bitrate-value"),
+  frameRate: document.querySelector("#frame-rate"),
+  frameRateValue: document.querySelector("#frame-rate-value"),
   latencyDiagnostics: document.querySelector("#latency-diagnostics"),
   disconnect: document.querySelector("#disconnect-button"),
   appMessage: document.querySelector("#app-message"),
@@ -174,6 +178,16 @@ function loadBitrate() {
 function updateBitrate(value) {
   elements.bitrate.value = String(value);
   elements.bitrateValue.value = `${value} Mbit/s`;
+}
+
+function loadFrameRate() {
+  const value = Number(localStorage.getItem(frameRateStorageKey));
+  return Number.isInteger(value) && value >= 1 && value <= 65535 ? value : defaultFrameRate;
+}
+
+function updateFrameRate(value) {
+  elements.frameRate.value = String(value);
+  elements.frameRateValue.value = `${value} FPS`;
 }
 
 function showAppMessage(message) {
@@ -526,6 +540,7 @@ async function startPlayer(item, password = "", remember = false) {
       password,
       remember,
       maximumBitrateMbps: Number(elements.bitrate.value),
+      framesPerSecond: Number(elements.frameRate.value),
       latencyDiagnostics: elements.latencyDiagnostics.checked,
     });
   } catch (error) {
@@ -760,6 +775,13 @@ elements.bitrate.addEventListener("input", () => {
   updateBitrate(value);
 });
 
+elements.frameRate.addEventListener("input", () => {
+  const value = Number(elements.frameRate.value);
+  if (!Number.isInteger(value) || value < 1 || value > 65535) return;
+  localStorage.setItem(frameRateStorageKey, String(value));
+  updateFrameRate(value);
+});
+
 elements.latencyDiagnostics.addEventListener("change", () => {
   localStorage.setItem(latencyDiagnosticsStorageKey, String(elements.latencyDiagnostics.checked));
 });
@@ -825,6 +847,7 @@ await listen("player-ended", ({ payload }) => {
 });
 
 updateBitrate(loadBitrate());
+updateFrameRate(loadFrameRate());
 elements.latencyDiagnostics.checked = localStorage.getItem(latencyDiagnosticsStorageKey) === "true";
 renderMachines();
 setPage(location.hash === "#settings" ? "settings" : "machines");

@@ -48,7 +48,6 @@ use zeroize::Zeroizing;
 
 const WIDTH: u32 = 2560;
 const HEIGHT: u32 = 1440;
-const FRAMES_PER_SECOND: u16 = 120;
 const DEFAULT_MAXIMUM_BITRATE: u64 = 20_000_000;
 const VAAPI_DEVICE: &str = "/dev/dri/renderD128";
 const MAX_DIAGNOSTIC_MARKER_PROBES_PER_INPUT: u8 = 8;
@@ -393,6 +392,7 @@ pub fn stream_quic_video(
     password: Option<Vec<u8>>,
     remember_password: bool,
     maximum_bitrate_bits_per_second: u64,
+    frames_per_second: u16,
     latency_diagnostics: bool,
     diagnostic_probe_sequence: Arc<AtomicU64>,
     should_stop: impl Fn() -> bool,
@@ -420,7 +420,7 @@ pub fn stream_quic_video(
         },
         maximum_width: WIDTH,
         maximum_height: HEIGHT,
-        maximum_frames_per_second: FRAMES_PER_SECOND,
+        maximum_frames_per_second: frames_per_second,
     };
     let capability_10 = DomainCapability {
         mode: DomainMode {
@@ -429,12 +429,12 @@ pub fn stream_quic_video(
         },
         maximum_width: WIDTH,
         maximum_height: HEIGHT,
-        maximum_frames_per_second: FRAMES_PER_SECOND,
+        maximum_frames_per_second: frames_per_second,
     };
     let settings = DomainSettings {
         width: WIDTH,
         height: HEIGHT,
-        frames_per_second: FRAMES_PER_SECOND,
+        frames_per_second,
         mode_preferences: vec![capability_10.mode, capability_8.mode],
         maximum_bitrate_bits_per_second,
     };
@@ -670,6 +670,7 @@ pub fn run_one_frame_proof(
     address: &str,
     report_path: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    const PROOF_FRAMES_PER_SECOND: u16 = 120;
     let validation_device = HardwareDevice::open(HardwareDeviceType::VaApi, Some(VAAPI_DEVICE))?;
     let mut validation_decoder = Av1VaApiDecoder::open(&validation_device)?;
     let validation_frame = validation_decoder.decode_one_packet(CAPABILITY_FIXTURE)?;
@@ -684,12 +685,12 @@ pub fn run_one_frame_proof(
         },
         maximum_width: WIDTH,
         maximum_height: HEIGHT,
-        maximum_frames_per_second: FRAMES_PER_SECOND,
+        maximum_frames_per_second: PROOF_FRAMES_PER_SECOND,
     };
     let settings = DomainSettings {
         width: WIDTH,
         height: HEIGHT,
-        frames_per_second: FRAMES_PER_SECOND,
+        frames_per_second: PROOF_FRAMES_PER_SECOND,
         mode_preferences: vec![local_capability.mode],
         maximum_bitrate_bits_per_second: DEFAULT_MAXIMUM_BITRATE,
     };

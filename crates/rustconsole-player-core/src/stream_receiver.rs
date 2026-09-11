@@ -7,14 +7,13 @@ use rustconsole_protocol::audio::AudioPacket;
 use rustconsole_protocol::diagnostics::{MediaKind, PayloadDigest, RECORD_SIZE, STREAM_PREAMBLE};
 use rustconsole_protocol::wire::{
     AudioStatus, AudioStreamState, ClockPing, ClockPong, Envelope, HostSessionControlKind,
-    InputTransition, KeyTransition, KeyboardLeds, PointerButtonTransition, PointerMode,
-    PointerModeTransition, ReleaseAll, VideoControl, VideoControlKind, VideoReceiverReport,
-    VideoReconfigurationCause, WheelTransition, envelope, input_transition,
+    InputPack, InputTransition, KeyTransition, KeyboardLeds, PointerButtonTransition,
+    PointerMotionTransition, PointerPositionTransition, ReleaseAll, VideoControl, VideoControlKind,
+    VideoReceiverReport, VideoReconfigurationCause, WheelTransition, envelope, input_transition,
 };
 use rustconsole_session::audio_datagram::{
     AUDIO_QUEUE_PACKETS, AUDIO_WAIT, AudioAssembler, AudioReceiveStatistics,
 };
-use rustconsole_session::input_datagram::PointerSnapshot;
 use rustconsole_session::media_queue::MediaQueue;
 use rustconsole_session::quic::{read_envelope, write_envelope};
 use rustconsole_session::video_datagram::{
@@ -734,16 +733,13 @@ where
         });
     let task = tokio::spawn(async move {
         let result = async {
-            let mut ticks = tokio::time::interval(Duration::from_millis(5));
+            let frame_period = Duration::from_nanos(1_000_000_000 / u64::from(fps));
+            let mut ticks = tokio::time::interval(frame_period);
             ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut last_report = Instant::now();
             let mut last_keyframe = Instant::now() - Duration::from_secs(1);
             let input_generation = 1;
             let mut input_sequence = 0u64;
-            let mut pointer_sequence = 0u64;
-            let mut cumulative_x = 0i64;
-            let mut cumulative_y = 0i64;
-            let mut pointer_mode = None;
             let mut clock_sequence = 0_u64;
             let mut next_clock_sync = Instant::now();
             let mut keyboard_leds = KeyboardLedReceiver::default();
@@ -756,7 +752,6 @@ where
                             match message.map_err(|e| e.to_string())?.body {
                                 Some(envelope::Body::AudioStreamState(state)) => receiver.state(state),
                                 Some(envelope::Body::InputAck(ack)) => {
-                                    if reader_full_diagnostics {
                                     reader_diagnostics.push(DiagnosticEvent::InputAck {
                                         sequence: ack.through_sequence,
                                         player_sent_at_micros: ack.player_sent_at_micros,
@@ -780,7 +775,6 @@ where
                                         pointer_mode_rejections: ack.pointer_mode_rejections,
                                         pointer_relative_baselines: ack.pointer_relative_baselines,
                                     });
-                                    }
                                 }
                                 Some(envelope::Body::ClockPong(pong)) => {
                                     if let Some(estimate) = clock_offset(pong, elapsed_micros(reader_started)) {
@@ -821,50 +815,31 @@ where
                                 write_envelope(&mut send, Envelope { body: Some(envelope::Body::ClockPing(ClockPing { sequence: clock_sequence, player_sent_at_micros })) }).await.map_err(|e| e.to_string())?;
                                 next_clock_sync = Instant::now() + Duration::from_millis(500);
                             }
-                            for _ in 0..256 {
-                                let Some(TimedInputEvent { event, occurred_at }) = next_input() else { break; };
-                                match event {
-                                    InputEvent::PointerMotion { delta_x, delta_y } => {
-                                        if pointer_mode != Some(PointerMode::Relative) {
-                                            input_sequence = input_sequence.checked_add(1).ok_or("input sequence exhausted")?;
-                                            let player_sent_at_micros = reader_full_diagnostics.then(|| elapsed_micros(reader_started)).unwrap_or(0);
-                                            write_envelope(input_send.as_mut().unwrap_or(&mut send), Envelope { body: Some(envelope::Body::InputTransition(InputTransition { generation: input_generation, sequence: input_sequence, action: Some(input_transition::Action::PointerMode(PointerModeTransition { mode: PointerMode::Relative as i32 })), player_sent_at_micros })) }).await.map_err(|e| e.to_string())?;
-                                            pointer_mode = Some(PointerMode::Relative);
-                                        }
-                                        cumulative_x = cumulative_x.checked_add(i64::from(delta_x)).ok_or("relative pointer x counter overflow")?;
-                                        cumulative_y = cumulative_y.checked_add(i64::from(delta_y)).ok_or("relative pointer y counter overflow")?;
-                                        pointer_sequence = pointer_sequence.checked_add(1).ok_or("pointer sequence exhausted")?;
-                                        let bytes = PointerSnapshot::Relative { generation: input_generation, sequence: pointer_sequence, cumulative_x, cumulative_y }.encode();
-                                        reader_connection.send_datagram(bytes.to_vec().into()).map_err(|e| e.to_string())?;
-                                    }
-                                    InputEvent::PointerPosition { x, y } => {
-                                        if pointer_mode != Some(PointerMode::Absolute) {
-                                            input_sequence = input_sequence.checked_add(1).ok_or("input sequence exhausted")?;
-                                            let player_sent_at_micros = reader_full_diagnostics.then(|| elapsed_micros(reader_started)).unwrap_or(0);
-                                            write_envelope(input_send.as_mut().unwrap_or(&mut send), Envelope { body: Some(envelope::Body::InputTransition(InputTransition { generation: input_generation, sequence: input_sequence, action: Some(input_transition::Action::PointerMode(PointerModeTransition { mode: PointerMode::Absolute as i32 })), player_sent_at_micros })) }).await.map_err(|e| e.to_string())?;
-                                            pointer_mode = Some(PointerMode::Absolute);
-                                        }
-                                        pointer_sequence = pointer_sequence.checked_add(1).ok_or("pointer sequence exhausted")?;
-                                        let bytes = PointerSnapshot::Absolute { generation: input_generation, sequence: pointer_sequence, x, y }.encode();
-                                        reader_connection.send_datagram(bytes.to_vec().into()).map_err(|e| e.to_string())?;
-                                    }
-                                    event => {
-                                        input_sequence = input_sequence.checked_add(1).ok_or("input sequence exhausted")?;
-                                        let correlates_test_marker = matches!(event, InputEvent::PointerButton { pressed: true, .. });
-                                        let action = match event {
-                                            InputEvent::Key { hid_usage, pressed } => input_transition::Action::Key(KeyTransition { hid_usage: u32::from(hid_usage), pressed }),
-                                            InputEvent::ReleaseAll => input_transition::Action::ReleaseAll(ReleaseAll {}),
-                                            InputEvent::PointerButton { button, pressed } => input_transition::Action::PointerButton(PointerButtonTransition { button: u32::from(button), pressed }),
-                                            InputEvent::Wheel { horizontal, vertical } => input_transition::Action::Wheel(WheelTransition { horizontal: i32::from(horizontal), vertical: i32::from(vertical) }),
-                                            InputEvent::PointerMotion { .. } | InputEvent::PointerPosition { .. } => unreachable!(),
-                                        };
-                                        let sent_at = reader_full_diagnostics.then(Instant::now);
-                                        let player_sent_at_micros = reader_full_diagnostics.then(|| elapsed_micros(reader_started)).unwrap_or(0);
-                                        write_envelope(input_send.as_mut().unwrap_or(&mut send), Envelope { body: Some(envelope::Body::InputTransition(InputTransition { generation: input_generation, sequence: input_sequence, action: Some(action), player_sent_at_micros })) }).await.map_err(|e| e.to_string())?;
-                                        if let Some(sent_at) = sent_at {
-                                            reader_diagnostics.push(DiagnosticEvent::InputSent { sequence: input_sequence, occurred_at, sent_at, send_completed_at: Instant::now(), correlates_test_marker });
-                                        }
-                                    }
+                            for _ in 0..4 {
+                                let sent_at = Instant::now();
+                                let player_sent_at_micros = elapsed_micros(reader_started);
+                                let mut transitions = Vec::with_capacity(rustconsole_protocol::input::MAX_EVENTS_PER_PACK);
+                                let mut sent_events = Vec::with_capacity(rustconsole_protocol::input::MAX_EVENTS_PER_PACK);
+                                for _ in 0..rustconsole_protocol::input::MAX_EVENTS_PER_PACK {
+                                    let Some(TimedInputEvent { event, occurred_at }) = next_input() else { break; };
+                                    input_sequence = input_sequence.checked_add(1).ok_or("input sequence exhausted")?;
+                                    let correlates_test_marker = matches!(event, InputEvent::PointerButton { pressed: true, .. });
+                                    let action = match event {
+                                        InputEvent::Key { hid_usage, pressed } => input_transition::Action::Key(KeyTransition { hid_usage: u32::from(hid_usage), pressed }),
+                                        InputEvent::ReleaseAll => input_transition::Action::ReleaseAll(ReleaseAll {}),
+                                        InputEvent::PointerButton { button, pressed } => input_transition::Action::PointerButton(PointerButtonTransition { button: u32::from(button), pressed }),
+                                        InputEvent::PointerMotion { delta_x, delta_y } => input_transition::Action::PointerMotion(PointerMotionTransition { delta_x, delta_y }),
+                                        InputEvent::PointerPosition { x, y } => input_transition::Action::PointerPosition(PointerPositionTransition { x: u32::from(x), y: u32::from(y) }),
+                                        InputEvent::Wheel { horizontal, vertical } => input_transition::Action::Wheel(WheelTransition { horizontal: i32::from(horizontal), vertical: i32::from(vertical) }),
+                                    };
+                                    transitions.push(InputTransition { generation: input_generation, sequence: input_sequence, action: Some(action), player_sent_at_micros });
+                                    sent_events.push((input_sequence, occurred_at, correlates_test_marker));
+                                }
+                                if transitions.is_empty() { break; }
+                                write_envelope(input_send.as_mut().unwrap_or(&mut send), Envelope { body: Some(envelope::Body::InputPack(InputPack { transitions })) }).await.map_err(|e| e.to_string())?;
+                                let send_completed_at = Instant::now();
+                                for (sequence, occurred_at, correlates_test_marker) in sent_events {
+                                    reader_diagnostics.push(DiagnosticEvent::InputSent { sequence, occurred_at, sent_at, send_completed_at, correlates_test_marker });
                                 }
                             }
                             receiver.audio.expire(Instant::now());
@@ -901,7 +876,7 @@ where
                 }
             };
             input_sequence = input_sequence.checked_add(1).ok_or("input sequence exhausted")?;
-            write_envelope(input_send.as_mut().unwrap_or(&mut send), Envelope { body: Some(envelope::Body::InputTransition(InputTransition { generation: input_generation, sequence: input_sequence, action: Some(input_transition::Action::ReleaseAll(ReleaseAll {})), player_sent_at_micros: 0 })) }).await.map_err(|e| e.to_string())?;
+            write_envelope(input_send.as_mut().unwrap_or(&mut send), Envelope { body: Some(envelope::Body::InputPack(InputPack { transitions: vec![InputTransition { generation: input_generation, sequence: input_sequence, action: Some(input_transition::Action::ReleaseAll(ReleaseAll {})), player_sent_at_micros: elapsed_micros(reader_started) }] })) }).await.map_err(|e| e.to_string())?;
             write_envelope(&mut send, Envelope { body: Some(envelope::Body::VideoControl(VideoControl { kind: VideoControlKind::Stop as i32 })) }).await.map_err(|e| e.to_string())?;
             send.finish().map_err(|e| e.to_string())?;
             Ok(end)
@@ -1417,13 +1392,17 @@ mod tests {
             let input = read_envelope(&mut server_input).await.unwrap();
             assert!(matches!(
                 input.body,
-                Some(envelope::Body::InputTransition(InputTransition {
-                    action: Some(input_transition::Action::Key(KeyTransition {
-                        hid_usage: 4,
-                        pressed: false,
-                    })),
-                    ..
-                }))
+                Some(envelope::Body::InputPack(InputPack { transitions }))
+                    if matches!(
+                        transitions.as_slice(),
+                        [InputTransition {
+                            action: Some(input_transition::Action::Key(KeyTransition {
+                                hid_usage: 4,
+                                pressed: false,
+                            })),
+                            ..
+                        }]
+                    )
             ));
             let state =
                 AudioStreamState::new(1, AudioStatus::Failed, 0, "audio-only test failure".into());

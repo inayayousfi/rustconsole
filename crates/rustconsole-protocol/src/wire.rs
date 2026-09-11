@@ -35,7 +35,7 @@ pub mod envelope {
         #[prost(message, tag = "14")]
         AudioStreamState(super::AudioStreamState),
         #[prost(message, tag = "15")]
-        InputTransition(super::InputTransition),
+        InputPack(super::InputPack),
         #[prost(message, tag = "16")]
         InputAck(super::InputAck),
         #[prost(message, tag = "17")]
@@ -83,7 +83,7 @@ pub struct InputTransition {
     pub generation: u64,
     #[prost(uint64, tag = "2")]
     pub sequence: u64,
-    #[prost(oneof = "input_transition::Action", tags = "3, 4, 5, 6, 7")]
+    #[prost(oneof = "input_transition::Action", tags = "3, 4, 5, 6, 7, 9, 10")]
     pub action: Option<input_transition::Action>,
     #[prost(uint64, tag = "8")]
     pub player_sent_at_micros: u64,
@@ -104,7 +104,17 @@ pub mod input_transition {
         PointerMode(super::PointerModeTransition),
         #[prost(message, tag = "7")]
         ReleaseAll(super::ReleaseAll),
+        #[prost(message, tag = "9")]
+        PointerMotion(super::PointerMotionTransition),
+        #[prost(message, tag = "10")]
+        PointerPosition(super::PointerPositionTransition),
     }
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct InputPack {
+    #[prost(message, repeated, tag = "1")]
+    pub transitions: Vec<InputTransition>,
 }
 
 #[derive(Clone, Copy, PartialEq, Message)]
@@ -121,6 +131,22 @@ pub struct PointerButtonTransition {
     pub button: u32,
     #[prost(bool, tag = "2")]
     pub pressed: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Message)]
+pub struct PointerMotionTransition {
+    #[prost(sint32, tag = "1")]
+    pub delta_x: i32,
+    #[prost(sint32, tag = "2")]
+    pub delta_y: i32,
+}
+
+#[derive(Clone, Copy, PartialEq, Message)]
+pub struct PointerPositionTransition {
+    #[prost(uint32, tag = "1")]
+    pub x: u32,
+    #[prost(uint32, tag = "2")]
+    pub y: u32,
 }
 
 #[derive(Clone, Copy, PartialEq, Message)]
@@ -819,6 +845,41 @@ mod tests {
             SelectedAv1Configuration::decode(SELECTED_AV1_CONFIGURATION_FIXTURE.as_slice())
                 .unwrap(),
             selected
+        );
+    }
+
+    #[test]
+    fn reliable_input_pack_preserves_order_and_pointer_motion() {
+        let envelope = Envelope {
+            body: Some(envelope::Body::InputPack(InputPack {
+                transitions: vec![
+                    InputTransition {
+                        generation: 3,
+                        sequence: 8,
+                        action: Some(input_transition::Action::Key(KeyTransition {
+                            hid_usage: 4,
+                            pressed: true,
+                        })),
+                        player_sent_at_micros: 100,
+                    },
+                    InputTransition {
+                        generation: 3,
+                        sequence: 9,
+                        action: Some(input_transition::Action::PointerMotion(
+                            PointerMotionTransition {
+                                delta_x: -5,
+                                delta_y: 7,
+                            },
+                        )),
+                        player_sent_at_micros: 100,
+                    },
+                ],
+            })),
+        };
+
+        assert_eq!(
+            decode_reliable_frame(&encode_reliable_frame(&envelope).unwrap()).unwrap(),
+            envelope
         );
     }
 

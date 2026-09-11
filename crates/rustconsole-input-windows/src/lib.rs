@@ -208,6 +208,28 @@ impl InputSession {
                     .apply(InputEvent::PointerButton { button, pressed }, sink)
                     .map_err(InputSessionError::Apply)?;
             }
+            input_transition::Action::PointerMotion(motion) => self
+                .state
+                .apply(
+                    InputEvent::PointerMotion {
+                        delta_x: motion.delta_x,
+                        delta_y: motion.delta_y,
+                    },
+                    sink,
+                )
+                .map_err(InputSessionError::Apply)?,
+            input_transition::Action::PointerPosition(position) => self
+                .state
+                .apply(
+                    InputEvent::PointerPosition {
+                        x: u16::try_from(position.x)
+                            .map_err(|_| InputSessionError::InvalidTransition)?,
+                        y: u16::try_from(position.y)
+                            .map_err(|_| InputSessionError::InvalidTransition)?,
+                    },
+                    sink,
+                )
+                .map_err(InputSessionError::Apply)?,
             input_transition::Action::Wheel(wheel) => {
                 let horizontal = i16::try_from(wheel.horizontal)
                     .map_err(|_| InputSessionError::InvalidTransition)?;
@@ -309,6 +331,12 @@ fn validate_action<E>(action: input_transition::Action) -> Result<(), InputSessi
             Ok(())
         }
         input_transition::Action::PointerButton(button) if (1..=5).contains(&button.button) => {
+            Ok(())
+        }
+        input_transition::Action::PointerMotion(_) => Ok(()),
+        input_transition::Action::PointerPosition(position)
+            if position.x <= 32767 && position.y <= 32767 =>
+        {
             Ok(())
         }
         input_transition::Action::Wheel(wheel)
@@ -518,7 +546,9 @@ impl<E: fmt::Debug + fmt::Display> std::error::Error for ApplyError<E> {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustconsole_protocol::wire::{KeyTransition, PointerModeTransition, input_transition};
+    use rustconsole_protocol::wire::{
+        KeyTransition, PointerModeTransition, PointerMotionTransition, input_transition,
+    };
     use rustconsole_session::input_datagram::{PointerSnapshot, PointerSnapshotReceiver};
 
     #[derive(Default)]
@@ -708,6 +738,35 @@ mod tests {
         ));
         assert_eq!(session.generation(), 7);
         assert_eq!(sink.reports.len(), report_count);
+    }
+
+    #[test]
+    fn reliable_pointer_motion_is_applied_without_a_datagram_baseline() {
+        let mut session = InputSession::default();
+        let mut sink = Sink::default();
+        let ack = session
+            .reliable(
+                InputTransition {
+                    generation: 1,
+                    sequence: 1,
+                    action: Some(input_transition::Action::PointerMotion(
+                        PointerMotionTransition {
+                            delta_x: 12,
+                            delta_y: -7,
+                        },
+                    )),
+                    player_sent_at_micros: 42,
+                },
+                &mut sink,
+            )
+            .unwrap();
+
+        assert_eq!(ack.through_sequence, 1);
+        assert_eq!(ack.player_sent_at_micros, 42);
+        assert_eq!(
+            sink.reports,
+            [HidReport::Mouse(mouse_relative(0, 12, -7, 0, 0))]
+        );
     }
 
     #[test]
