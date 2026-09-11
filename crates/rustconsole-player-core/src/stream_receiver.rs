@@ -478,10 +478,13 @@ impl Receiver {
                 self.queue_audio(events);
             }
         } else {
-            let assembled = self
-                .video
-                .push(bytes, now, rtt)
-                .map_err(|e| e.to_string())?;
+            let assembled = self.video.push(bytes, now, rtt).map_err(|error| {
+                format!(
+                    "{error}: length={} prefix={:02x?}",
+                    bytes.len(),
+                    &bytes[..bytes.len().min(4)]
+                )
+            })?;
             if assembled.dependency_lost {
                 self.recover.store(true, Ordering::Release);
             }
@@ -593,6 +596,14 @@ impl Drop for ReaderGuard {
         }
         self.connection.close(0_u32.into(), b"player stopped");
     }
+}
+
+pub(super) fn close_with_stream_error(connection: &quinn::Connection, error: &str) {
+    let mut end = error.len().min(1_024);
+    while !error.is_char_boundary(end) {
+        end -= 1;
+    }
+    connection.close(0x202_u32.into(), &error.as_bytes()[..end]);
 }
 
 pub(super) struct ReceiveStreamParameters<Stop, Input, Progress, Audio, Video> {
@@ -895,6 +906,9 @@ where
             send.finish().map_err(|e| e.to_string())?;
             Ok(end)
         }.await;
+        if let Err(error) = &result {
+            close_with_stream_error(&reader_connection, error);
+        }
         receiver.frames.close();
         receiver.audio_events.close();
         result
@@ -915,7 +929,10 @@ where
         }
         let frame = frames.pop_timeout(Duration::from_millis(2));
         while let Some(event) = audio_events.pop_timeout(Duration::ZERO) {
-            consume_audio(event)?;
+            if let Err(error) = consume_audio(event) {
+                close_with_stream_error(&guard.connection, &error.to_string());
+                return Err(error);
+            }
         }
         while let Some(event) = diagnostic_events.pop_timeout(Duration::ZERO) {
             match event {
@@ -1063,7 +1080,7 @@ where
                 });
                 first = false;
             }
-            if !consume_video(
+            let keep_streaming = consume_video(
                 frame,
                 StreamTransportStatistics {
                     round_trip_time: snapshot.rtt,
@@ -1075,7 +1092,15 @@ where
                     ),
                     assembled_payload_sha256: payload_sha256,
                 },
-            )? {
+            );
+            let keep_streaming = match keep_streaming {
+                Ok(keep_streaming) => keep_streaming,
+                Err(error) => {
+                    close_with_stream_error(&guard.connection, &error.to_string());
+                    return Err(error);
+                }
+            };
+            if !keep_streaming {
                 break;
             }
         } else if frames.is_closed() || guard.task.as_ref().unwrap().is_finished() {

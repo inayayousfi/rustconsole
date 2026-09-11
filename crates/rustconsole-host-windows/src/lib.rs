@@ -24,6 +24,8 @@ pub mod firewall;
 #[cfg(windows)]
 mod gpu_encode;
 #[cfg(windows)]
+mod installation;
+#[cfg(windows)]
 mod interactive_worker;
 pub mod service;
 #[cfg(windows)]

@@ -9,11 +9,13 @@ use core::ptr::{copy_nonoverlapping, null_mut};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use std::thread::JoinHandle;
+use std::time::Duration;
 use wdk_sys::{
     _WDF_EXECUTION_LEVEL, _WDF_IO_QUEUE_DISPATCH_TYPE, _WDF_SYNCHRONIZATION_SCOPE, _WDF_TRI_STATE,
-    NTSTATUS, PCUNICODE_STRING, PDRIVER_OBJECT, ULONG, WDF_DRIVER_CONFIG, WDF_IO_QUEUE_CONFIG,
-    WDF_NO_HANDLE, WDF_NO_OBJECT_ATTRIBUTES, WDF_OBJECT_ATTRIBUTES, WDFDEVICE, WDFDEVICE_INIT,
-    WDFDRIVER, WDFOBJECT, WDFQUEUE, WDFREQUEST, call_unsafe_wdf_function_binding,
+    NTSTATUS, PCUNICODE_STRING, PDRIVER_OBJECT, ULONG, WDF_DEVICE_PNP_CAPABILITIES,
+    WDF_DRIVER_CONFIG, WDF_IO_QUEUE_CONFIG, WDF_NO_HANDLE, WDF_NO_OBJECT_ATTRIBUTES,
+    WDF_OBJECT_ATTRIBUTES, WDFDEVICE, WDFDEVICE_INIT, WDFDRIVER, WDFOBJECT, WDFQUEUE, WDFREQUEST,
+    call_unsafe_wdf_function_binding,
 };
 
 use config::{DeviceConfig, DeviceKind};
@@ -32,7 +34,7 @@ const STATUS_INVALID_PARAMETER: NTSTATUS = -1_073_741_811;
 struct DeviceState {
     config: DeviceConfig,
     pending_reads: WDFQUEUE,
-    ipc: InputIpc,
+    ipc: Option<InputIpc>,
     pumping: bool,
     worker: Option<JoinHandle<()>>,
 }
@@ -111,12 +113,23 @@ extern "C" fn evt_driver_device_add(
     if status != STATUS_SUCCESS {
         return status;
     }
+    const { assert!(size_of::<WDF_DEVICE_PNP_CAPABILITIES>() <= ULONG::MAX as usize) };
+    let mut pnp_capabilities = WDF_DEVICE_PNP_CAPABILITIES {
+        Size: size_of::<WDF_DEVICE_PNP_CAPABILITIES>() as ULONG,
+        Removable: _WDF_TRI_STATE::WdfTrue,
+        SurpriseRemovalOK: _WDF_TRI_STATE::WdfTrue,
+        ..WDF_DEVICE_PNP_CAPABILITIES::default()
+    };
+    // SAFETY: device is live and WDF consumes the capabilities synchronously.
+    unsafe {
+        call_unsafe_wdf_function_binding!(
+            WdfDeviceSetPnpCapabilities,
+            device,
+            &mut pnp_capabilities,
+        )
+    };
     let config = match config::load(device) {
         Ok(config) => config,
-        Err(status) => return status,
-    };
-    let ipc = match InputIpc::open(&config) {
-        Ok(ipc) => ipc,
         Err(status) => return status,
     };
     const { assert!(size_of::<WDF_IO_QUEUE_CONFIG>() <= ULONG::MAX as usize) };
@@ -174,7 +187,7 @@ extern "C" fn evt_driver_device_add(
         DeviceState {
             config,
             pending_reads,
-            ipc,
+            ipc: None,
             pumping: false,
             worker: None,
         },
@@ -209,7 +222,9 @@ unsafe extern "C" fn evt_device_cleanup(object: WDFOBJECT) {
             .ok()
             .and_then(|mut devices| devices.remove(&(object as usize)));
         if let Some(state) = removed.as_mut() {
-            state.ipc.signal_stop();
+            if let Some(ipc) = state.ipc.as_ref() {
+                ipc.signal_stop();
+            }
             if let Some(worker) = state.worker.take() {
                 let _ = worker.join();
             }
@@ -326,10 +341,14 @@ unsafe extern "C" fn evt_io_device_control(
                 STATUS_INVALID_PARAMETER
             } else if devices().lock().ok().is_some_and(|mut devices| {
                 devices.get_mut(&(device as usize)).is_some_and(|state| {
-                    state
-                        .ipc
-                        .publish_output(ipc::OUTPUT_REPORT_OPERATION, report[0], &report[1..])
+                    state.ipc.as_mut().is_some_and(|ipc| {
+                        ipc.publish_output(
+                            ipc::OUTPUT_REPORT_OPERATION,
+                            report[0],
+                            &report[1..],
+                        )
                         .is_ok()
+                    })
                 })
             }) {
                 STATUS_SUCCESS
@@ -417,14 +436,36 @@ unsafe extern "C" fn evt_io_device_control(
 
 fn input_worker(key: usize) {
     loop {
-        let handles = {
+        let (handles, config) = {
             let Ok(devices) = devices().lock() else {
                 return;
             };
             let Some(state) = devices.get(&key) else {
                 return;
             };
-            state.ipc.handles()
+            (
+                state.ipc.as_ref().map(InputIpc::handles),
+                state.config.clone(),
+            )
+        };
+        let Some(handles) = handles else {
+            let opened = InputIpc::open(&config).ok().is_some_and(|ipc| {
+                devices().lock().ok().is_some_and(|mut devices| {
+                    devices.get_mut(&key).is_some_and(|state| {
+                        if state.ipc.is_some() {
+                            return false;
+                        }
+                        state.ipc = Some(ipc);
+                        true
+                    })
+                })
+            });
+            if opened {
+                pump_reports(key);
+                continue;
+            }
+            std::thread::sleep(Duration::from_millis(250));
+            continue;
         };
         match ipc::wait(handles.0, handles.1) {
             ipc::WaitResult::Stop | ipc::WaitResult::Failed => return,
@@ -455,7 +496,11 @@ fn pump_reports(key: usize) {
             let Some(state) = devices.get_mut(&key) else {
                 return;
             };
-            match ipc::read_report(&state.ipc, state.config.kind) {
+            let Some(ipc) = state.ipc.as_ref() else {
+                state.pumping = false;
+                return;
+            };
+            match ipc::read_report(ipc, state.config.kind) {
                 Ok(Some(report)) => report,
                 Ok(None) | Err(()) => {
                     state.pumping = false;
@@ -488,7 +533,10 @@ fn pump_reports(key: usize) {
             let Some(state) = devices.get(&key) else {
                 return;
             };
-            ipc::consume(&state.ipc, report.0);
+            let Some(ipc) = state.ipc.as_ref() else {
+                return;
+            };
+            ipc::consume(ipc, report.0);
         } else {
             if let Ok(mut devices) = devices().lock()
                 && let Some(state) = devices.get_mut(&key)

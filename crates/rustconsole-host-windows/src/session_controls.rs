@@ -5,7 +5,7 @@ use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::mpsc::{Receiver, TryRecvError, sync_channel};
 use windows::Win32::Foundation::{
-    CloseHandle, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
+    CloseHandle, ERROR_NO_TOKEN, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint,
@@ -82,6 +82,12 @@ impl WindowsSessionControls {
             actions,
         })
     }
+}
+
+pub fn user_token_unavailable(error: &(dyn std::error::Error + 'static)) -> bool {
+    error
+        .downcast_ref::<windows::core::Error>()
+        .is_some_and(|error| error.code() == windows::core::HRESULT::from_win32(ERROR_NO_TOKEN.0))
 }
 
 impl HostSessionControlSource for WindowsSessionControls {

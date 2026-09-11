@@ -3,9 +3,10 @@ use std::ffi::OsString;
 #[cfg(any(windows, test))]
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 
-pub const SERVICE_NAME: &str = "RustConsoleHostDev";
-pub const SERVICE_DISPLAY_NAME: &str = "Rust Console Host (Development)";
-pub const SERVICE_DESCRIPTION: &str = "Development host service for Rust Console.";
+pub const SERVICE_NAME: &str = "RustConsoleHost";
+pub const SERVICE_DISPLAY_NAME: &str = "Rust Console Host";
+pub const SERVICE_DESCRIPTION: &str =
+    "Streams this Windows computer to authenticated Rust Console players.";
 pub const CAPTURE_PROOF_REPORT: &str = r"C:\ProgramData\RustConsole\capture-proof.txt";
 pub const AUDIO_PROOF_REPORT: &str = r"C:\ProgramData\RustConsole\audio-proof.txt";
 pub const AUDIO_ENCODE_PROOF_REPORT: &str = r"C:\ProgramData\RustConsole\audio-encode-proof.txt";
@@ -17,6 +18,7 @@ pub const DISPLAY_MODE_TRANSITION_PROOF_REPORT: &str =
     r"C:\ProgramData\RustConsole\display-mode-transition-proof.txt";
 pub const ONE_FRAME_PROOF_REPORT: &str = r"C:\ProgramData\RustConsole\one-frame-proof.txt";
 pub const SERVICE_ERROR_REPORT: &str = r"C:\ProgramData\RustConsole\service-error.txt";
+pub const SESSION_ERROR_REPORT: &str = r"C:\ProgramData\RustConsole\session-error.txt";
 #[cfg(windows)]
 const CAPTURE_IMAGE_PROOF_REPORT: &str = "capture-image-proof.txt";
 
@@ -54,6 +56,7 @@ pub enum ServiceCommand {
     RunDisplayModeTransitionProof,
     RunOneFrameProof,
     Install,
+    InstallElevated,
     InstallCaptureProof,
     InstallDesktopTransitionProof,
     InstallLoginTransitionProof,
@@ -77,6 +80,7 @@ pub enum ServiceCommand {
         connection_token: String,
     },
     Uninstall,
+    UninstallElevated,
     FirewallStatus,
     FirewallEnable(crate::firewall::FirewallScope),
     FirewallDisable,
@@ -93,6 +97,14 @@ pub fn execute_service_command(command: ServiceCommand) -> Result<(), Box<dyn st
         let _ = command;
         Err("the Rust Console host service is only available on Windows".into())
     }
+}
+
+#[cfg(windows)]
+pub(crate) fn install_service(
+    executable_path: std::path::PathBuf,
+    launch_arguments: Vec<OsString>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    windows::install_service(executable_path, launch_arguments)
 }
 
 #[cfg(any(windows, test))]
@@ -150,9 +162,7 @@ mod windows {
     use windows_service::service_dispatcher;
     use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
-    const DELETE_TIMEOUT: Duration = Duration::from_secs(10);
     const STATUS_WAIT_HINT: Duration = Duration::from_secs(5);
-    const ERROR_SERVICE_DOES_NOT_EXIST: i32 = 1060;
     const CAPTURE_PROOF_LIMIT: Duration = Duration::from_secs(10);
     const CAPTURE_ACQUIRE_TIMEOUT: Duration = Duration::from_millis(250);
     const ONE_FRAME_PROOF_ADDRESS: &str = "0.0.0.0:47999";
@@ -205,24 +215,25 @@ mod windows {
                 service_dispatcher::start(SERVICE_NAME, service_main_ffi)?;
                 Ok(())
             }
-            ServiceCommand::Install => install(std::env::current_exe()?, Vec::new()),
-            ServiceCommand::InstallCaptureProof => install(
+            ServiceCommand::Install => crate::installation::install(false),
+            ServiceCommand::InstallElevated => crate::installation::install(true),
+            ServiceCommand::InstallCaptureProof => install_service(
                 std::env::current_exe()?,
                 vec![OsString::from("capture-proof")],
             ),
-            ServiceCommand::InstallDesktopTransitionProof => install(
+            ServiceCommand::InstallDesktopTransitionProof => install_service(
                 std::env::current_exe()?,
                 vec![OsString::from("desktop-transition-proof")],
             ),
-            ServiceCommand::InstallLoginTransitionProof => install(
+            ServiceCommand::InstallLoginTransitionProof => install_service(
                 std::env::current_exe()?,
                 vec![OsString::from("login-transition-proof")],
             ),
-            ServiceCommand::InstallDisplayModeTransitionProof => install(
+            ServiceCommand::InstallDisplayModeTransitionProof => install_service(
                 std::env::current_exe()?,
                 vec![OsString::from("display-mode-transition-proof")],
             ),
-            ServiceCommand::InstallOneFrameProof => install(
+            ServiceCommand::InstallOneFrameProof => install_service(
                 std::env::current_exe()?,
                 vec![OsString::from("one-frame-proof")],
             ),
@@ -243,14 +254,15 @@ mod windows {
                 pipe,
                 connection_token,
             } => crate::session_controls::run(&pipe, &connection_token),
-            ServiceCommand::Uninstall => uninstall(),
+            ServiceCommand::Uninstall => crate::installation::uninstall(false),
+            ServiceCommand::UninstallElevated => crate::installation::uninstall(true),
             ServiceCommand::FirewallStatus => crate::firewall::print_status(),
             ServiceCommand::FirewallEnable(scope) => crate::firewall::enable(scope),
             ServiceCommand::FirewallDisable => crate::firewall::disable(),
         }
     }
 
-    fn install(
+    pub(super) fn install_service(
         executable_path: PathBuf,
         launch_arguments: Vec<OsString>,
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -284,40 +296,6 @@ mod windows {
             );
         }
         Ok(())
-    }
-
-    fn uninstall() -> Result<(), Box<dyn std::error::Error>> {
-        crate::firewall::disable()?;
-        let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
-        let service = manager.open_service(
-            SERVICE_NAME,
-            ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE,
-        )?;
-        service.delete()?;
-        if service.query_status()?.current_state != ServiceState::Stopped {
-            service.stop()?;
-        }
-        drop(service);
-
-        let started = Instant::now();
-        while started.elapsed() < DELETE_TIMEOUT {
-            match manager.open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS) {
-                Err(windows_service::Error::Winapi(error))
-                    if error.raw_os_error() == Some(ERROR_SERVICE_DOES_NOT_EXIST) =>
-                {
-                    return Ok(());
-                }
-                Err(error) => return Err(error.into()),
-                Ok(service) => drop(service),
-            }
-            thread::sleep(Duration::from_millis(100));
-        }
-
-        Err(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            "timed out waiting for the Rust Console service to be deleted",
-        )
-        .into())
     }
 
     fn service_main(_arguments: Vec<OsString>) {
@@ -365,7 +343,8 @@ mod windows {
             1,
             STATUS_WAIT_HINT,
         )?;
-        crate::audio_policy::recover_pending_route()?;
+        crate::audio_policy::recover_pending_route()
+            .map_err(|error| format!("recovering the Windows audio route: {error}"))?;
         let _audio_recovery = AudioRecoveryGuard;
         set_status(
             &status_handle,
@@ -411,13 +390,22 @@ mod windows {
     fn run_authenticated_quic_service(
         shutdown_rx: &Receiver<()>,
     ) -> Result<bool, Box<dyn std::error::Error>> {
-        let record = Arc::new(crate::credentials::load_record()?);
+        let record = Arc::new(
+            crate::credentials::load_record()
+                .map_err(|error| format!("loading the OPAQUE server record: {error}"))?,
+        );
         let _ = crate::firewall::write_report();
-        let host_metadata = Arc::new(discovery_metadata()?);
+        let host_metadata = Arc::new(
+            discovery_metadata()
+                .map_err(|error| format!("reading Windows host metadata: {error}"))?,
+        );
         let limiter = Arc::new(Mutex::new(AuthenticationRateLimiter::default()));
         let active_stream = Arc::new(AtomicBool::new(false));
         let vb_cable_status = Arc::new(AtomicI32::new(detect_vb_cable_status() as i32));
-        let executable = Arc::new(std::env::current_exe()?);
+        let executable = Arc::new(
+            std::env::current_exe()
+                .map_err(|error| format!("locating the host executable: {error}"))?,
+        );
         let input_generation =
             u64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_micros())?.max(1);
         let input_inf = executable
@@ -425,19 +413,23 @@ mod windows {
             .ok_or("host executable has no parent directory")?
             .join("input-driver")
             .join("rustconsole_input_driver.inf");
-        let input_owner = Arc::new(Mutex::new(VirtualInputOwner::create(
-            &input_inf,
-            input_generation,
-        )?));
+        let input_owner = Arc::new(Mutex::new(
+            VirtualInputOwner::create(&input_inf, input_generation).map_err(|error| {
+                format!("creating the persistent virtual input devices: {error}")
+            })?,
+        ));
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
-            .build()?;
+            .build()
+            .map_err(|error| format!("creating the host async runtime: {error}"))?;
         runtime.block_on(async move {
-            let server_config = ephemeral_server_config()?;
+            let server_config = ephemeral_server_config()
+                .map_err(|error| format!("creating the ephemeral QUIC certificate: {error}"))?;
             let ipv4 = Endpoint::server(
                 server_config.clone(),
                 PRODUCTION_QUIC_IPV4_ADDRESS.parse()?,
-            )?;
+            )
+            .map_err(|error| format!("opening the IPv4 QUIC endpoint: {error}"))?;
             let ipv6 = match Endpoint::server(
                 server_config,
                 PRODUCTION_QUIC_IPV6_ADDRESS.parse()?,
@@ -461,7 +453,15 @@ mod windows {
                     if let Some(ipv6) = &ipv6 {
                         ipv6.close(VarInt::from_u32(0), b"service stopping");
                     }
-                    authentications.abort_all();
+                    if tokio::time::timeout(Duration::from_secs(10), async {
+                        while authentications.join_next().await.is_some() {}
+                    })
+                    .await
+                    .is_err()
+                    {
+                        authentications.abort_all();
+                        while authentications.join_next().await.is_some() {}
+                    }
                     return Ok(true);
                 }
                 tokio::select! {
@@ -483,13 +483,15 @@ mod windows {
                             };
                             match authenticate_server(connection.clone(), &record, &limiter, &host_metadata).await {
                                 Ok(authenticated) => {
-                                    let _ = serve_authenticated_video(
+                                    if let Err(error) = serve_authenticated_video(
                                          authenticated,
                                          active_stream,
                                          vb_cable_status,
                                          executable,
                                          input_owner,
-                                    ).await;
+                                    ).await {
+                                        report_session_error(&connection, error.as_ref());
+                                    }
                                 }
                                 Err(_) => connection.close(
                                     VarInt::from_u32(0x100),
@@ -516,13 +518,15 @@ mod windows {
                             };
                             match authenticate_server(connection.clone(), &record, &limiter, &host_metadata).await {
                                 Ok(authenticated) => {
-                                    let _ = serve_authenticated_video(
+                                    if let Err(error) = serve_authenticated_video(
                                          authenticated,
                                          active_stream,
                                          vb_cable_status,
                                          executable,
                                          input_owner,
-                                    ).await;
+                                    ).await {
+                                        report_session_error(&connection, error.as_ref());
+                                    }
                                 }
                                 Err(_) => connection.close(
                                     VarInt::from_u32(0x100),
@@ -545,6 +549,24 @@ mod windows {
             Some(endpoint) => endpoint.accept().await,
             None => std::future::pending().await,
         }
+    }
+
+    fn report_session_error(connection: &Connection, error: &dyn std::error::Error) {
+        let report = PathBuf::from(SESSION_ERROR_REPORT);
+        if let Some(parent) = report.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if let Ok(mut report) = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(report)
+        {
+            let timestamp_millis = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_millis());
+            let _ = writeln!(report, "time_millis={timestamp_millis} error={error}");
+        }
+        connection.close(VarInt::from_u32(0x102), b"session failed");
     }
 
     fn discovery_metadata() -> Result<HostMetadata, Box<dyn std::error::Error>> {
@@ -579,11 +601,20 @@ mod windows {
         input_owner: Arc<Mutex<VirtualInputOwner>>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let connection = authenticated.connection;
+        macro_rules! session_try {
+            ($stage:literal, $result:expr) => {
+                $result.map_err(|error| format!(concat!($stage, ": {}"), error))?
+            };
+        }
         let (mut send, mut receive) =
             tokio::time::timeout(Duration::from_secs(10), connection.accept_bi())
                 .await
-                .map_err(|_| "timed out waiting for AV1 capability negotiation")??;
-        let request = read_envelope(&mut receive).await?;
+                .map_err(|_| "timed out waiting for AV1 capability negotiation")?
+                .map_err(|error| format!("accepting AV1 negotiation stream: {error}"))?;
+        let request = session_try!(
+            "reading player AV1 capability offer",
+            read_envelope(&mut receive).await
+        );
         if matches!(
             &request.body,
             Some(envelope::Body::SessionAvailabilityProbe(_))
@@ -626,7 +657,10 @@ mod windows {
                 ),
                 _ => (None, false, false, false),
             };
-        let (decoder_capabilities, settings) = parse_viewer_offer(request)?;
+        let (decoder_capabilities, settings) = session_try!(
+            "parsing player AV1 capability offer",
+            parse_viewer_offer(request)
+        );
         if active_stream
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
@@ -635,15 +669,36 @@ mod windows {
             return Ok(());
         }
         let _active_guard = ActiveStreamGuard(Arc::clone(&active_stream));
+        let mut session_controls = if host_pointer_release {
+            let controls_executable = executable.as_ref().to_owned();
+            tokio::task::spawn_blocking(move || {
+                match crate::session_controls::WindowsSessionControls::launch(&controls_executable)
+                {
+                    Ok(controls) => Ok(Some(controls)),
+                    Err(error)
+                        if crate::session_controls::user_token_unavailable(error.as_ref()) =>
+                    {
+                        Ok(None)
+                    }
+                    Err(error) => Err(error.to_string()),
+                }
+            })
+            .await
+            .map_err(|_| "session controls launch task panicked")??
+        } else {
+            None
+        };
+        let host_pointer_release = session_controls.is_some();
         let worker_executable = executable.as_ref().to_owned();
-        let (worker, video_configuration) = tokio::task::spawn_blocking(move || {
+        let prepared = tokio::task::spawn_blocking(move || {
             let (_shutdown_tx, shutdown_rx) = shutdown_channel();
             crate::worker::MediaWorker::launch_prepared_video(&worker_executable, &shutdown_rx)
                 .map_err(|error| error.to_string())?
                 .ok_or_else(|| "media worker preparation was interrupted".to_owned())
         })
         .await
-        .map_err(|_| "media worker preparation task panicked")??;
+        .map_err(|_| "media worker preparation task panicked")?;
+        let (worker, video_configuration) = session_try!("preparing media worker", prepared);
         let encoder_capability = DomainCapability {
             mode: DomainMode {
                 chroma_subsampling: ChromaSubsampling::Yuv420,
@@ -654,66 +709,71 @@ mod windows {
             },
             maximum_width: video_configuration.width,
             maximum_height: video_configuration.height,
-            maximum_frames_per_second: u16::try_from(video_configuration.refresh_rate)?,
+            maximum_frames_per_second: session_try!(
+                "converting host refresh rate",
+                u16::try_from(video_configuration.refresh_rate)
+            ),
         };
-        let selected =
-            negotiate_av1_configuration(&[encoder_capability], &decoder_capabilities, &settings)?;
-        write_envelope(
-            &mut send,
-            Envelope {
-                body: Some(envelope::Body::Av1CapabilityOffer(Av1CapabilityOffer {
-                    dedicated_input_stream,
-                    host_pointer_release,
-                    full_diagnostics,
-                    audio_transport: audio_configuration,
-                    encoder_capabilities: vec![wire_capability(encoder_capability)],
-                    decoder_capabilities: Vec::new(),
-                    viewer_settings: None,
-                })),
-            },
-        )
-        .await?;
+        let selected = session_try!(
+            "selecting AV1 configuration",
+            negotiate_av1_configuration(&[encoder_capability], &decoder_capabilities, &settings)
+        );
+        session_try!(
+            "sending host AV1 capability offer",
+            write_envelope(
+                &mut send,
+                Envelope {
+                    body: Some(envelope::Body::Av1CapabilityOffer(Av1CapabilityOffer {
+                        dedicated_input_stream,
+                        host_pointer_release,
+                        full_diagnostics,
+                        audio_transport: audio_configuration,
+                        encoder_capabilities: vec![wire_capability(encoder_capability)],
+                        decoder_capabilities: Vec::new(),
+                        viewer_settings: None,
+                    })),
+                },
+            )
+            .await
+        );
         let mut selected_wire = wire_selected(selected);
         selected_wire.audio_transport = audio_configuration;
         selected_wire.full_diagnostics = full_diagnostics;
         selected_wire.host_pointer_release = host_pointer_release;
         selected_wire.dedicated_input_stream = dedicated_input_stream;
-        match read_envelope(&mut receive).await?.body {
+        let player_selection = session_try!(
+            "reading player AV1 selection",
+            read_envelope(&mut receive).await
+        );
+        match player_selection.body {
             Some(envelope::Body::SelectedAv1Configuration(peer)) if peer == selected_wire => {}
             _ => return Err("viewer selected a different AV1 configuration".into()),
         }
-        write_envelope(
-            &mut send,
-            Envelope {
-                body: Some(envelope::Body::SelectedAv1Configuration(selected_wire)),
-            },
-        )
-        .await?;
+        session_try!(
+            "sending host AV1 selection",
+            write_envelope(
+                &mut send,
+                Envelope {
+                    body: Some(envelope::Body::SelectedAv1Configuration(selected_wire)),
+                },
+            )
+            .await
+        );
 
         let mut input_receive = if dedicated_input_stream {
             let mut input = tokio::time::timeout(Duration::from_secs(10), connection.accept_uni())
                 .await
-                .map_err(|_| "timed out waiting for dedicated input stream")??;
+                .map_err(|_| "timed out waiting for dedicated input stream")?
+                .map_err(|error| format!("accepting dedicated input stream: {error}"))?;
             let mut preamble = [0; INPUT_STREAM_PREAMBLE.len()];
-            input.read_exact(&mut preamble).await?;
+            session_try!(
+                "reading dedicated input stream preamble",
+                input.read_exact(&mut preamble).await
+            );
             if preamble != INPUT_STREAM_PREAMBLE {
                 return Err("invalid dedicated input stream preamble".into());
             }
             Some(input)
-        } else {
-            None
-        };
-
-        let mut session_controls = if host_pointer_release {
-            let controls_executable = executable.as_ref().to_owned();
-            Some(
-                tokio::task::spawn_blocking(move || {
-                    crate::session_controls::WindowsSessionControls::launch(&controls_executable)
-                        .map_err(|error| error.to_string())
-                })
-                .await
-                .map_err(|_| "session controls launch task panicked")??,
-            )
         } else {
             None
         };
@@ -839,7 +899,12 @@ mod windows {
                         }
                         break 'control;
                     }
-                    _ = connection.closed() => break 'control,
+                    error = connection.closed() => {
+                        if !matches!(error, quinn::ConnectionError::LocallyClosed) {
+                            control_error = Some(format!("viewer connection closed: {error}"));
+                        }
+                        break 'control;
+                    }
                     _ = input_tick.tick() => {
                         if let Some(controls) = session_controls.as_mut() {
                             match controls.try_next_action() {
@@ -1148,16 +1213,27 @@ mod windows {
         let _ = control_tx.try_send(WorkerVideoControl::Stop);
         drop(control_tx);
         if !media_finished {
-            media
-                .await
-                .map_err(|_| "media worker task panicked")?
-                .map_err(|error| error.to_string())?;
+            match media.await {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    control_error.get_or_insert_with(|| format!("media worker failed: {error}"));
+                }
+                Err(_) => {
+                    control_error.get_or_insert_with(|| "media worker task panicked".to_owned());
+                }
+            }
         }
         if let Some(error) = control_error {
             connection.close(VarInt::from_u32(0x102), error.as_bytes());
             return Err(error.into());
         }
-        send.finish()?;
+        if matches!(
+            connection.close_reason(),
+            Some(quinn::ConnectionError::LocallyClosed)
+        ) {
+            return Ok(());
+        }
+        session_try!("finishing host control stream", send.finish());
         Ok(())
     }
 

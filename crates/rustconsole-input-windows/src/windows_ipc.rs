@@ -4,7 +4,8 @@ use crate::{
 use core::mem::size_of;
 use core::ptr::null_mut;
 use windows::Win32::Foundation::{
-    CloseHandle, HANDLE, HLOCAL, INVALID_HANDLE_VALUE, LocalFree, WAIT_OBJECT_0,
+    CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HLOCAL, INVALID_HANDLE_VALUE,
+    LocalFree, WAIT_OBJECT_0,
 };
 use windows::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
 use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
@@ -133,6 +134,8 @@ impl NamedRing {
                 &mapping_name,
             )?
         };
+        // SAFETY: called immediately after CreateFileMappingW succeeds.
+        let mapping_existed = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
         // SAFETY: mapping is live and the requested view matches its complete size.
         let view = unsafe {
             MapViewOfFile(
@@ -149,11 +152,21 @@ impl NamedRing {
             return Err(Error::from_thread());
         }
         // SAFETY: the mapped view is writable, aligned, and exactly one ring long.
-        unsafe {
-            view.Value
-                .cast::<SharedReportRing>()
-                .write(SharedReportRing::new(generation))
-        };
+        let ring = unsafe { &mut *view.Value.cast::<SharedReportRing>() };
+        if mapping_existed {
+            if ring.reopen(generation).is_err() {
+                unsafe {
+                    let _ = UnmapViewOfFile(view);
+                    let _ = CloseHandle(mapping);
+                }
+                return Err(Error::new(
+                    windows::core::HRESULT(0x8007_0057u32 as i32),
+                    "existing virtual input ring is invalid",
+                ));
+            }
+        } else {
+            *ring = SharedReportRing::new(generation);
+        }
         // SAFETY: name and security attributes remain live for the call.
         let event = match unsafe { CreateEventW(Some(security), false, false, &event_name) } {
             Ok(event) => event,

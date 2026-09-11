@@ -3,27 +3,28 @@ use core::mem::size_of;
 use rand::{RngCore, rngs::OsRng};
 use std::path::Path;
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
-    DI_REMOVEDEVICE_GLOBAL, DICD_GENERATE_ID, DICS_FLAG_GLOBAL, DIF_REGISTERDEVICE, DIF_REMOVE,
-    DIREG_DEV, GUID_DEVCLASS_HIDCLASS, HDEVINFO, INSTALLFLAG_FORCE, SP_CLASSINSTALL_HEADER,
-    SP_DEVINFO_DATA, SP_REMOVEDEVICE_PARAMS, SPDRP_HARDWAREID, SetupDiCallClassInstaller,
-    SetupDiCreateDevRegKeyW, SetupDiCreateDeviceInfoList, SetupDiCreateDeviceInfoW,
-    SetupDiDestroyDeviceInfoList, SetupDiGetDeviceInstanceIdW, SetupDiSetClassInstallParamsW,
+    DICD_GENERATE_ID, DICS_FLAG_GLOBAL, DIF_REGISTERDEVICE, DIREG_DEV, DiUninstallDevice,
+    GUID_DEVCLASS_HIDCLASS, HDEVINFO, INSTALLFLAG_FORCE, SETUP_DI_GET_CLASS_DEVS_FLAGS,
+    SP_DEVINFO_DATA, SPDRP_HARDWAREID, SetupDiCallClassInstaller, SetupDiCreateDevRegKeyW,
+    SetupDiCreateDeviceInfoList, SetupDiCreateDeviceInfoW, SetupDiDestroyDeviceInfoList,
+    SetupDiEnumDeviceInfo, SetupDiGetClassDevsW, SetupDiGetDeviceInstanceIdW, SetupDiOpenDevRegKey,
     SetupDiSetDeviceRegistryPropertyW, UpdateDriverForPlugAndPlayDevicesW,
 };
+use windows::Win32::Foundation::{ERROR_NO_MORE_ITEMS, HWND};
 use windows::Win32::System::Registry::{
-    HKEY_LOCAL_MACHINE, KEY_SET_VALUE, REG_DWORD, REG_OPTION_NON_VOLATILE, REG_SZ, RegCloseKey,
-    RegCreateKeyExW, RegDeleteTreeW, RegSetValueExW,
+    HKEY, HKEY_LOCAL_MACHINE, KEY_READ, KEY_SET_VALUE, REG_DWORD, REG_OPTION_NON_VOLATILE, REG_SZ,
+    RegCloseKey, RegCreateKeyExW, RegDeleteTreeW, RegQueryValueExW, RegSetValueExW,
 };
 use windows::core::{Error, HSTRING, PCWSTR};
 
 const HARDWARE_ID: &str = "ROOT\\RUSTCONSOLEINPUT";
+const INSTANCE_ID_PREFIX: &str = "ROOT\\RUST_CONSOLE_VIRTUAL_INPUT_";
 const CONFIG_ROOT: &str = "SOFTWARE\\RustConsole\\VirtualInput";
 
 pub struct VirtualInputOwner {
     token: String,
     generation: u64,
-    mouse: Option<PnpDevice>,
-    keyboard: Option<PnpDevice>,
+    instance_ids: [String; 2],
     sink: WindowsRingPair,
 }
 
@@ -32,70 +33,31 @@ impl VirtualInputOwner {
         if generation == 0 {
             return Err(invalid_argument("input generation must be nonzero"));
         }
-        let token = random_token();
+        let existing = existing_devices()?;
+        let token = existing
+            .as_ref()
+            .map_or_else(random_token, |devices| devices.token.clone());
         let sink = WindowsRingPair::create(&token, generation)?;
         write_config(0, 1, &token)?;
         if let Err(error) = write_config(1, 2, &token) {
             delete_config(0);
             return Err(error);
         }
-        let mouse = match PnpDevice::create(0, &token) {
-            Ok(device) => device,
-            Err(error) => {
-                delete_config(0);
-                delete_config(1);
-                return Err(error);
-            }
+        let Some(existing) = existing else {
+            return create_devices(inf_path, generation, token, sink);
         };
-        let keyboard = match PnpDevice::create(1, &token) {
-            Ok(device) => device,
-            Err(error) => {
-                drop(mouse);
-                delete_config(0);
-                delete_config(1);
-                return Err(error);
+        let mut instance_ids = existing.instance_ids;
+        for (index, instance_id) in instance_ids.iter_mut().enumerate() {
+            if instance_id.is_none() {
+                let device = PnpDevice::create(index as u32, &token)?;
+                *instance_id = Some(device.instance_id.clone());
             }
-        };
-        let inf = inf_path.canonicalize().map_err(|error| {
-            Error::new(
-                windows::core::HRESULT(0x8007_0002u32 as i32),
-                error.to_string(),
-            )
-        })?;
-        let inf = HSTRING::from(inf.as_os_str().to_string_lossy().as_ref());
-        let hardware_id = HSTRING::from(HARDWARE_ID);
-        let mut reboot = false.into();
-        // SAFETY: both strings remain live and reboot points to valid output storage.
-        if let Err(error) = unsafe {
-            UpdateDriverForPlugAndPlayDevicesW(
-                None,
-                &hardware_id,
-                &inf,
-                INSTALLFLAG_FORCE,
-                Some(&mut reboot),
-            )
-        } {
-            drop(keyboard);
-            drop(mouse);
-            delete_config(0);
-            delete_config(1);
-            return Err(error);
         }
-        if reboot.as_bool() {
-            drop(keyboard);
-            drop(mouse);
-            delete_config(0);
-            delete_config(1);
-            return Err(Error::new(
-                windows::core::HRESULT(0x8007_0BC2u32 as i32),
-                "virtual input driver requested a reboot",
-            ));
-        }
+        update_driver(inf_path)?;
         Ok(Self {
             token,
             generation,
-            mouse: Some(mouse),
-            keyboard: Some(keyboard),
+            instance_ids: instance_ids.map(Option::unwrap),
             sink,
         })
     }
@@ -117,28 +79,128 @@ impl VirtualInputOwner {
     }
 
     pub fn instance_ids(&self) -> (&str, &str) {
-        (
-            &self
-                .mouse
-                .as_ref()
-                .expect("mouse owner missing")
-                .instance_id,
-            &self
-                .keyboard
-                .as_ref()
-                .expect("keyboard owner missing")
-                .instance_id,
-        )
+        (&self.instance_ids[0], &self.instance_ids[1])
     }
 }
 
-impl Drop for VirtualInputOwner {
-    fn drop(&mut self) {
-        drop(self.keyboard.take());
-        drop(self.mouse.take());
-        delete_config(1);
+pub fn remove_persistent_devices() -> Result<(), Error> {
+    // SAFETY: the class GUID is static and no parent window or enumerator is used.
+    let set = unsafe {
+        SetupDiGetClassDevsW(
+            Some(&GUID_DEVCLASS_HIDCLASS),
+            PCWSTR::null(),
+            None,
+            SETUP_DI_GET_CLASS_DEVS_FLAGS(0),
+        )?
+    };
+    let result = (|| {
+        let mut devices = Vec::new();
+        let mut index = 0;
+        loop {
+            let mut data = SP_DEVINFO_DATA {
+                cbSize: size_of::<SP_DEVINFO_DATA>() as u32,
+                ..SP_DEVINFO_DATA::default()
+            };
+            // SAFETY: set is live and data is valid output storage.
+            match unsafe { SetupDiEnumDeviceInfo(set, index, &mut data) } {
+                Ok(()) => {}
+                Err(error) if error.code() == ERROR_NO_MORE_ITEMS.to_hresult() => break,
+                Err(error) => return Err(error),
+            }
+            if owned_instance_id(&read_instance_id(set, &data)?) {
+                devices.push(data);
+            }
+            index += 1;
+        }
+        for data in &devices {
+            let mut reboot = false.into();
+            // SAFETY: set and each device record remain live until the set is destroyed.
+            unsafe { DiUninstallDevice(HWND::default(), set, data, 0, Some(&mut reboot))? };
+            if reboot.as_bool() {
+                return Err(Error::new(
+                    windows::core::HRESULT(0x8007_0BC2u32 as i32),
+                    "removing the virtual input devices requested a reboot",
+                ));
+            }
+        }
+        Ok(())
+    })();
+    // SAFETY: set was created above and is destroyed exactly once.
+    let destroy = unsafe { SetupDiDestroyDeviceInfoList(set) };
+    result.and_then(|()| destroy).map(|()| {
         delete_config(0);
+        delete_config(1);
+    })
+}
+
+fn create_devices(
+    inf_path: &Path,
+    generation: u64,
+    token: String,
+    sink: WindowsRingPair,
+) -> Result<VirtualInputOwner, Error> {
+    let mouse = match PnpDevice::create(0, &token) {
+        Ok(device) => device,
+        Err(error) => {
+            delete_config(0);
+            delete_config(1);
+            return Err(error);
+        }
+    };
+    let keyboard = match PnpDevice::create(1, &token) {
+        Ok(device) => device,
+        Err(error) => {
+            delete_config(0);
+            delete_config(1);
+            return Err(error);
+        }
+    };
+    if let Err(error) = update_driver(inf_path) {
+        delete_config(0);
+        delete_config(1);
+        return Err(error);
     }
+    let instance_ids = [mouse.instance_id.clone(), keyboard.instance_id.clone()];
+    Ok(VirtualInputOwner {
+        token,
+        generation,
+        instance_ids,
+        sink,
+    })
+}
+
+fn update_driver(inf_path: &Path) -> Result<(), Error> {
+    let inf = inf_path.canonicalize().map_err(|error| {
+        Error::new(
+            windows::core::HRESULT(0x8007_0002u32 as i32),
+            error.to_string(),
+        )
+    })?;
+    let inf = HSTRING::from(inf.as_os_str().to_string_lossy().as_ref());
+    let hardware_id = HSTRING::from(HARDWARE_ID);
+    let mut reboot = false.into();
+    // SAFETY: both strings remain live and reboot points to valid output storage.
+    unsafe {
+        UpdateDriverForPlugAndPlayDevicesW(
+            None,
+            &hardware_id,
+            &inf,
+            INSTALLFLAG_FORCE,
+            Some(&mut reboot),
+        )?
+    };
+    if reboot.as_bool() {
+        return Err(Error::new(
+            windows::core::HRESULT(0x8007_0BC2u32 as i32),
+            "virtual input driver requested a reboot",
+        ));
+    }
+    Ok(())
+}
+
+struct ExistingDevices {
+    token: String,
+    instance_ids: [Option<String>; 2],
 }
 
 struct PnpDevice {
@@ -212,7 +274,7 @@ impl PnpDevice {
             instance_id: String::new(),
         };
         owner.write_hardware_config(index, token)?;
-        owner.instance_id = owner.read_instance_id()?;
+        owner.instance_id = read_instance_id(owner.set, &owner.data)?;
         Ok(owner)
     }
 
@@ -237,57 +299,179 @@ impl PnpDevice {
         }
         result
     }
-
-    fn read_instance_id(&self) -> Result<String, Error> {
-        let mut required = 0;
-        // SAFETY: first call queries required length only.
-        let _ =
-            unsafe { SetupDiGetDeviceInstanceIdW(self.set, &self.data, None, Some(&mut required)) };
-        if required < 2 || required > 1024 {
-            return Err(invalid_argument(
-                "invalid generated device instance ID length",
-            ));
-        }
-        let mut buffer = vec![0u16; required as usize];
-        // SAFETY: buffer has the exact queried capacity.
-        unsafe {
-            SetupDiGetDeviceInstanceIdW(
-                self.set,
-                &self.data,
-                Some(&mut buffer),
-                Some(&mut required),
-            )?
-        };
-        let end = buffer
-            .iter()
-            .position(|value| *value == 0)
-            .unwrap_or(buffer.len());
-        String::from_utf16(&buffer[..end]).map_err(|_| invalid_argument("invalid instance ID"))
-    }
 }
 
 impl Drop for PnpDevice {
     fn drop(&mut self) {
-        let params = SP_REMOVEDEVICE_PARAMS {
-            ClassInstallHeader: SP_CLASSINSTALL_HEADER {
-                cbSize: size_of::<SP_CLASSINSTALL_HEADER>() as u32,
-                InstallFunction: DIF_REMOVE,
-            },
-            Scope: DI_REMOVEDEVICE_GLOBAL,
-            HwProfile: 0,
-        };
-        // SAFETY: set/data remain live through both removal calls.
+        // SAFETY: set is live and destroyed exactly once. The registered device persists.
         unsafe {
-            let _ = SetupDiSetClassInstallParamsW(
-                self.set,
-                Some(&self.data),
-                Some(&params.ClassInstallHeader),
-                size_of::<SP_REMOVEDEVICE_PARAMS>() as u32,
-            );
-            let _ = SetupDiCallClassInstaller(DIF_REMOVE, self.set, Some(&self.data));
             let _ = SetupDiDestroyDeviceInfoList(self.set);
         }
     }
+}
+
+fn existing_devices() -> Result<Option<ExistingDevices>, Error> {
+    // SAFETY: the class GUID is static and no parent window or enumerator is used.
+    let set = unsafe {
+        SetupDiGetClassDevsW(
+            Some(&GUID_DEVCLASS_HIDCLASS),
+            PCWSTR::null(),
+            None,
+            SETUP_DI_GET_CLASS_DEVS_FLAGS(0),
+        )?
+    };
+    let result = (|| {
+        let mut records = Vec::new();
+        let mut index = 0;
+        loop {
+            let mut data = SP_DEVINFO_DATA {
+                cbSize: size_of::<SP_DEVINFO_DATA>() as u32,
+                ..SP_DEVINFO_DATA::default()
+            };
+            // SAFETY: set is live and data is valid output storage.
+            match unsafe { SetupDiEnumDeviceInfo(set, index, &mut data) } {
+                Ok(()) => {}
+                Err(error) if error.code() == ERROR_NO_MORE_ITEMS.to_hresult() => break,
+                Err(error) => return Err(error),
+            }
+            let instance_id = read_instance_id(set, &data)?;
+            if owned_instance_id(&instance_id) {
+                let (device_index, token) = read_hardware_config(set, &data)?;
+                records.push((device_index, token, instance_id));
+            }
+            index += 1;
+        }
+        select_existing_devices(records)
+    })();
+    // SAFETY: set was created above and is destroyed exactly once.
+    let destroy = unsafe { SetupDiDestroyDeviceInfoList(set) };
+    result.and_then(|devices| destroy.map(|()| devices))
+}
+
+fn select_existing_devices(
+    records: Vec<(u32, String, String)>,
+) -> Result<Option<ExistingDevices>, Error> {
+    if records.is_empty() {
+        return Ok(None);
+    }
+    let mut token = None::<String>;
+    let mut instance_ids = [None::<String>, None::<String>];
+    for (index, current_token, instance_id) in records {
+        let index = usize::try_from(index).map_err(|_| invalid_existing_devices())?;
+        let Some(slot) = instance_ids.get_mut(index) else {
+            return Err(invalid_existing_devices());
+        };
+        if slot.is_some() || token.as_ref().is_some_and(|token| token != &current_token) {
+            return Err(invalid_existing_devices());
+        }
+        token.get_or_insert_with(|| current_token.clone());
+        *slot = Some(instance_id);
+    }
+    match token {
+        Some(token) => Ok(Some(ExistingDevices {
+            token,
+            instance_ids,
+        })),
+        None => Err(invalid_existing_devices()),
+    }
+}
+
+fn read_hardware_config(set: HDEVINFO, data: &SP_DEVINFO_DATA) -> Result<(u32, String), Error> {
+    // SAFETY: set/data identify an enumerated device and request its hardware key read-only.
+    let key =
+        unsafe { SetupDiOpenDevRegKey(set, data, DICS_FLAG_GLOBAL.0, 0, DIREG_DEV, KEY_READ.0)? };
+    let result = read_dword(key, "DeviceIndex")
+        .and_then(|index| read_string(key, "InstanceToken").map(|token| (index, token)));
+    // SAFETY: key was opened successfully and is closed exactly once.
+    unsafe {
+        let _ = RegCloseKey(key);
+    }
+    result
+}
+
+fn read_dword(key: HKEY, name: &str) -> Result<u32, Error> {
+    let mut value_type = Default::default();
+    let mut value = 0_u32;
+    let mut size = size_of::<u32>() as u32;
+    // SAFETY: key is live and all output buffers match their supplied sizes.
+    unsafe {
+        RegQueryValueExW(
+            key,
+            &HSTRING::from(name),
+            None,
+            Some(&mut value_type),
+            Some((&mut value as *mut u32).cast()),
+            Some(&mut size),
+        )
+        .ok()?
+    };
+    if value_type != REG_DWORD || size != size_of::<u32>() as u32 {
+        return Err(invalid_existing_devices());
+    }
+    Ok(value)
+}
+
+fn read_string(key: HKEY, name: &str) -> Result<String, Error> {
+    let mut value_type = Default::default();
+    let mut value = [0_u16; 65];
+    let mut size = size_of_val(&value) as u32;
+    // SAFETY: key is live and all output buffers match their supplied sizes.
+    unsafe {
+        RegQueryValueExW(
+            key,
+            &HSTRING::from(name),
+            None,
+            Some(&mut value_type),
+            Some(value.as_mut_ptr().cast()),
+            Some(&mut size),
+        )
+        .ok()?
+    };
+    if value_type != REG_SZ || size < 2 || !size.is_multiple_of(2) {
+        return Err(invalid_existing_devices());
+    }
+    let length = size as usize / size_of::<u16>();
+    if length > value.len() || value[length - 1] != 0 {
+        return Err(invalid_existing_devices());
+    }
+    let value = String::from_utf16(&value[..length - 1]).map_err(|_| invalid_existing_devices())?;
+    if !(16..=64).contains(&value.len())
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        return Err(invalid_existing_devices());
+    }
+    Ok(value)
+}
+
+fn invalid_existing_devices() -> Error {
+    invalid_argument("existing Rust Console virtual input devices are incomplete or inconsistent")
+}
+
+fn read_instance_id(set: HDEVINFO, data: &SP_DEVINFO_DATA) -> Result<String, Error> {
+    let mut required = 0;
+    // SAFETY: first call queries required length only.
+    let _ = unsafe { SetupDiGetDeviceInstanceIdW(set, data, None, Some(&mut required)) };
+    if !(2..=1024).contains(&required) {
+        return Err(invalid_argument(
+            "invalid generated device instance ID length",
+        ));
+    }
+    let mut buffer = vec![0u16; required as usize];
+    // SAFETY: buffer has the exact queried capacity.
+    unsafe { SetupDiGetDeviceInstanceIdW(set, data, Some(&mut buffer), Some(&mut required))? };
+    let end = buffer
+        .iter()
+        .position(|value| *value == 0)
+        .unwrap_or(buffer.len());
+    String::from_utf16(&buffer[..end]).map_err(|_| invalid_argument("invalid instance ID"))
+}
+
+fn owned_instance_id(instance_id: &str) -> bool {
+    instance_id
+        .get(..INSTANCE_ID_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(INSTANCE_ID_PREFIX))
 }
 
 fn write_config(index: u32, kind: u32, token: &str) -> Result<(), Error> {
@@ -373,8 +557,55 @@ fn as_bytes(values: &[u16]) -> &[u8] {
 }
 
 fn invalid_argument(message: &str) -> Error {
-    Error::new(
-        windows::core::HRESULT(0x8007_0057u32 as i32),
-        message.to_owned(),
-    )
+    Error::new(windows::core::HRESULT(0x8007_0057u32 as i32), message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn owned_instance_filter_excludes_other_root_hid_devices() {
+        assert!(owned_instance_id(
+            "ROOT\\RUST_CONSOLE_VIRTUAL_INPUT_1\\0010"
+        ));
+        assert!(owned_instance_id(
+            "root\\rust_console_virtual_input_0\\0000"
+        ));
+        assert!(!owned_instance_id("ROOT\\RUSTCONSOLEINPUT\\0000"));
+        assert!(!owned_instance_id(
+            "HID\\RUST_CONSOLE_VIRTUAL_INPUT_1\\0000"
+        ));
+    }
+
+    #[test]
+    fn existing_devices_require_one_consistent_mouse_and_keyboard() {
+        let selected = select_existing_devices(vec![
+            (1, "0123456789abcdef".into(), "keyboard".into()),
+            (0, "0123456789abcdef".into(), "mouse".into()),
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(selected.token, "0123456789abcdef");
+        assert_eq!(
+            selected.instance_ids,
+            [Some("mouse".into()), Some("keyboard".into())]
+        );
+
+        assert!(select_existing_devices(Vec::new()).unwrap().is_none());
+        assert_eq!(
+            select_existing_devices(vec![(0, "0123456789abcdef".into(), "mouse".into())])
+                .unwrap()
+                .unwrap()
+                .instance_ids,
+            [Some("mouse".into()), None]
+        );
+        assert!(
+            select_existing_devices(vec![
+                (0, "0123456789abcdef".into(), "mouse".into()),
+                (1, "fedcba9876543210".into(), "keyboard".into()),
+            ])
+            .is_err()
+        );
+    }
 }

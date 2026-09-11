@@ -19,7 +19,7 @@ pub use ipc::{
 #[cfg(windows)]
 pub use windows_ipc::{WindowsRingError, WindowsRingPair};
 #[cfg(windows)]
-pub use windows_owner::VirtualInputOwner;
+pub use windows_owner::{VirtualInputOwner, remove_persistent_devices};
 
 pub const TEST_VENDOR_ID: u16 = 0x1209;
 pub const TEST_MOUSE_PRODUCT_ID: u16 = 0x000e;

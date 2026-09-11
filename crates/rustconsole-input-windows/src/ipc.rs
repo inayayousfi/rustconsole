@@ -83,6 +83,15 @@ impl SharedReportRing {
         }
     }
 
+    pub fn reopen(&self, generation: u64) -> Result<(), RingError> {
+        self.header.validate()?;
+        if generation == 0 {
+            return Err(RingError::InvalidHeader);
+        }
+        self.header.generation.store(generation, Ordering::Release);
+        Ok(())
+    }
+
     pub fn publish(&mut self, report: &[u8]) -> Result<u64, RingError> {
         self.header.validate()?;
         if report.is_empty() || report.len() > REPORT_CAPACITY as usize {
@@ -232,6 +241,19 @@ mod tests {
         assert_eq!(header.validate(), Ok(()));
         header.slot_count -= 1;
         assert_eq!(header.validate(), Err(RingError::InvalidHeader));
+    }
+
+    #[test]
+    fn reopening_changes_only_the_generation() {
+        let mut ring = SharedReportRing::new(7);
+        ring.publish(&[1, 2, 3]).unwrap();
+
+        ring.reopen(8).unwrap();
+
+        assert_eq!(ring.header.generation.load(Ordering::Acquire), 8);
+        assert_eq!(ring.header.producer_sequence.load(Ordering::Acquire), 1);
+        assert_eq!(ring.slots[0].committed_sequence.load(Ordering::Acquire), 1);
+        assert_eq!(ring.reopen(0), Err(RingError::InvalidHeader));
     }
 
     #[test]

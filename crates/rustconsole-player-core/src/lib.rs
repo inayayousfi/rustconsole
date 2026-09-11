@@ -583,33 +583,52 @@ where
         on_authenticated(authenticated.host_identity)?;
         on_progress(StreamProgress::NegotiatingVideo);
         let connection = authenticated.connection;
-        let (mut send, mut receive) = connection.open_bi().await?;
-        rustconsole_session::quic::write_envelope(
-            &mut send,
-            Envelope {
-                body: Some(envelope::Body::Av1CapabilityOffer(Av1CapabilityOffer {
-                    dedicated_input_stream: true,
-                    host_pointer_release: true,
-                    full_diagnostics,
-                    audio_transport: Some(rustconsole_protocol::wire::AudioConfiguration::INITIAL),
-                    encoder_capabilities: Vec::new(),
-                    decoder_capabilities: decoder_capabilities
-                        .iter()
-                        .copied()
-                        .map(wire_capability)
-                        .collect(),
-                    viewer_settings: Some(wire_settings(&settings)),
-                })),
-            },
-        )
-        .await?;
+        macro_rules! session_try {
+            ($stage:literal, $result:expr) => {
+                match $result {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let error = format!(concat!($stage, ": {}"), error);
+                        stream_receiver::close_with_stream_error(&connection, &error);
+                        return Err(error.into());
+                    }
+                }
+            };
+        }
+        let (mut send, mut receive) =
+            session_try!("opening AV1 negotiation stream", connection.open_bi().await);
+        session_try!(
+            "sending player AV1 capability offer",
+            rustconsole_session::quic::write_envelope(
+                &mut send,
+                Envelope {
+                    body: Some(envelope::Body::Av1CapabilityOffer(Av1CapabilityOffer {
+                        dedicated_input_stream: true,
+                        host_pointer_release: true,
+                        full_diagnostics,
+                        audio_transport: Some(
+                            rustconsole_protocol::wire::AudioConfiguration::INITIAL
+                        ),
+                        encoder_capabilities: Vec::new(),
+                        decoder_capabilities: decoder_capabilities
+                            .iter()
+                            .copied()
+                            .map(wire_capability)
+                            .collect(),
+                        viewer_settings: Some(wire_settings(&settings)),
+                    })),
+                },
+            )
+            .await
+        );
         let audio_transport;
         let dedicated_input_stream;
         let host_pointer_release;
-        let host_capabilities = match rustconsole_session::quic::read_envelope(&mut receive)
-            .await?
-            .body
-        {
+        let host_offer = session_try!(
+            "reading host AV1 capability offer",
+            rustconsole_session::quic::read_envelope(&mut receive).await
+        );
+        let host_capabilities = match host_offer.body {
             Some(envelope::Body::Av1CapabilityOffer(offer))
                 if offer.decoder_capabilities.is_empty() && offer.viewer_settings.is_none() =>
             {
@@ -618,34 +637,51 @@ where
                 audio_transport = offer
                     .audio_transport
                     .filter(|configuration| configuration.supported());
-                offer
-                    .encoder_capabilities
-                    .iter()
-                    .map(domain_capability)
-                    .collect::<Result<Vec<_>, _>>()?
+                session_try!(
+                    "parsing host AV1 capabilities",
+                    offer
+                        .encoder_capabilities
+                        .iter()
+                        .map(domain_capability)
+                        .collect::<Result<Vec<_>, _>>()
+                )
             }
-            _ => return Err("host sent an invalid AV1 capability offer".into()),
+            _ => {
+                let error = "host sent an invalid AV1 capability offer";
+                stream_receiver::close_with_stream_error(&connection, error);
+                return Err(error.into());
+            }
         };
-        let selected =
-            negotiate_av1_configuration(&host_capabilities, &decoder_capabilities, &settings)?;
+        let selected = session_try!(
+            "selecting AV1 configuration",
+            negotiate_av1_configuration(&host_capabilities, &decoder_capabilities, &settings)
+        );
         let mut selected_wire = wire_selected(selected);
         selected_wire.audio_transport = audio_transport;
         selected_wire.full_diagnostics = full_diagnostics;
         selected_wire.host_pointer_release = host_pointer_release;
         selected_wire.dedicated_input_stream = dedicated_input_stream;
-        rustconsole_session::quic::write_envelope(
-            &mut send,
-            Envelope {
-                body: Some(envelope::Body::SelectedAv1Configuration(selected_wire)),
-            },
-        )
-        .await?;
-        match rustconsole_session::quic::read_envelope(&mut receive)
-            .await?
-            .body
-        {
+        session_try!(
+            "sending player AV1 selection",
+            rustconsole_session::quic::write_envelope(
+                &mut send,
+                Envelope {
+                    body: Some(envelope::Body::SelectedAv1Configuration(selected_wire)),
+                },
+            )
+            .await
+        );
+        let host_selection = session_try!(
+            "reading host AV1 selection",
+            rustconsole_session::quic::read_envelope(&mut receive).await
+        );
+        match host_selection.body {
             Some(envelope::Body::SelectedAv1Configuration(peer)) if peer == selected_wire => {}
-            _ => return Err("host selected a different AV1 configuration".into()),
+            _ => {
+                let error = "host selected a different AV1 configuration";
+                stream_receiver::close_with_stream_error(&connection, error);
+                return Err(error.into());
+            }
         }
         on_progress(StreamProgress::PointerCaptureAvailable(
             host_pointer_release,
@@ -653,41 +689,52 @@ where
         on_progress(StreamProgress::VideoNegotiated(selected));
         on_progress(StreamProgress::WaitingForVideoPackets);
         let input_stream = if dedicated_input_stream {
-            let mut input = connection.open_uni().await?;
-            input
-                .write_all(&rustconsole_protocol::input::STREAM_PREAMBLE)
-                .await?;
+            let mut input = session_try!(
+                "opening dedicated input stream",
+                connection.open_uni().await
+            );
+            session_try!(
+                "sending dedicated input stream preamble",
+                input
+                    .write_all(&rustconsole_protocol::input::STREAM_PREAMBLE)
+                    .await
+            );
             Some(input)
         } else {
             None
         };
         let diagnostic_stream = if full_diagnostics {
-            Some(
+            let stream = session_try!(
+                "waiting for host diagnostic stream",
                 tokio::time::timeout(Duration::from_secs(10), connection.accept_uni())
                     .await
-                    .map_err(|_| "timed out waiting for diagnostic stream")??,
-            )
+                    .map_err(|_| "timed out")
+            );
+            Some(session_try!("accepting host diagnostic stream", stream))
         } else {
             None
         };
 
-        let end = stream_receiver::receive_stream(stream_receiver::ReceiveStreamParameters {
-            connection,
-            control: (send, receive),
-            input_stream,
-            fps: selected.frames_per_second,
-            audio_enabled: audio_transport.is_some(),
-            host_pointer_release,
-            diagnostic_stream,
-            should_stop,
-            next_input,
-            progress: on_progress,
-            consumers: StreamConsumers {
-                audio: consume_audio,
-                video: consume_video,
-            },
-        })
-        .await?;
+        let end = session_try!(
+            "receiving stream",
+            stream_receiver::receive_stream(stream_receiver::ReceiveStreamParameters {
+                connection: connection.clone(),
+                control: (send, receive),
+                input_stream,
+                fps: selected.frames_per_second,
+                audio_enabled: audio_transport.is_some(),
+                host_pointer_release,
+                diagnostic_stream,
+                should_stop,
+                next_input,
+                progress: on_progress,
+                consumers: StreamConsumers {
+                    audio: consume_audio,
+                    video: consume_video,
+                },
+            })
+            .await
+        );
         Ok(StreamHostResult { identity, end })
     })
 }

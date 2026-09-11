@@ -1,8 +1,8 @@
 use rand::{RngCore, rngs::OsRng};
+use std::ffi::c_void;
 use std::fs::File;
 use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::path::Path;
-use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{
@@ -19,17 +19,16 @@ use windows::Win32::Security::{
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_SHARE_MODE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
 };
+use windows::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
 use windows::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeClientProcessId, PIPE_NOWAIT,
     PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES,
     PIPE_WAIT, SetNamedPipeHandleState,
 };
-use windows::Win32::System::RemoteDesktop::{
-    ProcessIdToSessionId, WTSDomainName, WTSFreeMemory, WTSQuerySessionInformationW, WTSUserName,
-};
+use windows::Win32::System::RemoteDesktop::{ProcessIdToSessionId, WTSQueryUserToken};
 use windows::Win32::System::Threading::{
-    OpenProcess, OpenProcessToken, PROCESS_DUP_HANDLE, PROCESS_QUERY_LIMITED_INFORMATION,
-    PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+    CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW, OpenProcessToken,
+    PROCESS_INFORMATION, STARTUPINFOW,
 };
 use windows::core::{PCWSTR, PWSTR};
 
@@ -66,10 +65,9 @@ pub fn launch_helper(
     let pipe_name = format!(r"\\.\pipe\RC.{suffix}.w");
     let security = PipeSecurity::for_authenticated_user()?;
     let pipe = NamedPipeServer::new(&pipe_name, security.attributes())?;
-    let account = session_account(session_id)?;
-    let task_name = format!("RustConsoleWgcHelper-{suffix}");
+    let user_token = user_token(session_id)?;
     let action = format!("\"{}\" \"{pipe_name}\" {token_hex}", executable.display());
-    let mut task = create_and_run_task(&task_name, &account, &action)?;
+    let mut launched = launch_as_user(executable, user_token.get(), &action)?;
     let channel = pipe.connect()?;
     let mut process_id = 0;
     // SAFETY: channel is a connected local named-pipe server endpoint.
@@ -77,27 +75,16 @@ pub fn launch_helper(
     if process_id == 0 {
         return Err("WGC helper returned an invalid process id".into());
     }
-    // SAFETY: process_id came from a connected local named-pipe endpoint.
-    let process = unsafe {
-        OpenProcess(
-            PROCESS_DUP_HANDLE
-                | PROCESS_QUERY_LIMITED_INFORMATION
-                | PROCESS_SYNCHRONIZE
-                | PROCESS_TERMINATE,
-            false,
-            process_id,
-        )?
-    };
+    if process_id != launched.process_id {
+        return Err("a different process connected to the WGC helper pipe".into());
+    }
     let mut actual_session_id = u32::MAX;
     // SAFETY: process_id identifies the connected helper and output storage is valid.
     unsafe { ProcessIdToSessionId(process_id, &mut actual_session_id)? };
     if actual_session_id != session_id {
-        // SAFETY: process was opened with PROCESS_TERMINATE.
-        let _ = unsafe { windows::Win32::System::Threading::TerminateProcess(process, 1) };
-        let _ = unsafe { CloseHandle(process) };
         return Err("WGC helper is not running in the active console session".into());
     }
-    task.delete()?;
+    let process = launched.take_process();
     Ok(InteractiveHelperConnection {
         channel,
         process,
@@ -119,13 +106,11 @@ pub fn launch_session_controls(
     let expected_sid = token_sid(user_token)?;
     let security = PipeSecurity::new(&expected_sid)?;
     let pipe = NamedPipeServer::new(&pipe_name, security.attributes())?;
-    let account = session_account(session_id)?;
-    let task_name = format!("RustConsoleSessionControls-{suffix}");
     let action = format!(
         "\"{}\" session-controls \"{pipe_name}\" {token_hex}",
         executable.display()
     );
-    let mut task = create_and_run_task(&task_name, &account, &action)?;
+    let mut launched = launch_as_user(executable, user_token, &action)?;
     let channel = pipe.connect()?;
     let mut process_id = 0;
     // SAFETY: channel is a connected local named-pipe server endpoint.
@@ -133,21 +118,14 @@ pub fn launch_session_controls(
     if process_id == 0 {
         return Err("session controls returned an invalid process id".into());
     }
-    // SAFETY: process_id came from the connected local named pipe.
-    let process = unsafe {
-        OpenProcess(
-            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE | PROCESS_TERMINATE,
-            false,
-            process_id,
-        )?
-    };
+    if process_id != launched.process_id {
+        return Err("a different process connected to the session controls pipe".into());
+    }
+    let process = launched.process();
     let mut actual_session_id = u32::MAX;
     // SAFETY: output storage is valid.
     unsafe { ProcessIdToSessionId(process_id, &mut actual_session_id)? };
     if actual_session_id != session_id {
-        // SAFETY: process was opened with terminate rights.
-        let _ = unsafe { windows::Win32::System::Threading::TerminateProcess(process, 1) };
-        let _ = unsafe { CloseHandle(process) };
         return Err("session controls are not running in the active console session".into());
     }
     let mut process_token = HANDLE::default();
@@ -156,11 +134,9 @@ pub fn launch_session_controls(
     let actual_sid = token_sid(process_token);
     let _ = unsafe { CloseHandle(process_token) };
     if actual_sid? != expected_sid {
-        let _ = unsafe { windows::Win32::System::Threading::TerminateProcess(process, 1) };
-        let _ = unsafe { CloseHandle(process) };
         return Err("session controls SID does not match the active console user".into());
     }
-    task.delete()?;
+    let process = launched.take_process();
     Ok(InteractiveHelperConnection {
         channel,
         process,
@@ -193,13 +169,11 @@ pub fn launch(
     let control = NamedPipeServer::new(&control_name, security.attributes())?;
     let audio = NamedPipeServer::new(&audio_name, security.attributes())?;
 
-    let account = session_account(session_id)?;
-    let task_name = format!("RustConsoleMediaWorker-{suffix}");
     let action = format!(
         "\"{}\" media-worker-named \"{control_name}\" \"{audio_name}\" {token_hex}",
         executable.display()
     );
-    let mut task = create_and_run_task(&task_name, &account, &action)?;
+    let mut launched = launch_as_user(executable, user_token, &action)?;
 
     let control = control.connect()?;
     let audio = audio.connect()?;
@@ -213,14 +187,16 @@ pub fn launch(
     if process_id == 0 || audio_process_id != process_id {
         return Err("interactive worker connected pipes from different processes".into());
     }
-    // SAFETY: process_id came from a connected local named-pipe endpoint.
-    let process = unsafe {
-        OpenProcess(
-            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE | PROCESS_TERMINATE,
-            false,
-            process_id,
-        )?
-    };
+    if process_id != launched.process_id {
+        return Err("a different process connected to the interactive worker pipes".into());
+    }
+    let process = launched.process();
+    let mut actual_session_id = u32::MAX;
+    // SAFETY: process_id identifies the connected worker and output storage is valid.
+    unsafe { ProcessIdToSessionId(process_id, &mut actual_session_id)? };
+    if actual_session_id != session_id {
+        return Err("interactive worker is not running in the active console session".into());
+    }
     let mut process_token = HANDLE::default();
     // SAFETY: process is open and process_token is valid output storage.
     unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut process_token)? };
@@ -228,14 +204,10 @@ pub fn launch(
     // SAFETY: OpenProcessToken transferred ownership of this handle.
     let _ = unsafe { CloseHandle(process_token) };
     if actual_sid? != expected_sid {
-        // SAFETY: the process was opened with PROCESS_TERMINATE.
-        let _ = unsafe { windows::Win32::System::Threading::TerminateProcess(process, 1) };
-        // SAFETY: this function has not transferred process ownership yet.
-        let _ = unsafe { CloseHandle(process) };
         return Err("interactive worker SID does not match the active console user".into());
     }
     let events = control.try_clone()?;
-    task.delete()?;
+    let process = launched.take_process();
     Ok(InteractiveConnection {
         command: control,
         events,
@@ -439,100 +411,108 @@ fn token_sid(token: HANDLE) -> Result<String, Box<dyn std::error::Error>> {
     }
 }
 
-fn session_account(session_id: u32) -> Result<String, Box<dyn std::error::Error>> {
-    let domain = session_string(session_id, WTSDomainName)?;
-    let user = session_string(session_id, WTSUserName)?;
-    if user.is_empty() {
-        return Err("active console session has no user name".into());
-    }
-    Ok(if domain.is_empty() {
-        user
-    } else {
-        format!("{domain}\\{user}")
-    })
-}
+struct OwnedHandle(HANDLE);
 
-fn session_string(
-    session_id: u32,
-    class: windows::Win32::System::RemoteDesktop::WTS_INFO_CLASS,
-) -> Result<String, Box<dyn std::error::Error>> {
-    let mut value = PWSTR::null();
-    let mut bytes = 0;
-    // SAFETY: output storage is valid and null server means local computer.
-    unsafe { WTSQuerySessionInformationW(None, session_id, class, &mut value, &mut bytes)? };
-    let result = if value.is_null() || bytes < 2 {
-        String::new()
-    } else {
-        // SAFETY: WTS returned a terminated string in its allocated buffer.
-        unsafe { value.to_string()? }
-    };
-    // SAFETY: WTS allocated this successful query buffer.
-    unsafe { WTSFreeMemory(value.0.cast()) };
-    Ok(result)
-}
-
-fn create_and_run_task(
-    task_name: &str,
-    account: &str,
-    action: &str,
-) -> Result<TaskGuard, Box<dyn std::error::Error>> {
-    let output = Command::new("schtasks.exe")
-        .args([
-            "/Create", "/TN", task_name, "/TR", action, "/SC", "ONCE", "/ST", "00:00", "/RU",
-            account, "/IT", "/RL", "LIMITED", "/F",
-        ])
-        .output()?;
-    if !output.status.success() {
-        return Err(format!(
-            "create interactive worker task failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )
-        .into());
-    }
-    let task = TaskGuard(Some(task_name.to_owned()));
-    let output = Command::new("schtasks.exe")
-        .args(["/Run", "/TN", task_name])
-        .output()?;
-    if !output.status.success() {
-        return Err(format!(
-            "run interactive worker task failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )
-        .into());
-    }
-    Ok(task)
-}
-
-struct TaskGuard(Option<String>);
-
-impl TaskGuard {
-    fn delete(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let Some(name) = self.0.as_deref() else {
-            return Ok(());
-        };
-        let output = Command::new("schtasks.exe")
-            .args(["/Delete", "/TN", name, "/F"])
-            .output()?;
-        if !output.status.success() {
-            return Err(format!(
-                "delete interactive worker task failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            )
-            .into());
-        }
-        self.0 = None;
-        Ok(())
+impl OwnedHandle {
+    fn get(&self) -> HANDLE {
+        self.0
     }
 }
 
-impl Drop for TaskGuard {
+impl Drop for OwnedHandle {
     fn drop(&mut self) {
-        if let Some(name) = self.0.as_deref() {
-            let _ = Command::new("schtasks.exe")
-                .args(["/Delete", "/TN", name, "/F"])
-                .output();
+        // SAFETY: this guard owns the handle.
+        let _ = unsafe { CloseHandle(self.0) };
+    }
+}
+
+fn user_token(session_id: u32) -> Result<OwnedHandle, Box<dyn std::error::Error>> {
+    let mut token = HANDLE::default();
+    // SAFETY: token is valid output storage.
+    unsafe { WTSQueryUserToken(session_id, &mut token)? };
+    Ok(OwnedHandle(token))
+}
+
+struct EnvironmentBlock(*mut c_void);
+
+impl Drop for EnvironmentBlock {
+    fn drop(&mut self) {
+        // SAFETY: CreateEnvironmentBlock allocated this block.
+        let _ = unsafe { DestroyEnvironmentBlock(self.0) };
+    }
+}
+
+struct LaunchedProcess {
+    process: Option<HANDLE>,
+    process_id: u32,
+}
+
+impl LaunchedProcess {
+    fn process(&self) -> HANDLE {
+        self.process.expect("launched process handle missing")
+    }
+
+    fn take_process(&mut self) -> HANDLE {
+        self.process
+            .take()
+            .expect("launched process handle missing")
+    }
+}
+
+impl Drop for LaunchedProcess {
+    fn drop(&mut self) {
+        if let Some(process) = self.process.take() {
+            // SAFETY: the process remains owned until it is transferred to the connection.
+            let _ = unsafe { windows::Win32::System::Threading::TerminateProcess(process, 1) };
+            let _ = unsafe { CloseHandle(process) };
         }
     }
+}
+
+fn launch_as_user(
+    executable: &Path,
+    token: HANDLE,
+    action: &str,
+) -> Result<LaunchedProcess, Box<dyn std::error::Error>> {
+    let mut environment = std::ptr::null_mut();
+    // SAFETY: environment is valid output storage and token remains live.
+    unsafe { CreateEnvironmentBlock(&mut environment, Some(token), false)? };
+    let environment = EnvironmentBlock(environment);
+    let executable_wide = wide(executable.as_os_str().to_string_lossy().as_ref());
+    let mut command_line = wide(action);
+    let current_directory = executable
+        .parent()
+        .ok_or("interactive executable has no parent directory")?;
+    let current_directory = wide(current_directory.as_os_str().to_string_lossy().as_ref());
+    let mut desktop = wide("winsta0\\default");
+    let startup = STARTUPINFOW {
+        cb: u32::try_from(std::mem::size_of::<STARTUPINFOW>())?,
+        lpDesktop: PWSTR(desktop.as_mut_ptr()),
+        ..Default::default()
+    };
+    let mut process = PROCESS_INFORMATION::default();
+    // SAFETY: all strings, the environment block, startup data, and output remain live.
+    unsafe {
+        CreateProcessAsUserW(
+            Some(token),
+            PCWSTR(executable_wide.as_ptr()),
+            Some(PWSTR(command_line.as_mut_ptr())),
+            None,
+            None,
+            false,
+            CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
+            Some(environment.0.cast_const()),
+            PCWSTR(current_directory.as_ptr()),
+            &startup,
+            &mut process,
+        )?;
+    }
+    // SAFETY: the thread handle is not needed after process creation.
+    let _ = unsafe { CloseHandle(process.hThread) };
+    Ok(LaunchedProcess {
+        process: Some(process.hProcess),
+        process_id: process.dwProcessId,
+    })
 }
 
 fn hex(bytes: &[u8]) -> String {

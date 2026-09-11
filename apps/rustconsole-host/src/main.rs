@@ -1,7 +1,12 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use rustconsole_host_windows::firewall::FirewallScope;
 use rustconsole_host_windows::service::{ServiceCommand, execute_service_command};
+use std::fs;
+use std::path::Path;
 use std::process::ExitCode;
+
+const INSTALL_ERROR_REPORT: &str = r"C:\ProgramData\RustConsole\install-error.txt";
+const UNINSTALL_ERROR_REPORT: &str = r"C:\ProgramData\RustConsole\uninstall-error.txt";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -24,6 +29,8 @@ enum HostCommand {
     DisplayModeTransitionProof,
     OneFrameProof,
     Install,
+    #[command(hide = true)]
+    InstallElevated,
     InstallCaptureProof,
     InstallDesktopTransitionProof,
     InstallLoginTransitionProof,
@@ -50,6 +57,8 @@ enum HostCommand {
         connection_token: String,
     },
     Uninstall,
+    #[command(hide = true)]
+    UninstallElevated,
     Firewall {
         #[command(subcommand)]
         command: FirewallCommand,
@@ -83,6 +92,7 @@ fn service_command(command: Option<HostCommand>) -> ServiceCommand {
         }
         Some(HostCommand::OneFrameProof) => ServiceCommand::RunOneFrameProof,
         Some(HostCommand::Install) => ServiceCommand::Install,
+        Some(HostCommand::InstallElevated) => ServiceCommand::InstallElevated,
         Some(HostCommand::InstallCaptureProof) => ServiceCommand::InstallCaptureProof,
         Some(HostCommand::InstallDesktopTransitionProof) => {
             ServiceCommand::InstallDesktopTransitionProof
@@ -123,6 +133,7 @@ fn service_command(command: Option<HostCommand>) -> ServiceCommand {
             connection_token,
         },
         Some(HostCommand::Uninstall) => ServiceCommand::Uninstall,
+        Some(HostCommand::UninstallElevated) => ServiceCommand::UninstallElevated,
         Some(HostCommand::Firewall {
             command: FirewallCommand::Status,
         }) => ServiceCommand::FirewallStatus,
@@ -140,10 +151,25 @@ fn service_command(command: Option<HostCommand>) -> ServiceCommand {
 }
 
 fn main() -> ExitCode {
-    match execute_service_command(service_command(Cli::parse().command)) {
+    let command = service_command(Cli::parse().command);
+    let error_report = match command {
+        ServiceCommand::InstallElevated => Some(INSTALL_ERROR_REPORT),
+        ServiceCommand::UninstallElevated => Some(UNINSTALL_ERROR_REPORT),
+        _ => None,
+    };
+    if let Some(error_report) = error_report {
+        if let Some(parent) = Path::new(error_report).parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let _ = fs::remove_file(error_report);
+    }
+    match execute_service_command(command) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("rustconsole-host: {error}");
+            if let Some(error_report) = error_report {
+                let _ = fs::write(error_report, format!("{error}\n"));
+            }
             ExitCode::FAILURE
         }
     }
