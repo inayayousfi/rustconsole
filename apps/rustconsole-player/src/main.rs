@@ -1293,7 +1293,7 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
                                 latency_diagnostics.counter(name, value);
                             }
                             format!(
-                                "Receiving host packets\nFrame {}  {}/{} chunks  {:.1} KiB\nAssembly {:.1}/{:.1} ms\nComplete {}  Incomplete {}  Overflow {}\nEstimated capacity {:.2} Mbit/s\nTarget {:.2} / Maximum {:.0} Mbit/s",
+                                "Receiving host packets\nFrame {}  {}/{} chunks  {:.1} KiB\nAssembly {:.1}/{:.1} ms\nComplete {}  Incomplete {}  Overflow {}\nDelivered rate (1s avg) {:.2} Mbit/s\nEncoder target {:.2} / Configured maximum {:.0} Mbit/s",
                                 frame.sequence,
                                 frame.received_chunks,
                                 frame.expected_chunks,
@@ -1313,7 +1313,7 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
                             estimated_capacity_bits_per_second,
                         } => {
                             format!(
-                                "First frame assembled\nDecoding video\nEstimated capacity {:.2} Mbit/s\nTarget {:.2} / Maximum {:.0} Mbit/s",
+                                "First frame assembled\nDecoding video\nDelivered rate (1s avg) {:.2} Mbit/s\nEncoder target {:.2} / Configured maximum {:.0} Mbit/s",
                                 estimated_capacity_bits_per_second as f64 / 1_000_000.0,
                                 target_bitrate_bits_per_second as f64 / 1_000_000.0,
                                 launch.maximum_bitrate_bits_per_second as f64 / 1_000_000.0,
@@ -2547,7 +2547,7 @@ struct StreamOverlay {
     statistics: OverlayStatistics,
     maximum_megabits_per_second: f64,
     target_megabits_per_second: f64,
-    estimated_capacity_megabits_per_second: f64,
+    delivered_megabits_per_second: f64,
     completed_frames: u64,
     incomplete_frames: u64,
     input_round_trip: Option<Duration>,
@@ -2563,8 +2563,8 @@ impl StreamOverlay {
             audio_playback: AudioPlaybackSnapshot::default(),
             statistics: OverlayStatistics::default(),
             maximum_megabits_per_second: maximum_bitrate_bits_per_second as f64 / 1_000_000.0,
-            target_megabits_per_second: 1.0,
-            estimated_capacity_megabits_per_second: 1.0,
+            target_megabits_per_second: maximum_bitrate_bits_per_second as f64 / 1_000_000.0,
+            delivered_megabits_per_second: 0.0,
             completed_frames: 0,
             incomplete_frames: 0,
             input_round_trip: None,
@@ -2587,7 +2587,7 @@ impl StreamOverlay {
         self.incomplete_frames = sample.incomplete_frames;
         self.target_megabits_per_second =
             sample.target_bitrate_bits_per_second as f64 / 1_000_000.0;
-        self.estimated_capacity_megabits_per_second =
+        self.delivered_megabits_per_second =
             sample.estimated_capacity_bits_per_second as f64 / 1_000_000.0;
         let elapsed = self.interval_started.elapsed();
         if elapsed >= Duration::from_millis(500) {
@@ -2603,10 +2603,10 @@ impl StreamOverlay {
 
     fn text(&self, state: &str) -> String {
         let video = format!(
-            "{RENDERING_BACKEND_LABEL}\n{state}\nFPS {:5.1}\nActual bitrate {:5.2} Mbit/s\nEstimated capacity {:5.2} Mbit/s\nTarget bitrate {:5.2} Mbit/s\nMaximum bitrate {:.0} Mbit/s\nImage ping {:5.1} ms\nInput ping {}\nComplete {}  Incomplete {}\nLost {}  Late {}  Overflow {}",
+            "{RENDERING_BACKEND_LABEL}\n{state}\nFPS {:5.1}\nEncoded rate (0.5s) {:5.2} Mbit/s\nDelivered rate (1s avg) {:5.2} Mbit/s\nEncoder target {:5.2} Mbit/s\nConfigured maximum {:.0} Mbit/s\nImage ping {:5.1} ms\nInput ping {}\nComplete {}  Incomplete {}\nLost {}  Late {}  Overflow {}",
             self.statistics.frames_per_second,
             self.statistics.encoded_megabits_per_second,
-            self.estimated_capacity_megabits_per_second,
+            self.delivered_megabits_per_second,
             self.target_megabits_per_second,
             self.maximum_megabits_per_second,
             self.statistics.round_trip_time.as_secs_f64() * 1_000.0,
@@ -2850,7 +2850,7 @@ mod tests {
         let text = overlay.text("Streaming");
         assert!(text.starts_with("Rendering backend: Vulkan\nStreaming\n"));
         assert!(text.contains(
-            "Actual bitrate  0.00 Mbit/s\nEstimated capacity  8.00 Mbit/s\nTarget bitrate  5.00 Mbit/s\nMaximum bitrate 100 Mbit/s"
+            "Encoded rate (0.5s)  0.00 Mbit/s\nDelivered rate (1s avg)  8.00 Mbit/s\nEncoder target  5.00 Mbit/s\nConfigured maximum 100 Mbit/s"
         ));
         assert!(text.contains("Image ping   7.0 ms"));
         assert!(text.contains("Input ping  11.0 ms"));

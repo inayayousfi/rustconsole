@@ -123,9 +123,8 @@ mod windows {
         ephemeral_server_config, read_envelope, write_envelope,
     };
     use rustconsole_host_core::{
-        AdaptiveBitrateController, BITRATE_DECREASE_INTERVAL, BITRATE_INCREASE_INTERVAL,
-        DesktopCapture, HostSessionControlAction, HostSessionControlSource,
-        VIDEO_BITRATE_BOOTSTRAP, VideoPathReport,
+        AdaptiveBitrateController, DesktopCapture, HostSessionControlAction,
+        HostSessionControlSource, VideoDeliveryReport, VideoPathReport,
     };
     use rustconsole_input_windows::{HidReport, InputSession, ReportSink, VirtualInputOwner};
     use rustconsole_protocol::diagnostics::{MediaKind, PayloadDigest, STREAM_PREAMBLE};
@@ -1115,7 +1114,9 @@ mod windows {
                 {
                     WorkerVideoControl::RequestKeyframe
                 }
-                Some(envelope::Body::VideoReceiverReport(_)) => continue,
+                Some(envelope::Body::VideoReceiverReport(report)) => {
+                    WorkerVideoControl::ReceiverReport(report)
+                }
                 _ => {
                     control_error = Some("invalid video control message".into());
                     break;
@@ -1191,6 +1192,7 @@ mod windows {
 
     enum WorkerVideoControl {
         RequestKeyframe,
+        ReceiverReport(wire::VideoReceiverReport),
         Stop,
     }
 
@@ -1360,9 +1362,7 @@ mod windows {
             .start_video_stream(
                 &shutdown_rx,
                 frames_per_second,
-                controller
-                    .target_bits_per_second()
-                    .min(VIDEO_BITRATE_BOOTSTRAP),
+                controller.target_bits_per_second(),
                 enable_audio,
                 diagnostic_tx.is_some(),
             )
@@ -1379,8 +1379,8 @@ mod windows {
         let mut local_audio_drops = 0_u64;
         let mut worker_audio_drops = 0_u64;
         let mut last_keyframe = Instant::now() - Duration::from_secs(1);
-        let mut next_bitrate_poll = Instant::now() + BITRATE_DECREASE_INTERVAL;
-        let mut next_bitrate_increase = Instant::now() + BITRATE_INCREASE_INTERVAL;
+        let frame_period = Duration::from_nanos(1_000_000_000 / u64::from(frames_per_second));
+        let mut sender_congested = false;
         loop {
             loop {
                 match controls.try_recv() {
@@ -1390,30 +1390,34 @@ mod windows {
                             last_keyframe = Instant::now();
                         }
                     }
+                    Ok(WorkerVideoControl::ReceiverReport(report)) => {
+                        let path = connection.stats().path;
+                        let change = controller.observe(
+                            VideoPathReport {
+                                round_trip_time: path.rtt,
+                                congestion_window_bytes: path.cwnd,
+                                lost_packets: path.lost_packets,
+                            },
+                            VideoDeliveryReport {
+                                completed_payload_bytes: report.completed_payload_bytes,
+                                measurement_interval_micros: report.measurement_interval_micros,
+                                lost_chunks: report.lost_chunks,
+                                late_chunks: report.late_chunks,
+                                assembly_overflows: report.assembly_overflows,
+                                incomplete_frames: report.incomplete_frames,
+                            },
+                        );
+                        sender_congested = false;
+                        if let Some(change) = change {
+                            stream.set_bitrate(change.target_bits_per_second)?;
+                        }
+                    }
                     Ok(WorkerVideoControl::Stop)
                     | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                         return Ok(WorkerVideoExit::Stopped);
                     }
                     Err(std::sync::mpsc::TryRecvError::Empty) => break,
                 }
-            }
-            let now = Instant::now();
-            if now >= next_bitrate_poll {
-                let path = connection.stats().path;
-                let allow_increase = now >= next_bitrate_increase;
-                if allow_increase {
-                    next_bitrate_increase = now + BITRATE_INCREASE_INTERVAL;
-                }
-                if let Some(change) = controller.observe(
-                    VideoPathReport {
-                        round_trip_time: path.rtt,
-                        congestion_window_bytes: path.cwnd,
-                    },
-                    allow_increase,
-                ) {
-                    stream.set_bitrate(change.target_bits_per_second)?;
-                }
-                next_bitrate_poll = now + BITRATE_DECREASE_INTERVAL;
             }
             if connection.close_reason().is_some() {
                 return Ok(WorkerVideoExit::Stopped);
@@ -1587,8 +1591,18 @@ mod windows {
                     true
                 }
             });
-            if !video_pending.is_empty() && video_started.elapsed() >= Duration::from_millis(100) {
+            let send_deadline = rustconsole_host_core::video_transport::assembly_deadline(
+                frame_period,
+                connection.rtt(),
+            );
+            if !video_pending.is_empty() && video_started.elapsed() >= send_deadline {
                 video_pending.clear();
+                if !sender_congested {
+                    sender_congested = true;
+                    if let Some(change) = controller.observe_sender_congestion() {
+                        stream.set_bitrate(change.target_bits_per_second)?;
+                    }
+                }
                 if let Some(record) = video_pending_diagnostic.take() {
                     submit_payload_digest(diagnostic_tx.as_ref(), record)?;
                 }
