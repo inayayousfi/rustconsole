@@ -1154,6 +1154,7 @@ impl Av1NvencEncoder {
         set_encoder_option(&context, "preset", c"preset", c"p1")?;
         set_encoder_option(&context, "tune", c"tune", c"ull")?;
         set_encoder_option(&context, "rate control", c"rc", c"cbr")?;
+        set_encoder_option(&context, "temporal AQ", c"temporal-aq", c"1")?;
         set_encoder_option(&context, "zero latency", c"zerolatency", c"1")?;
         set_encoder_option(&context, "encoder delay", c"delay", c"0")?;
         set_encoder_option(&context, "forced IDR", c"forced-idr", c"1")?;
