@@ -536,12 +536,14 @@ async function startPlayer(item, password = "", remember = false) {
   renderMachines();
   try {
     await invoke("start", {
-      host: item.resolvedEndpoint ?? item.preferredEndpoint,
-      password,
-      remember,
-      maximumBitrateMbps: Number(elements.bitrate.value),
-      framesPerSecond: Number(elements.frameRate.value),
-      latencyDiagnostics: elements.latencyDiagnostics.checked,
+      request: {
+        host: item.resolvedEndpoint ?? item.preferredEndpoint,
+        password,
+        remember,
+        maximumBitrateMbps: Number(elements.bitrate.value),
+        framesPerSecond: Number(elements.frameRate.value),
+        latencyDiagnostics: elements.latencyDiagnostics.checked,
+      },
     });
   } catch (error) {
     if (playerSession.generation === generation) {

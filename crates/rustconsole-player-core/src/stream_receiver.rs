@@ -74,7 +74,7 @@ struct LocalPayloadDigest {
 }
 
 enum PayloadDigestEvent {
-    Host(PayloadDigest),
+    Host(Box<PayloadDigest>),
     Local(LocalPayloadDigest),
 }
 
@@ -90,6 +90,7 @@ impl PayloadDigestMatcher {
         const MAX_PENDING: usize = 4_096;
         let key = match event {
             PayloadDigestEvent::Host(host) => {
+                let host = *host;
                 let key = (host.kind as u8, host.generation, host.sequence);
                 if self.host.insert(key, host).is_some() {
                     self.counters.duplicate_host_records += 1;
@@ -263,9 +264,16 @@ pub enum AudioPlaybackEvent {
 struct OrderedAudioPackets {
     generation: u64,
     expected: Option<u64>,
-    pending: BTreeMap<u64, (AudioPacket, Instant, u64, Option<[u8; 32]>)>,
+    pending: BTreeMap<u64, PendingAudioPacket>,
     started: bool,
     last_timestamp: Option<u64>,
+}
+
+struct PendingAudioPacket {
+    packet: AudioPacket,
+    assembled_at: Instant,
+    assembled_at_micros: u64,
+    assembled_payload_sha256: Option<[u8; 32]>,
 }
 
 impl OrderedAudioPackets {
@@ -303,12 +311,14 @@ impl OrderedAudioPackets {
                     .map_or(packet.sequence, |expected| expected.min(packet.sequence)),
             );
         }
-        self.pending.entry(packet.sequence).or_insert((
-            packet,
-            now,
-            assembled_at_micros,
-            assembled_payload_sha256,
-        ));
+        self.pending
+            .entry(packet.sequence)
+            .or_insert(PendingAudioPacket {
+                packet,
+                assembled_at: now,
+                assembled_at_micros,
+                assembled_payload_sha256,
+            });
         self.drain(now)
     }
 
@@ -318,12 +328,10 @@ impl OrderedAudioPackets {
 
     fn drain(&mut self, now: Instant) -> Vec<AudioPlaybackEvent> {
         if !self.started {
-            let old_enough =
-                self.pending
-                    .first_key_value()
-                    .is_some_and(|(_, (_, received, _, _))| {
-                        now.duration_since(*received) >= AUDIO_WAIT
-                    });
+            let old_enough = self
+                .pending
+                .first_key_value()
+                .is_some_and(|(_, pending)| now.duration_since(pending.assembled_at) >= AUDIO_WAIT);
             if self.pending.len() < AUDIO_QUEUE_PACKETS && !old_enough {
                 return Vec::new();
             }
@@ -332,8 +340,12 @@ impl OrderedAudioPackets {
 
         let mut ready = Vec::new();
         while let Some(expected) = self.expected {
-            if let Some((packet, assembled_at, assembled_at_micros, assembled_payload_sha256)) =
-                self.pending.remove(&expected)
+            if let Some(PendingAudioPacket {
+                packet,
+                assembled_at,
+                assembled_at_micros,
+                assembled_payload_sha256,
+            }) = self.pending.remove(&expected)
             {
                 self.last_timestamp = Some(packet.captured_at_micros);
                 self.expected = expected.checked_add(1);
@@ -346,12 +358,11 @@ impl OrderedAudioPackets {
                 });
                 continue;
             }
-            let Some((&next_sequence, (next, received, _, _))) = self.pending.first_key_value()
-            else {
+            let Some((&next_sequence, next)) = self.pending.first_key_value() else {
                 break;
             };
             let missing_is_confirmed = self.pending.len() >= AUDIO_QUEUE_PACKETS
-                || now.duration_since(*received) >= AUDIO_WAIT;
+                || now.duration_since(next.assembled_at) >= AUDIO_WAIT;
             if !missing_is_confirmed {
                 break;
             }
@@ -368,10 +379,11 @@ impl OrderedAudioPackets {
                             distance
                                 .checked_mul(rustconsole_protocol::audio::PACKET_DURATION_MICROS)
                         })
-                        .and_then(|distance| next.captured_at_micros.checked_sub(distance))
+                        .and_then(|distance| next.packet.captured_at_micros.checked_sub(distance))
                 })
-                .unwrap_or(next.captured_at_micros);
+                .unwrap_or(next.packet.captured_at_micros);
             self.last_timestamp = next
+                .packet
                 .captured_at_micros
                 .checked_sub(rustconsole_protocol::audio::PACKET_DURATION_MICROS);
             self.expected = Some(next_sequence);
@@ -723,7 +735,7 @@ where
                     match stream.read_exact(&mut bytes).await {
                         Ok(_) => {
                             let record = PayloadDigest::decode(&bytes).map_err(str::to_owned)?;
-                            queue.push(PayloadDigestEvent::Host(record));
+                            queue.push(PayloadDigestEvent::Host(Box::new(record)));
                         }
                         Err(quinn::ReadExactError::FinishedEarly(0)) => return Ok(()),
                         Err(error) => return Err(error.to_string()),
@@ -978,7 +990,7 @@ where
         if let Some(payload_digests) = &payload_digests {
             while let Some(event) = payload_digests.pop_timeout(Duration::ZERO) {
                 if let Some(sample) = digest_matcher.push(event) {
-                    progress(StreamProgress::PayloadIntegrity(sample));
+                    progress(StreamProgress::PayloadIntegrity(Box::new(sample)));
                 }
             }
         }
@@ -1180,14 +1192,18 @@ mod tests {
             audio_capture_queue_drops: 0,
         };
         let mut matcher = PayloadDigestMatcher::default();
-        assert!(matcher.push(PayloadDigestEvent::Host(host)).is_none());
+        assert!(
+            matcher
+                .push(PayloadDigestEvent::Host(Box::new(host)))
+                .is_none()
+        );
         let matched = matcher
             .push(PayloadDigestEvent::Local(local))
             .expect("matching sides should produce a sample");
         assert!(matched.matched);
         assert_eq!(matched.host_dropped_records, 12);
         host.sequence = 4;
-        matcher.push(PayloadDigestEvent::Host(host));
+        matcher.push(PayloadDigestEvent::Host(Box::new(host)));
         let mut changed = local;
         changed.sequence = 4;
         changed.sha256[0] ^= 1;

@@ -331,7 +331,7 @@ pub enum StreamProgress {
         pointer_mode_rejections: u64,
         pointer_relative_baselines: u64,
     },
-    PayloadIntegrity(PayloadIntegritySample),
+    PayloadIntegrity(Box<PayloadIntegritySample>),
     PayloadIntegrityCounters(PayloadIntegrityCounters),
     DiagnosticQueues(DiagnosticQueueSnapshot),
     KeyframeRecovered {

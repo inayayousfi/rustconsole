@@ -99,6 +99,16 @@ pub struct StreamCallbacks<Authenticated, Progress, Statistics, Audio, Video> {
     pub video: Video,
 }
 
+pub struct StreamConfiguration {
+    pub address: String,
+    pub password: Option<Vec<u8>>,
+    pub remember_password: bool,
+    pub maximum_bitrate_bits_per_second: u64,
+    pub frames_per_second: u16,
+    pub latency_diagnostics: bool,
+    pub diagnostic_probe_sequence: Arc<AtomicU64>,
+}
+
 #[derive(Debug)]
 pub enum DecodedAudioEvent {
     Reset { generation: u64 },
@@ -388,13 +398,7 @@ pub fn run_authentication_probe(
 }
 
 pub fn stream_quic_video(
-    address: &str,
-    password: Option<Vec<u8>>,
-    remember_password: bool,
-    maximum_bitrate_bits_per_second: u64,
-    frames_per_second: u16,
-    latency_diagnostics: bool,
-    diagnostic_probe_sequence: Arc<AtomicU64>,
+    configuration: StreamConfiguration,
     should_stop: impl Fn() -> bool,
     next_input: impl FnMut() -> Option<rustconsole_player_core::TimedInputEvent> + Send + 'static,
     callbacks: StreamCallbacks<
@@ -405,6 +409,15 @@ pub fn stream_quic_video(
         impl FnMut(DecodedVideoFrame) -> Result<bool, Box<dyn std::error::Error>>,
     >,
 ) -> Result<rustconsole_player_core::StreamHostResult, Box<dyn std::error::Error>> {
+    let StreamConfiguration {
+        address,
+        password,
+        remember_password,
+        maximum_bitrate_bits_per_second,
+        frames_per_second,
+        latency_diagnostics,
+        diagnostic_probe_sequence,
+    } = configuration;
     let StreamCallbacks {
         authenticated: observe_authenticated,
         progress: mut observe_progress,

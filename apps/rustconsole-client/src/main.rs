@@ -320,17 +320,31 @@ fn authenticate_address(host: &str) -> Result<(), String> {
         .unwrap_or_else(|| "host has no address".to_owned()))
 }
 
-#[tauri::command]
-fn start(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, ClientRuntime>,
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StartRequest {
     host: String,
     password: String,
     remember: bool,
     maximum_bitrate_mbps: u64,
     frames_per_second: u16,
     latency_diagnostics: bool,
+}
+
+#[tauri::command]
+fn start(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, ClientRuntime>,
+    request: StartRequest,
 ) -> Result<(), String> {
+    let StartRequest {
+        host,
+        password,
+        remember,
+        maximum_bitrate_mbps,
+        frames_per_second,
+        latency_diagnostics,
+    } = request;
     let maximum_bitrate_bits_per_second = maximum_bitrate(maximum_bitrate_mbps)?;
     if frames_per_second == 0 {
         return Err("Frame rate must be a positive integer.".into());

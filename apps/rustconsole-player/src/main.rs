@@ -239,6 +239,7 @@ struct QueuedVideoFrame {
     frame: NativeDmaBufFrame,
 }
 
+#[derive(Clone, Copy)]
 struct PendingPresentation {
     frame_sequence: u64,
     frame_queued_at: Instant,
@@ -325,13 +326,15 @@ fn start_stream_session(
         let progress_tx = events.clone();
         let statistics_tx = events.clone();
         let result = rustconsole_player_linux::stream_quic_video(
-            &address,
-            password,
-            remember_password,
-            maximum_bitrate_bits_per_second,
-            frames_per_second,
-            latency_diagnostics,
-            stream_diagnostic_probe_sequence,
+            rustconsole_player_linux::StreamConfiguration {
+                address,
+                password,
+                remember_password,
+                maximum_bitrate_bits_per_second,
+                frames_per_second,
+                latency_diagnostics,
+                diagnostic_probe_sequence: stream_diagnostic_probe_sequence,
+            },
             || session_stop.load(Ordering::Acquire),
             move || input_receivers.try_recv(),
             StreamCallbacks {
@@ -1873,15 +1876,18 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
                 } else if diagnose_submission {
                     observe_presented_frame(
                         &mut latency_diagnostics,
-                        frame.sequence,
-                        frame.queued_at,
-                        frame.capture_player_at,
-                        frame.input_sequence,
-                        input_started.remove(&frame.input_sequence),
-                        frame.diagnostic_marker_input_sequence,
-                        frame
-                            .diagnostic_marker_input_sequence
-                            .and_then(|sequence| correlated_input_started.remove(&sequence)),
+                        PendingPresentation {
+                            frame_sequence: frame.sequence,
+                            frame_queued_at: frame.queued_at,
+                            capture_player_at: frame.capture_player_at,
+                            input_sequence: frame.input_sequence,
+                            input_started_at: input_started.remove(&frame.input_sequence),
+                            diagnostic_marker_input_sequence: frame
+                                .diagnostic_marker_input_sequence,
+                            correlated_input_started_at: frame
+                                .diagnostic_marker_input_sequence
+                                .and_then(|sequence| correlated_input_started.remove(&sequence)),
+                        },
                         presented_at,
                         "Vulkan queue_present returned; compositor feedback unavailable",
                     );
@@ -1943,13 +1949,7 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(pending) = pending_presentations.remove(&feedback.id) {
                     observe_presented_frame(
                         &mut latency_diagnostics,
-                        pending.frame_sequence,
-                        pending.frame_queued_at,
-                        pending.capture_player_at,
-                        pending.input_sequence,
-                        pending.input_started_at,
-                        pending.diagnostic_marker_input_sequence,
-                        pending.correlated_input_started_at,
+                        pending,
                         feedback.presented_at,
                         "VK_KHR_present_wait reported compositor presentation completion",
                     );
@@ -2293,8 +2293,7 @@ fn observe_audio_samples(
     let mut clipped = 0_u64;
     let mut non_finite = 0_u64;
     let mut frames = 0_u64;
-    for frame in decoded.samples.interleaved.chunks_exact(2) {
-        let (left, right) = (frame[0], frame[1]);
+    for &[left, right] in decoded.samples.interleaved.as_chunks::<2>().0 {
         if !left.is_finite() || !right.is_finite() {
             non_finite = non_finite.saturating_add(1);
             continue;
@@ -2351,16 +2350,19 @@ fn observe_audio_samples(
 
 fn observe_presented_frame(
     diagnostics: &mut LatencyDiagnostics,
-    frame_sequence: u64,
-    frame_queued_at: Instant,
-    capture_player_at: Option<Instant>,
-    input_sequence: u64,
-    input_started_at: Option<Instant>,
-    diagnostic_marker_input_sequence: Option<u64>,
-    correlated_input_started_at: Option<Instant>,
+    pending: PendingPresentation,
     presented_at: Instant,
     endpoint: &'static str,
 ) {
+    let PendingPresentation {
+        frame_sequence,
+        frame_queued_at,
+        capture_player_at,
+        input_sequence,
+        input_started_at,
+        diagnostic_marker_input_sequence,
+        correlated_input_started_at,
+    } = pending;
     if let Some(captured_at) = capture_player_at {
         diagnostics.observe_classified(
             "video_source_capture_to_presentation",
