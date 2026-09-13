@@ -97,7 +97,7 @@ rustconsole-player-linux = { path = "crates/rustconsole-player-linux" }
 zeroize = { version = "=1.8.1", features = ["std"] }
 
 [patch.crates-io]
-ffmpeg-sys-next = { path = "vendor/ffmpeg-sys-next-9.0.0" }
+ffmpeg-sys-next = { git = "https://github.com/inayayousfi/rust-ffmpeg-sys", rev = "29f32e275cbfc7cd6c6f130930f37d93587bf2a7" }
 quinn-proto = { git = "https://github.com/quinn-rs/quinn", rev = "a708a979c291f6b2baf0141d3096f265353cbce1" }
 
 [profile.release]

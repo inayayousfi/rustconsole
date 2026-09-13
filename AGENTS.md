@@ -72,7 +72,7 @@ Platform crates may depend on neutral contracts, neutral mechanisms, and the tec
 ### Other boundaries
 
 - `native/windows-input-driver` is the Windows UMDF virtual mouse and keyboard driver. It is a separate Cargo workspace because its toolchain, build, installation, and runtime boundary differ from the main workspace. Driver implementation belongs here; safe user-mode state and communication belong in `rustconsole-input-windows`.
-- `vendor/ffmpeg-sys-next-9.0.0` is the patched FFmpeg binding used through the workspace patch. Treat it as third-party source, not ordinary project code.
+- The workspace patch pins the patched `ffmpeg-sys-next` fork at an exact Git revision. Treat that fork as third-party source and keep `THIRD_PARTY.md` synchronized with its local changes and upstream status.
 - `patches/` contains maintained patches applied to external projects. Preserve patch format and upstream context.
 - `scripts/` contains repository policy and build checks. In particular, `scripts/check-dependency-direction.mjs` is the executable source of truth for allowed internal dependencies.
 - `docs/` contains focused design or operational documents that are too detailed for this repository map.
