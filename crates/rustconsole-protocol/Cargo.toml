@@ -11,3 +11,10 @@ path = "src/lib.rs"
 
 [dependencies]
 prost.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "protocol"
+harness = false

@@ -13,3 +13,10 @@ path = "src/lib.rs"
 rustconsole-media.workspace = true
 rustconsole-protocol.workspace = true
 rustconsole-session.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "policy"
+harness = false

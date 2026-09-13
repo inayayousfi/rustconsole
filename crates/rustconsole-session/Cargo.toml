@@ -22,4 +22,9 @@ tokio.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
 rand_chacha = "=0.3.1"
+
+[[bench]]
+name = "data_path"
+harness = false

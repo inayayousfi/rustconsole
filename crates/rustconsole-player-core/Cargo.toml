@@ -18,3 +18,10 @@ rustconsole-session.workspace = true
 sha2.workspace = true
 tokio.workspace = true
 zeroize.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "process_protocol"
+harness = false

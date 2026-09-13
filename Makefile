@@ -1,6 +1,6 @@
 CARGO := cargo +1.95.0
 
-.PHONY: client host install-host uninstall-host
+.PHONY: client host benchmark install-host uninstall-host
 
 client:
 	$(CARGO) build --release --locked -p rustconsole-player
@@ -8,6 +8,9 @@ client:
 
 host:
 	powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts/package-windows.ps1
+
+benchmark:
+	$(CARGO) bench --workspace --bench '*' --locked
 
 install-host:
 	./target/windows-package/rustconsole-host.exe install
