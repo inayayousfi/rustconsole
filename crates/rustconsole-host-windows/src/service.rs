@@ -7,20 +7,8 @@ pub const SERVICE_NAME: &str = "RustConsoleHost";
 pub const SERVICE_DISPLAY_NAME: &str = "Rust Console Host";
 pub const SERVICE_DESCRIPTION: &str =
     "Streams this Windows computer to authenticated Rust Console players.";
-pub const CAPTURE_PROOF_REPORT: &str = r"C:\ProgramData\RustConsole\capture-proof.txt";
-pub const AUDIO_PROOF_REPORT: &str = r"C:\ProgramData\RustConsole\audio-proof.txt";
-pub const AUDIO_ENCODE_PROOF_REPORT: &str = r"C:\ProgramData\RustConsole\audio-encode-proof.txt";
-pub const DESKTOP_TRANSITION_PROOF_REPORT: &str =
-    r"C:\ProgramData\RustConsole\desktop-transition-proof.txt";
-pub const LOGIN_TRANSITION_PROOF_REPORT: &str =
-    r"C:\ProgramData\RustConsole\login-transition-proof.txt";
-pub const DISPLAY_MODE_TRANSITION_PROOF_REPORT: &str =
-    r"C:\ProgramData\RustConsole\display-mode-transition-proof.txt";
-pub const ONE_FRAME_PROOF_REPORT: &str = r"C:\ProgramData\RustConsole\one-frame-proof.txt";
 pub const SERVICE_ERROR_REPORT: &str = r"C:\ProgramData\RustConsole\service-error.txt";
 pub const SESSION_ERROR_REPORT: &str = r"C:\ProgramData\RustConsole\session-error.txt";
-#[cfg(windows)]
-const CAPTURE_IMAGE_PROOF_REPORT: &str = "capture-image-proof.txt";
 
 #[cfg(any(windows, test))]
 fn session_availability(
@@ -47,22 +35,9 @@ fn vb_cable_status<E>(available: Result<bool, E>) -> rustconsole_protocol::wire:
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ServiceCommand {
-    RunAudioProof,
-    RunAudioEncodeProof,
     Run,
-    RunCaptureProof,
-    RunDesktopTransitionProof,
-    RunLoginTransitionProof,
-    RunDisplayModeTransitionProof,
-    RunOneFrameProof,
     Install,
     InstallElevated,
-    InstallCaptureProof,
-    InstallDesktopTransitionProof,
-    InstallLoginTransitionProof,
-    InstallDisplayModeTransitionProof,
-    InstallOneFrameProof,
-    CaptureImageProof,
     SetPassword,
     SetPasswordStdin,
     MediaWorker {
@@ -115,7 +90,6 @@ fn shutdown_channel() -> (SyncSender<()>, Receiver<()>) {
 #[cfg(windows)]
 mod windows {
     use super::*;
-    use crate::capture::{DesktopDuplicationCapture, DesktopDuplicationError, DesktopOutput};
     use crate::worker_protocol::WorkerEvent;
     use quinn::{Connection, Endpoint, VarInt};
     use rustconsole_host_core::authentication::{
@@ -159,24 +133,13 @@ mod windows {
     use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
     const STATUS_WAIT_HINT: Duration = Duration::from_secs(5);
-    const CAPTURE_PROOF_LIMIT: Duration = Duration::from_secs(10);
-    const CAPTURE_ACQUIRE_TIMEOUT: Duration = Duration::from_millis(250);
-    const ONE_FRAME_PROOF_ADDRESS: &str = "0.0.0.0:47999";
     const PRODUCTION_QUIC_IPV4_ADDRESS: &str = "0.0.0.0:47999";
     const PRODUCTION_QUIC_IPV6_ADDRESS: &str = "[::]:47999";
     const IPV6_STATUS_REPORT: &str = r"C:\ProgramData\RustConsole\ipv6-status.txt";
-    const ONE_FRAME_PROOF_WAIT: Duration = Duration::from_secs(300);
 
     #[derive(Clone, Copy)]
     enum ServiceMode {
-        AudioProof,
-        AudioEncodeProof,
         Idle,
-        CaptureProof,
-        DesktopTransitionProof,
-        LoginTransitionProof,
-        DisplayModeTransitionProof,
-        OneFrameProof,
     }
 
     static SERVICE_MODE: OnceLock<ServiceMode> = OnceLock::new();
@@ -185,55 +148,13 @@ mod windows {
 
     pub fn execute(command: ServiceCommand) -> Result<(), Box<dyn std::error::Error>> {
         match command {
-            ServiceCommand::Run
-            | ServiceCommand::RunAudioProof
-            | ServiceCommand::RunAudioEncodeProof
-            | ServiceCommand::RunCaptureProof
-            | ServiceCommand::RunDesktopTransitionProof
-            | ServiceCommand::RunLoginTransitionProof
-            | ServiceCommand::RunDisplayModeTransitionProof
-            | ServiceCommand::RunOneFrameProof => {
-                let mode = match command {
-                    ServiceCommand::RunAudioProof => ServiceMode::AudioProof,
-                    ServiceCommand::RunAudioEncodeProof => ServiceMode::AudioEncodeProof,
-                    ServiceCommand::RunCaptureProof => ServiceMode::CaptureProof,
-                    ServiceCommand::RunDesktopTransitionProof => {
-                        ServiceMode::DesktopTransitionProof
-                    }
-                    ServiceCommand::RunLoginTransitionProof => ServiceMode::LoginTransitionProof,
-                    ServiceCommand::RunDisplayModeTransitionProof => {
-                        ServiceMode::DisplayModeTransitionProof
-                    }
-                    ServiceCommand::RunOneFrameProof => ServiceMode::OneFrameProof,
-                    _ => ServiceMode::Idle,
-                };
-                let _ = SERVICE_MODE.set(mode);
+            ServiceCommand::Run => {
+                let _ = SERVICE_MODE.set(ServiceMode::Idle);
                 service_dispatcher::start(SERVICE_NAME, service_main_ffi)?;
                 Ok(())
             }
             ServiceCommand::Install => crate::installation::install(false),
             ServiceCommand::InstallElevated => crate::installation::install(true),
-            ServiceCommand::InstallCaptureProof => install_service(
-                std::env::current_exe()?,
-                vec![OsString::from("capture-proof")],
-            ),
-            ServiceCommand::InstallDesktopTransitionProof => install_service(
-                std::env::current_exe()?,
-                vec![OsString::from("desktop-transition-proof")],
-            ),
-            ServiceCommand::InstallLoginTransitionProof => install_service(
-                std::env::current_exe()?,
-                vec![OsString::from("login-transition-proof")],
-            ),
-            ServiceCommand::InstallDisplayModeTransitionProof => install_service(
-                std::env::current_exe()?,
-                vec![OsString::from("display-mode-transition-proof")],
-            ),
-            ServiceCommand::InstallOneFrameProof => install_service(
-                std::env::current_exe()?,
-                vec![OsString::from("one-frame-proof")],
-            ),
-            ServiceCommand::CaptureImageProof => capture_image_proof(),
             ServiceCommand::SetPassword => crate::credentials::set_password_interactive(),
             ServiceCommand::SetPasswordStdin => crate::credentials::set_password_from_stdin(),
             ServiceCommand::MediaWorker {
@@ -298,15 +219,6 @@ mod windows {
         let mode = SERVICE_MODE.get().copied().unwrap_or(ServiceMode::Idle);
         if let Err(error) = run_service(mode) {
             let report_path = match mode {
-                ServiceMode::AudioProof => Some(AUDIO_PROOF_REPORT),
-                ServiceMode::AudioEncodeProof => Some(AUDIO_ENCODE_PROOF_REPORT),
-                ServiceMode::CaptureProof => Some(CAPTURE_PROOF_REPORT),
-                ServiceMode::DesktopTransitionProof => Some(DESKTOP_TRANSITION_PROOF_REPORT),
-                ServiceMode::LoginTransitionProof => Some(LOGIN_TRANSITION_PROOF_REPORT),
-                ServiceMode::DisplayModeTransitionProof => {
-                    Some(DISPLAY_MODE_TRANSITION_PROOF_REPORT)
-                }
-                ServiceMode::OneFrameProof => Some(ONE_FRAME_PROOF_REPORT),
                 ServiceMode::Idle => Some(SERVICE_ERROR_REPORT),
             };
             if let Some(report_path) = report_path {
@@ -350,18 +262,7 @@ mod windows {
             Duration::ZERO,
         )?;
 
-        let shutdown_received = match mode {
-            ServiceMode::AudioProof => run_audio_proof(&shutdown_rx, false)?,
-            ServiceMode::AudioEncodeProof => run_audio_proof(&shutdown_rx, true)?,
-            ServiceMode::Idle => run_authenticated_quic_service(&shutdown_rx)?,
-            ServiceMode::CaptureProof => run_capture_proof(&shutdown_rx)?,
-            ServiceMode::DesktopTransitionProof => run_desktop_transition_proof(&shutdown_rx)?,
-            ServiceMode::LoginTransitionProof => run_login_transition_proof(&shutdown_rx)?,
-            ServiceMode::DisplayModeTransitionProof => {
-                run_display_mode_transition_proof(&shutdown_rx)?
-            }
-            ServiceMode::OneFrameProof => run_one_frame_proof(&shutdown_rx)?,
-        };
+        let shutdown_received = run_authenticated_quic_service(&shutdown_rx)?;
         if !shutdown_received && shutdown_rx.recv().is_err() {
             return Ok(());
         }
@@ -1747,251 +1648,6 @@ mod windows {
         }
     }
 
-    fn run_audio_proof(
-        shutdown_rx: &Receiver<()>,
-        encode_opus: bool,
-    ) -> Result<bool, Box<dyn std::error::Error>> {
-        let path = PathBuf::from(if encode_opus {
-            AUDIO_ENCODE_PROOF_REPORT
-        } else {
-            AUDIO_PROOF_REPORT
-        });
-        fs::create_dir_all(path.parent().ok_or("audio proof report has no parent")?)?;
-        let mut worker = crate::worker::MediaWorker::launch(&std::env::current_exe()?)?;
-        let (interrupted, mut report) = worker.audio_proof(shutdown_rx, encode_opus)?;
-        let stopped = Instant::now();
-        worker.stop_and_wait(interrupted)?;
-        report.push_str(&format!(
-            "worker_shutdown_micros={}\n",
-            stopped.elapsed().as_micros()
-        ));
-        fs::write(path, report)?;
-        Ok(interrupted)
-    }
-
-    fn run_capture_proof(shutdown_rx: &Receiver<()>) -> Result<bool, Box<dyn std::error::Error>> {
-        let report_path = PathBuf::from(CAPTURE_PROOF_REPORT);
-        if let Some(parent) = report_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-
-        let executable = std::env::current_exe()?;
-        let mut worker = crate::worker::MediaWorker::launch(&executable)?;
-        let (shutdown_received, report) = worker.capture_proof(shutdown_rx)?;
-        fs::write(report_path, report)?;
-        if !shutdown_received && shutdown_rx.recv().is_err() {
-            return Ok(true);
-        }
-        if !shutdown_received {
-            worker.stop()?;
-        }
-        Ok(true)
-    }
-
-    fn run_desktop_transition_proof(
-        shutdown_rx: &Receiver<()>,
-    ) -> Result<bool, Box<dyn std::error::Error>> {
-        let report_path = PathBuf::from(DESKTOP_TRANSITION_PROOF_REPORT);
-        if let Some(parent) = report_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-
-        let executable = std::env::current_exe()?;
-        let mut worker = crate::worker::MediaWorker::launch(&executable)?;
-        let (shutdown_received, report) = worker.desktop_transition_proof(shutdown_rx)?;
-        fs::write(report_path, report)?;
-        if !shutdown_received && shutdown_rx.recv().is_err() {
-            return Ok(true);
-        }
-        if !shutdown_received {
-            worker.stop()?;
-        }
-        Ok(true)
-    }
-
-    fn run_login_transition_proof(
-        shutdown_rx: &Receiver<()>,
-    ) -> Result<bool, Box<dyn std::error::Error>> {
-        let report_path = PathBuf::from(LOGIN_TRANSITION_PROOF_REPORT);
-        if let Some(parent) = report_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-
-        let executable = std::env::current_exe()?;
-        let mut worker = crate::worker::MediaWorker::launch(&executable)?;
-        let (shutdown_received, report) = worker.login_transition_proof(shutdown_rx)?;
-        fs::write(report_path, report)?;
-        if !shutdown_received && shutdown_rx.recv().is_err() {
-            return Ok(true);
-        }
-        if !shutdown_received {
-            worker.stop()?;
-        }
-        Ok(true)
-    }
-
-    fn run_display_mode_transition_proof(
-        shutdown_rx: &Receiver<()>,
-    ) -> Result<bool, Box<dyn std::error::Error>> {
-        let report_path = PathBuf::from(DISPLAY_MODE_TRANSITION_PROOF_REPORT);
-        if let Some(parent) = report_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-
-        let executable = std::env::current_exe()?;
-        let mut worker = crate::worker::MediaWorker::launch(&executable)?;
-        let (shutdown_received, report) =
-            worker.display_mode_transition_proof(shutdown_rx, &report_path)?;
-        fs::write(report_path, report)?;
-        if !shutdown_received && shutdown_rx.recv().is_err() {
-            return Ok(true);
-        }
-        if !shutdown_received {
-            worker.stop()?;
-        }
-        Ok(true)
-    }
-
-    fn run_one_frame_proof(shutdown_rx: &Receiver<()>) -> Result<bool, Box<dyn std::error::Error>> {
-        let report_path = PathBuf::from(ONE_FRAME_PROOF_REPORT);
-        if let Some(parent) = report_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&report_path, "status=waiting_for_viewer\n")?;
-        let listener = TcpListener::bind(ONE_FRAME_PROOF_ADDRESS)?;
-        listener.set_nonblocking(true)?;
-        let started = Instant::now();
-        let mut stream = loop {
-            if shutdown_rx.try_recv().is_ok() {
-                return Ok(true);
-            }
-            match listener.accept() {
-                Ok((stream, _)) => break stream,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    if started.elapsed() >= ONE_FRAME_PROOF_WAIT {
-                        return Err("timed out waiting for one-frame proof viewer".into());
-                    }
-                    thread::sleep(Duration::from_millis(50));
-                }
-                Err(error) => return Err(error.into()),
-            }
-        };
-        stream.set_nonblocking(false)?;
-        stream.set_read_timeout(Some(Duration::from_secs(30)))?;
-        stream.set_write_timeout(Some(Duration::from_secs(30)))?;
-        let viewer_offer = read_control(&mut stream)?;
-        let (decoder_capabilities, settings) = parse_viewer_offer(viewer_offer)?;
-
-        let executable = std::env::current_exe()?;
-        let (mut worker, video_configuration) =
-            crate::worker::MediaWorker::launch_prepared_video(&executable, shutdown_rx)?
-                .ok_or("one-frame proof interrupted during preparation")?;
-        let audio_report = "status=not-run\nreason=bounded-video-proof\n";
-        let event = worker
-            .encode_snapshot(
-                shutdown_rx,
-                settings.frames_per_second,
-                settings.maximum_bitrate_bits_per_second,
-            )?
-            .ok_or("one-frame proof interrupted")?;
-        let WorkerEvent::EncodedSnapshot {
-            last_present_time,
-            accumulated_frames,
-            protected_content_masked,
-            presentation_timestamp: _,
-            keyframe,
-            payload,
-        } = event
-        else {
-            if let WorkerEvent::Failure(error) = event {
-                return Err(error.into());
-            }
-            return Err("media worker returned an unexpected snapshot event".into());
-        };
-        if !keyframe || payload.is_empty() {
-            return Err("media worker did not produce a non-empty keyframe".into());
-        }
-
-        let encoder_capability = DomainCapability {
-            mode: DomainMode {
-                chroma_subsampling: ChromaSubsampling::Yuv420,
-                bit_depth: match video_configuration.format {
-                    crate::worker_protocol::WorkerVideoFormat::Nv12 => VideoBitDepth::Eight,
-                    crate::worker_protocol::WorkerVideoFormat::P010 => VideoBitDepth::Ten,
-                },
-            },
-            maximum_width: settings.width,
-            maximum_height: settings.height,
-            maximum_frames_per_second: settings.frames_per_second,
-        };
-        let selected =
-            negotiate_av1_configuration(&[encoder_capability], &decoder_capabilities, &settings)?;
-        write_control(
-            &mut stream,
-            Envelope {
-                body: Some(envelope::Body::Av1CapabilityOffer(Av1CapabilityOffer {
-                    dedicated_input_stream: false,
-                    host_pointer_release: false,
-                    full_diagnostics: false,
-                    audio_transport: None,
-                    encoder_capabilities: vec![wire_capability(encoder_capability)],
-                    decoder_capabilities: Vec::new(),
-                    viewer_settings: None,
-                })),
-            },
-        )?;
-        let selected_wire = wire_selected(selected);
-        match read_control(&mut stream)?.body {
-            Some(envelope::Body::SelectedAv1Configuration(peer)) if peer == selected_wire => {}
-            _ => return Err("viewer selected a different AV1 configuration".into()),
-        }
-        write_control(
-            &mut stream,
-            Envelope {
-                body: Some(envelope::Body::SelectedAv1Configuration(selected_wire)),
-            },
-        )?;
-        let encoded_payload_bytes = payload.len();
-        let packet = wire::encode_video_packet_frame(&EncodedVideoPacket {
-            sequence: 0,
-            captured_at_micros: crate::clock::HostClock::new()?
-                .ticks_to_micros(last_present_time)?,
-            keyframe,
-            payload,
-        })?;
-        stream.write_all(&packet)?;
-        stream.flush()?;
-        worker.stop()?;
-        fs::write(
-            report_path,
-            format!(
-                "status=ok\ntransport=tcp-proof-only\nlisten_address={ONE_FRAME_PROOF_ADDRESS}\nworker_identity={}\ncapture_engine={:?}\nconfiguration={}x{}@{}-yuv420-{}bit\nvideo_color={:?}\nencoded_payload_bytes={}\nwire_packet_bytes={}\nlast_present_time={}\naccumulated_frames={}\nprotected_content_masked={}\nuser_audio_report_begin\n{}user_audio_report_end\n",
-                match video_configuration.capture_engine {
-                    crate::worker_protocol::WorkerCaptureEngine::WindowsGraphicsCapture =>
-                        "LOCAL_SYSTEM+interactive-helper",
-                    crate::worker_protocol::WorkerCaptureEngine::DesktopDuplication =>
-                        "LOCAL_SYSTEM",
-                },
-                video_configuration.capture_engine,
-                video_configuration.width,
-                video_configuration.height,
-                settings.frames_per_second,
-                match video_configuration.format {
-                    crate::worker_protocol::WorkerVideoFormat::Nv12 => 8,
-                    crate::worker_protocol::WorkerVideoFormat::P010 => 10,
-                },
-                video_configuration.color,
-                encoded_payload_bytes,
-                packet.len() - wire::RELIABLE_FRAME_PREFIX_SIZE,
-                last_present_time,
-                accumulated_frames,
-                protected_content_masked,
-                audio_report,
-            ),
-        )?;
-        Ok(true)
-    }
-
     fn parse_viewer_offer(
         envelope: Envelope,
     ) -> Result<(Vec<DomainCapability>, DomainSettings), Box<dyn std::error::Error>> {
@@ -2010,7 +1666,7 @@ mod windows {
             || settings.maximum_bitrate_bits_per_second == 0
             || settings.mode_preferences.is_empty()
         {
-            return Err("viewer settings do not match the one-frame proof mode".into());
+            return Err("viewer settings do not match the negotiated video mode".into());
         }
         let capabilities = offer
             .decoder_capabilities
@@ -2120,165 +1776,6 @@ mod windows {
         stream.write_all(&wire::encode_reliable_frame(&envelope)?)?;
         stream.flush()?;
         Ok(())
-    }
-
-    fn capture_image_proof() -> Result<(), Box<dyn std::error::Error>> {
-        let executable = std::env::current_exe()?;
-        let directory = executable.parent().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "capture proof executable has no parent directory",
-            )
-        })?;
-        let report_path = directory.join(CAPTURE_IMAGE_PROOF_REPORT);
-        let started = Instant::now();
-        let outputs = DesktopDuplicationCapture::attached_outputs()?;
-        let mut report = format!("output_count={}\n", outputs.len());
-        let mut visible_images = 0_u64;
-
-        for (index, output) in outputs.iter().enumerate() {
-            match capture_output_image(output, started) {
-                Ok(captured) => {
-                    let image = &captured.image;
-                    let checksum = image
-                        .pixels
-                        .iter()
-                        .fold(0_u64, |sum, value| sum.wrapping_add(u64::from(*value)));
-                    let image_name = format!("capture-proof-{index}.bmp");
-                    fs::write(
-                        directory.join(&image_name),
-                        bgra_bmp(image.width, image.height, &image.pixels)?,
-                    )?;
-                    visible_images += 1;
-                    append_output_report(
-                        &mut report,
-                        index,
-                        output,
-                        &format!(
-                            "status=ok\nwidth={}\nheight={}\nrefresh_hz={}\ndxgi_format={}\nchecksum={}\npointer_only_frames={}\nzero_presented_frames={}\npresented_frames={}\nlast_accumulated_frames={}\nlast_present_time={}\nimage={}\n",
-                            image.width,
-                            image.height,
-                            captured.refresh_hz,
-                            captured.dxgi_format,
-                            checksum,
-                            captured.pointer_only_frames,
-                            captured.zero_presented_frames,
-                            captured.presented_frames,
-                            captured.last_accumulated_frames,
-                            captured.last_present_time,
-                            image_name,
-                        ),
-                    );
-                }
-                Err(error) => append_output_report(
-                    &mut report,
-                    index,
-                    output,
-                    &format!("status=error\nerror={error}\n"),
-                ),
-            }
-        }
-
-        report.push_str(&format!(
-            "visible_images={visible_images}\nelapsed_micros={}\n",
-            started.elapsed().as_micros()
-        ));
-        fs::write(report_path, report)?;
-        if visible_images == 0 {
-            return Err("all attached desktop outputs contained only zero pixels".into());
-        }
-        Ok(())
-    }
-
-    fn capture_output_image(
-        output: &DesktopOutput,
-        started: Instant,
-    ) -> Result<CapturedOutputImage, Box<dyn std::error::Error>> {
-        let mut capture = loop {
-            match DesktopDuplicationCapture::for_output(output, CAPTURE_ACQUIRE_TIMEOUT) {
-                Ok(capture) => break capture,
-                Err(DesktopDuplicationError::TemporarilyUnavailable)
-                    if started.elapsed() < CAPTURE_PROOF_LIMIT =>
-                {
-                    thread::sleep(CAPTURE_ACQUIRE_TIMEOUT);
-                }
-                Err(error) => return Err(error.into()),
-            }
-        };
-        let mut pointer_only_frames = 0_u64;
-        let mut zero_presented_frames = 0_u64;
-        let mut presented_frames = 0_u64;
-        loop {
-            let frame = match capture.next_frame() {
-                Ok(frame) => frame,
-                Err(DesktopDuplicationError::Timeout)
-                    if started.elapsed() < CAPTURE_PROOF_LIMIT =>
-                {
-                    continue;
-                }
-                Err(error) => return Err(error.into()),
-            };
-            if frame.frame.last_present_time() == 0 {
-                pointer_only_frames += 1;
-                drop(frame);
-                if started.elapsed() >= CAPTURE_PROOF_LIMIT {
-                    return Err(format!(
-                        "no presented frame arrived; pointer_only_frames={pointer_only_frames}"
-                    )
-                    .into());
-                }
-                continue;
-            }
-            presented_frames += 1;
-            let last_accumulated_frames = frame.frame.accumulated_frames();
-            let last_present_time = frame.frame.last_present_time();
-            let image = capture.read_bgra8(&frame.frame)?;
-            if image.pixels.iter().any(|value| *value != 0) {
-                return Ok(CapturedOutputImage {
-                    image,
-                    refresh_hz: capture.format().frames_per_second,
-                    dxgi_format: capture.dxgi_format(),
-                    pointer_only_frames,
-                    zero_presented_frames,
-                    presented_frames,
-                    last_accumulated_frames,
-                    last_present_time,
-                });
-            }
-            zero_presented_frames += 1;
-            drop(frame);
-            if started.elapsed() >= CAPTURE_PROOF_LIMIT {
-                return Err(format!(
-                    "no nonzero presented frame arrived; pointer_only_frames={pointer_only_frames}, zero_presented_frames={zero_presented_frames}, presented_frames={presented_frames}, last_accumulated_frames={last_accumulated_frames}, last_present_time={last_present_time}"
-                )
-                .into());
-            }
-        }
-    }
-
-    struct CapturedOutputImage {
-        image: crate::capture::CpuBgraFrame,
-        refresh_hz: u16,
-        dxgi_format: i32,
-        pointer_only_frames: u64,
-        zero_presented_frames: u64,
-        presented_frames: u64,
-        last_accumulated_frames: u32,
-        last_present_time: i64,
-    }
-
-    fn append_output_report(
-        report: &mut String,
-        index: usize,
-        output: &DesktopOutput,
-        result: &str,
-    ) {
-        let (left, top, right, bottom) = output.coordinates();
-        report.push_str(&format!(
-            "\noutput={index}\nadapter={}\ndevice={}\ncoordinates={left},{top},{right},{bottom}\n{result}",
-            output.adapter_name(),
-            output.device_name(),
-        ));
     }
 
     fn set_status(

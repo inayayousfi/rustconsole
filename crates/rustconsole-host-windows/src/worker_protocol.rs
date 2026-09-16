@@ -1,25 +1,15 @@
 use std::io::{self, Read, Write};
 
-pub const VERSION: u16 = 14;
+pub const VERSION: u16 = 15;
 const MAX_PAYLOAD: usize = 16 * 1024 * 1024;
-const COMMAND_CAPTURE_PROOF: u8 = 1;
 const COMMAND_STOP: u8 = 2;
-const COMMAND_DESKTOP_TRANSITION_PROOF: u8 = 3;
-const COMMAND_LOGIN_TRANSITION_PROOF: u8 = 4;
-const COMMAND_DISPLAY_MODE_TRANSITION_PROOF: u8 = 5;
-const COMMAND_ENCODE_SNAPSHOT: u8 = 6;
 const COMMAND_START_VIDEO_STREAM: u8 = 7;
 const COMMAND_SET_VIDEO_BITRATE: u8 = 8;
 const COMMAND_REQUEST_VIDEO_KEYFRAME: u8 = 9;
 const COMMAND_STOP_VIDEO_STREAM: u8 = 10;
 const COMMAND_SET_VIDEO_FRAME_DIVISOR: u8 = 11;
-const COMMAND_AUDIO_PROOF: u8 = 12;
-const COMMAND_AUDIO_ENCODE_PROOF: u8 = 13;
 const COMMAND_PREPARE_VIDEO_STREAM: u8 = 14;
 const EVENT_HELLO: u8 = 1;
-const EVENT_CAPTURE_REPORT: u8 = 2;
-const EVENT_PROOF_PROGRESS: u8 = 3;
-const EVENT_ENCODED_SNAPSHOT: u8 = 4;
 const EVENT_FAILURE: u8 = 5;
 const EVENT_ENCODED_VIDEO_FRAME: u8 = 6;
 const EVENT_VIDEO_CONFIGURATION: u8 = 7;
@@ -66,17 +56,7 @@ pub struct WorkerVideoConfiguration {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WorkerCommand {
-    AudioProof,
-    AudioEncodeProof,
-    CaptureProof,
-    DesktopTransitionProof,
-    LoginTransitionProof,
-    DisplayModeTransitionProof,
     PrepareVideoStream,
-    EncodeSnapshot {
-        frames_per_second: u16,
-        bitrate_bits_per_second: u64,
-    },
     StartVideoStream {
         frames_per_second: u16,
         bitrate_bits_per_second: u64,
@@ -98,16 +78,6 @@ pub enum WorkerEvent {
         session_id: u32,
         identity: WorkerIdentity,
         connection_token: [u8; 16],
-    },
-    CaptureReport(String),
-    ProofProgress(String),
-    EncodedSnapshot {
-        last_present_time: i64,
-        accumulated_frames: u32,
-        protected_content_masked: bool,
-        presentation_timestamp: i64,
-        keyframe: bool,
-        payload: Vec<u8>,
     },
     EncodedVideoFrame {
         sequence: u64,
@@ -148,22 +118,7 @@ pub struct WorkerVideoQuality {
 
 pub fn write_command(writer: &mut impl Write, command: WorkerCommand) -> io::Result<()> {
     let payload = match command {
-        WorkerCommand::AudioProof => vec![COMMAND_AUDIO_PROOF],
-        WorkerCommand::AudioEncodeProof => vec![COMMAND_AUDIO_ENCODE_PROOF],
-        WorkerCommand::CaptureProof => vec![COMMAND_CAPTURE_PROOF],
-        WorkerCommand::DesktopTransitionProof => vec![COMMAND_DESKTOP_TRANSITION_PROOF],
-        WorkerCommand::LoginTransitionProof => vec![COMMAND_LOGIN_TRANSITION_PROOF],
-        WorkerCommand::DisplayModeTransitionProof => vec![COMMAND_DISPLAY_MODE_TRANSITION_PROOF],
         WorkerCommand::PrepareVideoStream => vec![COMMAND_PREPARE_VIDEO_STREAM],
-        WorkerCommand::EncodeSnapshot {
-            frames_per_second,
-            bitrate_bits_per_second,
-        } => {
-            let mut payload = vec![COMMAND_ENCODE_SNAPSHOT];
-            payload.extend_from_slice(&frames_per_second.to_be_bytes());
-            payload.extend_from_slice(&bitrate_bits_per_second.to_be_bytes());
-            payload
-        }
         WorkerCommand::StartVideoStream {
             frames_per_second,
             bitrate_bits_per_second,
@@ -195,19 +150,7 @@ pub fn write_command(writer: &mut impl Write, command: WorkerCommand) -> io::Res
 pub fn read_command(reader: &mut impl Read) -> io::Result<WorkerCommand> {
     let payload = read_frame(reader)?;
     match payload.as_slice() {
-        [COMMAND_AUDIO_PROOF] => Ok(WorkerCommand::AudioProof),
-        [COMMAND_AUDIO_ENCODE_PROOF] => Ok(WorkerCommand::AudioEncodeProof),
-        [COMMAND_CAPTURE_PROOF] => Ok(WorkerCommand::CaptureProof),
-        [COMMAND_DESKTOP_TRANSITION_PROOF] => Ok(WorkerCommand::DesktopTransitionProof),
-        [COMMAND_LOGIN_TRANSITION_PROOF] => Ok(WorkerCommand::LoginTransitionProof),
-        [COMMAND_DISPLAY_MODE_TRANSITION_PROOF] => Ok(WorkerCommand::DisplayModeTransitionProof),
         [COMMAND_PREPARE_VIDEO_STREAM] => Ok(WorkerCommand::PrepareVideoStream),
-        [COMMAND_ENCODE_SNAPSHOT, rest @ ..] if rest.len() == 10 => {
-            Ok(WorkerCommand::EncodeSnapshot {
-                frames_per_second: u16::from_be_bytes(rest[..2].try_into().unwrap()),
-                bitrate_bits_per_second: u64::from_be_bytes(rest[2..].try_into().unwrap()),
-            })
-        }
         [COMMAND_START_VIDEO_STREAM, rest @ ..]
             if rest.len() == 12 && rest[10] <= 1 && rest[11] <= 1 =>
         {
@@ -247,30 +190,6 @@ pub fn write_event(writer: &mut impl Write, event: &WorkerEvent) -> io::Result<(
             payload.extend_from_slice(&session_id.to_be_bytes());
             payload.push(*identity as u8);
             payload.extend_from_slice(connection_token);
-        }
-        WorkerEvent::CaptureReport(report) => {
-            payload.push(EVENT_CAPTURE_REPORT);
-            payload.extend_from_slice(report.as_bytes());
-        }
-        WorkerEvent::ProofProgress(report) => {
-            payload.push(EVENT_PROOF_PROGRESS);
-            payload.extend_from_slice(report.as_bytes());
-        }
-        WorkerEvent::EncodedSnapshot {
-            last_present_time,
-            accumulated_frames,
-            protected_content_masked,
-            presentation_timestamp,
-            keyframe,
-            payload: packet,
-        } => {
-            payload.push(EVENT_ENCODED_SNAPSHOT);
-            payload.extend_from_slice(&last_present_time.to_be_bytes());
-            payload.extend_from_slice(&accumulated_frames.to_be_bytes());
-            payload.push(u8::from(*protected_content_masked));
-            payload.extend_from_slice(&presentation_timestamp.to_be_bytes());
-            payload.push(u8::from(*keyframe));
-            payload.extend_from_slice(packet);
         }
         WorkerEvent::EncodedVideoFrame {
             sequence,
@@ -359,32 +278,6 @@ pub fn read_event(reader: &mut impl Read) -> io::Result<WorkerEvent> {
                 _ => return Err(invalid_data("invalid worker identity")),
             },
             connection_token: payload[12..28].try_into().unwrap(),
-        }),
-        Some(EVENT_CAPTURE_REPORT) => {
-            let report = String::from_utf8(payload[1..].to_vec())
-                .map_err(|_| invalid_data("worker report is not UTF-8"))?;
-            Ok(WorkerEvent::CaptureReport(report))
-        }
-        Some(EVENT_PROOF_PROGRESS) => {
-            let report = String::from_utf8(payload[1..].to_vec())
-                .map_err(|_| invalid_data("worker progress is not UTF-8"))?;
-            Ok(WorkerEvent::ProofProgress(report))
-        }
-        Some(EVENT_ENCODED_SNAPSHOT) if payload.len() >= 23 => Ok(WorkerEvent::EncodedSnapshot {
-            last_present_time: i64::from_be_bytes(payload[1..9].try_into().unwrap()),
-            accumulated_frames: u32::from_be_bytes(payload[9..13].try_into().unwrap()),
-            protected_content_masked: match payload[13] {
-                0 => false,
-                1 => true,
-                _ => return Err(invalid_data("invalid protected-content flag")),
-            },
-            presentation_timestamp: i64::from_be_bytes(payload[14..22].try_into().unwrap()),
-            keyframe: match payload[22] {
-                0 => false,
-                1 => true,
-                _ => return Err(invalid_data("invalid keyframe flag")),
-            },
-            payload: payload[23..].to_vec(),
         }),
         Some(EVENT_FAILURE) => {
             let error = String::from_utf8(payload[1..].to_vec())
@@ -732,57 +625,6 @@ mod tests {
     }
 
     #[test]
-    fn command_round_trip_is_framed() {
-        let mut bytes = Vec::new();
-        write_command(&mut bytes, WorkerCommand::CaptureProof).unwrap();
-        assert_eq!(
-            read_command(&mut Cursor::new(bytes)).unwrap(),
-            WorkerCommand::CaptureProof
-        );
-
-        let mut bytes = Vec::new();
-        write_command(&mut bytes, WorkerCommand::DesktopTransitionProof).unwrap();
-        assert_eq!(
-            read_command(&mut Cursor::new(bytes)).unwrap(),
-            WorkerCommand::DesktopTransitionProof
-        );
-
-        let mut bytes = Vec::new();
-        write_command(&mut bytes, WorkerCommand::LoginTransitionProof).unwrap();
-        assert_eq!(
-            read_command(&mut Cursor::new(bytes)).unwrap(),
-            WorkerCommand::LoginTransitionProof
-        );
-
-        let mut bytes = Vec::new();
-        write_command(&mut bytes, WorkerCommand::DisplayModeTransitionProof).unwrap();
-        assert_eq!(
-            read_command(&mut Cursor::new(bytes)).unwrap(),
-            WorkerCommand::DisplayModeTransitionProof
-        );
-
-        for command in [
-            WorkerCommand::AudioProof,
-            WorkerCommand::AudioEncodeProof,
-            WorkerCommand::PrepareVideoStream,
-            WorkerCommand::StartVideoStream {
-                audio: true,
-                diagnostics: true,
-                frames_per_second: 120,
-                bitrate_bits_per_second: 20_000_000,
-            },
-            WorkerCommand::SetVideoBitrate(16_000_000),
-            WorkerCommand::SetVideoFrameDivisor(2),
-            WorkerCommand::RequestVideoKeyframe,
-            WorkerCommand::StopVideoStream,
-        ] {
-            let mut bytes = Vec::new();
-            write_command(&mut bytes, command).unwrap();
-            assert_eq!(read_command(&mut Cursor::new(bytes)).unwrap(), command);
-        }
-    }
-
-    #[test]
     fn hello_round_trip_keeps_identity() {
         let event = WorkerEvent::Hello {
             version: VERSION,
@@ -799,29 +641,6 @@ mod tests {
         invalid_identity.extend([EVENT_HELLO, 0, 12, 0, 0, 0, 42, 0, 0, 0, 7, 3]);
         invalid_identity.extend([0; 16]);
         assert!(read_event(&mut Cursor::new(invalid_identity)).is_err());
-    }
-
-    #[test]
-    fn proof_progress_round_trip_keeps_report() {
-        let event = WorkerEvent::ProofProgress("status=running\nphase=initial\n".to_owned());
-        let mut bytes = Vec::new();
-        write_event(&mut bytes, &event).unwrap();
-        assert_eq!(read_event(&mut Cursor::new(bytes)).unwrap(), event);
-    }
-
-    #[test]
-    fn encoded_snapshot_round_trip_keeps_packet_and_metadata() {
-        let event = WorkerEvent::EncodedSnapshot {
-            last_present_time: 91,
-            accumulated_frames: 2,
-            protected_content_masked: false,
-            presentation_timestamp: 7,
-            keyframe: true,
-            payload: vec![1, 2, 3],
-        };
-        let mut bytes = Vec::new();
-        write_event(&mut bytes, &event).unwrap();
-        assert_eq!(read_event(&mut Cursor::new(bytes)).unwrap(), event);
     }
 
     #[test]

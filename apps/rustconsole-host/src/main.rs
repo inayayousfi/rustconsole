@@ -21,22 +21,9 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum HostCommand {
-    AudioProof,
-    AudioEncodeProof,
-    CaptureProof,
-    DesktopTransitionProof,
-    LoginTransitionProof,
-    DisplayModeTransitionProof,
-    OneFrameProof,
     Install,
     #[command(hide = true)]
     InstallElevated,
-    InstallCaptureProof,
-    InstallDesktopTransitionProof,
-    InstallLoginTransitionProof,
-    InstallDisplayModeTransitionProof,
-    InstallOneFrameProof,
-    CaptureImageProof,
     SetPassword,
     SetPasswordStdin,
     #[command(hide = true)]
@@ -82,29 +69,8 @@ enum FirewallScopeArgument {
 fn service_command(command: Option<HostCommand>) -> ServiceCommand {
     match command {
         None => ServiceCommand::Run,
-        Some(HostCommand::AudioProof) => ServiceCommand::RunAudioProof,
-        Some(HostCommand::AudioEncodeProof) => ServiceCommand::RunAudioEncodeProof,
-        Some(HostCommand::CaptureProof) => ServiceCommand::RunCaptureProof,
-        Some(HostCommand::DesktopTransitionProof) => ServiceCommand::RunDesktopTransitionProof,
-        Some(HostCommand::LoginTransitionProof) => ServiceCommand::RunLoginTransitionProof,
-        Some(HostCommand::DisplayModeTransitionProof) => {
-            ServiceCommand::RunDisplayModeTransitionProof
-        }
-        Some(HostCommand::OneFrameProof) => ServiceCommand::RunOneFrameProof,
         Some(HostCommand::Install) => ServiceCommand::Install,
         Some(HostCommand::InstallElevated) => ServiceCommand::InstallElevated,
-        Some(HostCommand::InstallCaptureProof) => ServiceCommand::InstallCaptureProof,
-        Some(HostCommand::InstallDesktopTransitionProof) => {
-            ServiceCommand::InstallDesktopTransitionProof
-        }
-        Some(HostCommand::InstallLoginTransitionProof) => {
-            ServiceCommand::InstallLoginTransitionProof
-        }
-        Some(HostCommand::InstallDisplayModeTransitionProof) => {
-            ServiceCommand::InstallDisplayModeTransitionProof
-        }
-        Some(HostCommand::InstallOneFrameProof) => ServiceCommand::InstallOneFrameProof,
-        Some(HostCommand::CaptureImageProof) => ServiceCommand::CaptureImageProof,
         Some(HostCommand::SetPassword) => ServiceCommand::SetPassword,
         Some(HostCommand::SetPasswordStdin) => ServiceCommand::SetPasswordStdin,
         Some(HostCommand::MediaWorker {
@@ -186,10 +152,6 @@ mod tests {
     #[test]
     fn existing_service_and_worker_commands_keep_their_shape() {
         assert_eq!(parse(&["host"]).unwrap(), ServiceCommand::Run);
-        assert_eq!(
-            parse(&["host", "audio-encode-proof"]).unwrap(),
-            ServiceCommand::RunAudioEncodeProof
-        );
         assert_eq!(
             parse(&["host", "media-worker", "12", "34", "56"]).unwrap(),
             ServiceCommand::MediaWorker {

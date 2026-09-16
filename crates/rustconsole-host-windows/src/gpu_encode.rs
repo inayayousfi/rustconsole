@@ -219,11 +219,11 @@ impl GpuAv1SnapshotEncoder {
             ..
         } = configuration;
         if width != 2560 || height != 1440 {
-            return Err(format!("GPU proof requires 2560x1440, found {width}x{height}").into());
+            return Err(format!("GPU encoder requires 2560x1440, found {width}x{height}").into());
         }
         if display_refresh_rate < u32::from(frames_per_second) {
             return Err(format!(
-                "GPU proof requires {frames_per_second} Hz, display reports {display_refresh_rate} Hz"
+                "GPU encoder requires {frames_per_second} Hz, display reports {display_refresh_rate} Hz"
             )
             .into());
         }
@@ -474,72 +474,6 @@ impl GpuAv1SnapshotEncoder {
         }
         Ok(())
     }
-
-    pub fn encode_snapshot(
-        &mut self,
-        timeout: Duration,
-    ) -> Result<EncodedSnapshot, Box<dyn std::error::Error>> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            match self.encode_snapshot_once(remaining) {
-                Ok(snapshot) => return Ok(snapshot),
-                Err(SnapshotAttemptError::AccessLost) if Instant::now() < deadline => {
-                    return Err(Box::new(VideoReconfigurationRequired {
-                        cause: self.bridge.reconfiguration_cause(),
-                    }));
-                }
-                Err(SnapshotAttemptError::AccessLost) => {
-                    return Err("Desktop Duplication access remained lost for 5 seconds".into());
-                }
-                Err(SnapshotAttemptError::Fatal(error)) => return Err(error),
-            }
-        }
-    }
-
-    fn encode_snapshot_once(
-        &mut self,
-        timeout: Duration,
-    ) -> Result<EncodedSnapshot, SnapshotAttemptError> {
-        let lease = match self.bridge.capture(timeout, false) {
-            Ok(lease) => lease,
-            Err(error) if error.code == DXGI_ERROR_ACCESS_LOST.0 => {
-                return Err(SnapshotAttemptError::AccessLost);
-            }
-            Err(error) => {
-                return Err(SnapshotAttemptError::Fatal(
-                    format!("GPU bridge capture failed: {error}").into(),
-                ));
-            }
-        };
-        if lease.last_present_time == 0 {
-            return Err(SnapshotAttemptError::Fatal(
-                "Desktop Duplication returned a pointer-only frame".into(),
-            ));
-        }
-        let packet = self
-            .encoder
-            .encode_one_d3d11_texture(&lease.texture, lease.last_present_time)
-            .map_err(|error| {
-                SnapshotAttemptError::Fatal(
-                    format!("NVENC AV1 frame submission failed: {error}").into(),
-                )
-            })?;
-        let snapshot = EncodedSnapshot {
-            packet,
-            last_present_time: lease.last_present_time,
-            accumulated_frames: lease.accumulated_frames,
-            protected_content_masked: lease.protected_content_masked,
-            mirror_decode_micros: 0,
-            capture_acquisition_micros: 0,
-            cross_adapter_copy_micros: 0,
-            color_conversion_micros: 0,
-            encoder_call_micros: 0,
-            quality: None,
-        };
-        drop(lease);
-        Ok(snapshot)
-    }
 }
 
 impl VideoQualityDiagnostics {
@@ -719,11 +653,6 @@ impl Drop for TextureMapping<'_> {
         // SAFETY: this guard is created immediately after a successful Map.
         unsafe { self.context.Unmap(self.texture, 0) };
     }
-}
-
-enum SnapshotAttemptError {
-    AccessLost,
-    Fatal(Box<dyn std::error::Error>),
 }
 
 struct GpuBridge {
