@@ -1,5 +1,7 @@
 //! Platform-neutral host session orchestration.
 
+pub mod video_recovery;
+
 use rustconsole_media::{AudioSamples, VideoFormat, VideoFrame};
 use rustconsole_protocol::InputEvent;
 use rustconsole_session::{SessionLifecycle, SessionPhase, SessionTransitionError};
@@ -45,7 +47,7 @@ pub mod audio_transport {
 
 pub const VIDEO_BITRATE_BOOTSTRAP: u64 = 1_000_000;
 const CONGESTION_TARGET_PERCENT: u128 = 90;
-const SAFE_PATH_PERCENT: u128 = 85;
+const SAFE_PATH_PERCENT: u128 = 100;
 const RECOVERY_PROBE_PERCENT: u128 = 110;
 const HEALTHY_REPORTS_BEFORE_RECOVERY: u8 = 2;
 const CAPACITY_AVERAGE_REPORTS: usize = 2;
@@ -98,6 +100,7 @@ pub struct AdaptiveBitrateController {
     previous_delivery: VideoDeliveryReport,
     previous_lost_packets: u64,
     healthy_reports: u8,
+    sender_congested_since_report: bool,
 }
 
 impl AdaptiveBitrateController {
@@ -113,6 +116,7 @@ impl AdaptiveBitrateController {
             previous_delivery: VideoDeliveryReport::default(),
             previous_lost_packets: 0,
             healthy_reports: 0,
+            sender_congested_since_report: false,
         }
     }
 
@@ -145,6 +149,7 @@ impl AdaptiveBitrateController {
         if delivery.measurement_interval_micros == 0 {
             return None;
         }
+        let sender_congested = std::mem::take(&mut self.sender_congested_since_report);
         if self.delivery_samples.len() == CAPACITY_AVERAGE_REPORTS {
             self.delivery_samples.pop_front();
         }
@@ -191,17 +196,14 @@ impl AdaptiveBitrateController {
             return self.set_target(target, BitrateChangeReason::Congestion);
         }
 
-        let rtt_congested = self.minimum_round_trip_time.is_some_and(|minimum| {
-            let growth = path.round_trip_time.saturating_sub(minimum);
-            growth > Duration::from_millis(5)
-                && path.round_trip_time.as_micros() > minimum.as_micros().saturating_mul(130) / 100
-        });
-        if rtt_congested || safe_path_capacity < self.target_bits_per_second {
+        if safe_path_capacity < self.target_bits_per_second {
             self.healthy_reports = 0;
-            return self.set_target(
-                congestion_target(capacity).min(safe_path_capacity),
-                BitrateChangeReason::Congestion,
-            );
+            return self.set_target(safe_path_capacity, BitrateChangeReason::Congestion);
+        }
+
+        if sender_congested {
+            self.healthy_reports = 0;
+            return None;
         }
 
         if self.target_bits_per_second == self.maximum_bits_per_second {
@@ -220,6 +222,11 @@ impl AdaptiveBitrateController {
 
     pub fn observe_sender_congestion(&mut self) -> Option<BitrateChange> {
         self.healthy_reports = 0;
+        // A brief drain between stalled frames is not evidence that congestion has cleared.
+        if self.sender_congested_since_report {
+            return None;
+        }
+        self.sender_congested_since_report = true;
         self.set_target(
             percentage(self.target_bits_per_second, CONGESTION_TARGET_PERCENT),
             BitrateChangeReason::Congestion,
@@ -680,7 +687,7 @@ mod tests {
     }
 
     #[test]
-    fn recovery_probe_requires_two_clean_reports() {
+    fn recovery_requires_two_clean_reports_and_uses_a_small_step() {
         let mut controller = AdaptiveBitrateController::new(100_000_000);
         let mut report = delivery(1_250_000);
         report.lost_chunks = 1;
@@ -698,6 +705,73 @@ mod tests {
                 reason: BitrateChangeReason::HealthyDelivery,
             })
         );
+    }
+
+    #[test]
+    fn stable_higher_rtt_does_not_prevent_full_recovery() {
+        let mut controller = AdaptiveBitrateController::new(100_000_000);
+        let mut congested = delivery(1_250_000);
+        congested.lost_chunks = 1;
+        controller.observe(path(200_000_000), congested);
+        assert_eq!(controller.target_bits_per_second(), 18_000_000);
+
+        let higher_rtt_path = VideoPathReport {
+            round_trip_time: Duration::from_millis(20),
+            congestion_window_bytes: 500_000,
+            lost_packets: 0,
+        };
+        let mut completed_payload_bytes = 1_250_000;
+        for _ in 0..36 {
+            completed_payload_bytes += 1_250_000;
+            controller.observe(higher_rtt_path, delivery(completed_payload_bytes));
+        }
+
+        assert_eq!(controller.target_bits_per_second(), 100_000_000);
+    }
+
+    #[test]
+    fn repeated_sender_stalls_cannot_collapse_bitrate_within_one_report() {
+        let mut controller = AdaptiveBitrateController::new(100_000_000);
+        controller.observe_sender_congestion().unwrap();
+        for _ in 0..120 {
+            assert_eq!(controller.observe_sender_congestion(), None);
+        }
+        assert_eq!(controller.target_bits_per_second(), 90_000_000);
+        assert_eq!(
+            controller.observe(path(200_000_000), delivery(5_000_000)),
+            None
+        );
+        assert_eq!(controller.target_bits_per_second(), 90_000_000);
+        assert_eq!(
+            controller
+                .observe_sender_congestion()
+                .unwrap()
+                .target_bits_per_second,
+            81_000_000
+        );
+    }
+
+    #[test]
+    fn sender_congestion_interval_cannot_count_toward_recovery() {
+        let mut controller = AdaptiveBitrateController::new(100_000_000);
+        controller.observe_sender_congestion();
+        for bytes in [5_000_000, 10_000_000] {
+            assert_eq!(controller.observe(path(200_000_000), delivery(bytes)), None);
+        }
+        let change = controller
+            .observe(path(200_000_000), delivery(15_000_000))
+            .unwrap();
+        assert_eq!(change.target_bits_per_second, 99_000_000);
+        assert_eq!(change.reason, BitrateChangeReason::HealthyDelivery);
+    }
+
+    #[test]
+    fn invalid_report_does_not_rearm_sender_bitrate_cuts() {
+        let mut controller = AdaptiveBitrateController::new(100_000_000);
+        controller.observe_sender_congestion();
+        controller.observe(path(200_000_000), VideoDeliveryReport::default());
+        assert_eq!(controller.observe_sender_congestion(), None);
+        assert_eq!(controller.target_bits_per_second(), 90_000_000);
     }
 
     #[test]

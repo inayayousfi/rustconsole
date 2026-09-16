@@ -1080,7 +1080,7 @@ impl Av1D3d11Decoder {
 pub struct Av1NvencEncoder {
     _context: CodecContext,
     #[cfg(windows)]
-    next_packet_is_keyframe: bool,
+    force_next_keyframe: bool,
     #[cfg(windows)]
     device_context: ID3D11DeviceContext,
 }
@@ -1172,7 +1172,7 @@ impl Av1NvencEncoder {
         Ok(Self {
             _context: context,
             #[cfg(windows)]
-            next_packet_is_keyframe: true,
+            force_next_keyframe: true,
             #[cfg(windows)]
             device_context,
         })
@@ -1191,6 +1191,11 @@ impl Av1NvencEncoder {
             (*context).rc_buffer_size = buffer_size;
         }
         Ok(())
+    }
+
+    #[cfg(windows)]
+    pub fn request_keyframe(&mut self) {
+        self.force_next_keyframe = true;
     }
 
     #[cfg(windows)]
@@ -1259,12 +1264,18 @@ impl Av1NvencEncoder {
         // dimensions validated by the host pipeline and encoder configuration.
         unsafe { self.device_context.CopyResource(destination, texture) };
         // SAFETY: the frame is exclusively owned.
-        unsafe { (*frame.0.as_ptr()).pts = presentation_timestamp };
+        unsafe {
+            (*frame.0.as_ptr()).pts = presentation_timestamp;
+            if self.force_next_keyframe {
+                (*frame.0.as_ptr()).pict_type = ffi::AVPictureType::AV_PICTURE_TYPE_I;
+            }
+        };
         // SAFETY: codec and hardware frame are initialized.
         let result = unsafe { ffi::avcodec_send_frame(self._context.0.as_ptr(), frame.0.as_ptr()) };
         if result < 0 {
             return Err(Av1CodecError::SendFrame(result));
         }
+        self.force_next_keyframe = false;
         Ok(())
     }
 
@@ -1289,8 +1300,7 @@ impl Av1NvencEncoder {
         }
         // SAFETY: FFmpeg exposes size bytes until the packet is unreferenced.
         let data = unsafe { std::slice::from_raw_parts(received.data, size) }.to_vec();
-        let keyframe = self.next_packet_is_keyframe || received.flags & ffi::AV_PKT_FLAG_KEY != 0;
-        self.next_packet_is_keyframe = false;
+        let keyframe = received.flags & ffi::AV_PKT_FLAG_KEY != 0;
         Ok(Some(EncodedAv1Packet {
             presentation_timestamp: received.pts,
             keyframe,

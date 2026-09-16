@@ -672,6 +672,18 @@ static HRESULT wait_for_fence(RustConsoleGpuBridge* bridge, uint64_t value) {
     return wait == WAIT_OBJECT_0 ? S_OK : HRESULT_FROM_WIN32(wait == WAIT_TIMEOUT ? ERROR_TIMEOUT : GetLastError());
 }
 
+static constexpr HRESULT keyed_mutex_result(HRESULT result) {
+    // AcquireSync returns positive wait statuses that FAILED/SUCCEEDED do not detect.
+    if (result == WAIT_TIMEOUT) return DXGI_ERROR_WAIT_TIMEOUT;
+    if (result == WAIT_ABANDONED) return DXGI_ERROR_ACCESS_LOST;
+    return result == S_OK || FAILED(result) ? result : E_UNEXPECTED;
+}
+
+static_assert(keyed_mutex_result(S_OK) == S_OK);
+static_assert(keyed_mutex_result(WAIT_TIMEOUT) == DXGI_ERROR_WAIT_TIMEOUT);
+static_assert(keyed_mutex_result(WAIT_ABANDONED) == DXGI_ERROR_ACCESS_LOST);
+static_assert(keyed_mutex_result(E_FAIL) == E_FAIL);
+
 static HRESULT capture_frame(
     RustConsoleGpuBridge* bridge,
     uint32_t timeout_millis,
@@ -780,7 +792,7 @@ static HRESULT capture_frame(
 
     const auto conversion_started = diagnostics ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     failure_stage = "convert NVIDIA-local capture texture to encoder format";
-    if (FAILED(result = bridge->nvidia11on12_mutex->AcquireSync(0, 5000))) return result;
+    if (FAILED(result = keyed_mutex_result(bridge->nvidia11on12_mutex->AcquireSync(0, 5000)))) return result;
     ID3D11Resource* wrapped[] = {bridge->nvidia_local_source11.Get()};
     bridge->nvidia_interop->AcquireWrappedResources(wrapped, ARRAYSIZE(wrapped));
     if (bridge->normal_desktop) {
@@ -815,7 +827,7 @@ static HRESULT capture_frame(
         std::chrono::steady_clock::now() - conversion_started).count();
     if (!external_consumer) {
         failure_stage = "acquire native NVIDIA encoder texture";
-        if (FAILED(result = bridge->encoder_mutex->AcquireSync(1, 5000))) return result;
+        if (FAILED(result = keyed_mutex_result(bridge->encoder_mutex->AcquireSync(1, 5000)))) return result;
         bridge->encoder_texture_outstanding = true;
         bridge->encoder_texture.CopyTo(encoder_texture);
     }
@@ -986,7 +998,8 @@ extern "C" HRESULT rustconsole_gpu_bridge_acquire_external(
     if (!bridge || !encoder_texture) return E_POINTER;
     if (bridge->encoder_texture_outstanding) return DXGI_ERROR_INVALID_CALL;
     failure_stage = "acquire external WGC encoder texture";
-    const HRESULT result = bridge->encoder_mutex->AcquireSync(1, timeout_millis);
+    *encoder_texture = nullptr;
+    const HRESULT result = keyed_mutex_result(bridge->encoder_mutex->AcquireSync(1, timeout_millis));
     if (FAILED(result)) return result;
     bridge->encoder_texture_outstanding = true;
     bridge->encoder_texture.CopyTo(encoder_texture);

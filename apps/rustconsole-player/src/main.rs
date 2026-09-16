@@ -266,26 +266,18 @@ impl VideoPlaybackClock {
 
 struct ActiveStreamSession {
     stop: Arc<AtomicBool>,
-    input: mpsc::SyncSender<TimedInputEvent>,
+    input: rustconsole_player_core::InputSender,
     input_queue_drops: Arc<AtomicU64>,
     diagnostic_probe_sequence: Arc<AtomicU64>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
-struct InputReceivers {
-    input: mpsc::Receiver<TimedInputEvent>,
-}
-
-impl InputReceivers {
-    fn try_recv(&self) -> Option<TimedInputEvent> {
-        self.input.try_recv().ok()
-    }
-}
-
 impl ActiveStreamSession {
     fn send_input(&self, event: InputEvent) {
         let occurred_at = Instant::now();
-        let _ = self.input.send(TimedInputEvent { event, occurred_at });
+        let _ = self
+            .input
+            .blocking_send(TimedInputEvent { event, occurred_at });
     }
 
     fn try_send_input(&self, event: InputEvent) {
@@ -310,8 +302,7 @@ fn start_stream_session(
     let stop = Arc::new(AtomicBool::new(false));
     let diagnostic_probe_sequence = Arc::new(AtomicU64::new(0));
     let input_queue_drops = Arc::new(AtomicU64::new(0));
-    let (input, input_rx) = mpsc::sync_channel(1024);
-    let input_receivers = InputReceivers { input: input_rx };
+    let (input, input_rx) = rustconsole_player_core::input_channel();
     let session_stop = Arc::clone(&stop);
     let address = launch.address.to_string();
     let password = (!launch.password.is_empty()).then(|| launch.password.to_vec());
@@ -336,7 +327,7 @@ fn start_stream_session(
                 diagnostic_probe_sequence: stream_diagnostic_probe_sequence,
             },
             || session_stop.load(Ordering::Acquire),
-            move || input_receivers.try_recv(),
+            input_rx,
             StreamCallbacks {
                 authenticated: move |host_identity| {
                     let _ = authenticated_tx.send(SessionEvent::Authenticated(host_identity));
@@ -1288,6 +1279,7 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
                                 ("video_assembly_overflows", totals.assembly_overflows),
                                 ("video_completed_frames", totals.completed_frames),
                                 ("video_incomplete_frames", totals.incomplete_frames),
+                                ("video_skipped_frames", totals.skipped_frames),
                                 (
                                     "video_completed_payload_bytes",
                                     totals.completed_payload_bytes,
@@ -2751,10 +2743,9 @@ mod tests {
 
     #[test]
     fn input_fifo_preserves_cross_device_order() {
-        let (input_tx, input) = mpsc::sync_channel(4);
-        let queues = InputReceivers { input };
+        let (input_tx, mut queues) = rustconsole_player_core::input_channel();
         input_tx
-            .send(TimedInputEvent {
+            .blocking_send(TimedInputEvent {
                 event: InputEvent::PointerMotion {
                     delta_x: 1,
                     delta_y: 0,
@@ -2764,7 +2755,7 @@ mod tests {
             .unwrap();
         for pressed in [true, false] {
             input_tx
-                .send(TimedInputEvent {
+                .blocking_send(TimedInputEvent {
                     event: InputEvent::Key {
                         hid_usage: 4,
                         pressed,

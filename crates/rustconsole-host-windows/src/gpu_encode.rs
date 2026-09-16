@@ -288,7 +288,12 @@ impl GpuAv1SnapshotEncoder {
         timeout: Duration,
     ) -> Result<Option<EncodedSnapshot>, Box<dyn std::error::Error>> {
         let diagnostics = self.quality.is_some();
-        let captured = match self.bridge.capture(timeout, diagnostics) {
+        let capture_timeout = if self.cached_texture.is_some() {
+            Duration::ZERO
+        } else {
+            timeout
+        };
+        let captured = match self.bridge.capture(capture_timeout, diagnostics) {
             Ok(lease) if lease.last_present_time != 0 => {
                 if self.cached_texture.is_none() {
                     let mut description = D3D11_TEXTURE2D_DESC::default();
@@ -434,8 +439,8 @@ impl GpuAv1SnapshotEncoder {
         Ok(())
     }
 
-    pub fn request_keyframe(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        self.rebuild_encoder(self.bitrate_bits_per_second)
+    pub fn request_keyframe(&mut self) {
+        self.encoder.request_keyframe();
     }
 
     fn rebuild_encoder(
@@ -659,6 +664,7 @@ struct GpuBridge {
     raw: NonNull<c_void>,
     configuration: VideoCaptureConfiguration,
     helper: Option<crate::wgc_helper::WgcHelper>,
+    pending_helper_frame: Option<crate::wgc_helper::WgcFrame>,
 }
 
 impl GpuBridge {
@@ -731,6 +737,7 @@ impl GpuBridge {
                 raw,
                 configuration,
                 helper: None,
+                pending_helper_frame: None,
             },
             device,
             configuration,
@@ -775,6 +782,7 @@ impl GpuBridge {
                 raw,
                 configuration,
                 helper: Some(helper),
+                pending_helper_frame: None,
             },
             device,
             configuration,
@@ -795,12 +803,21 @@ impl GpuBridge {
         let mut cross_adapter_copy_micros = 0;
         let mut color_conversion_micros = 0;
         let result = if let Some(helper) = self.helper.as_mut() {
-            let frame = helper
-                .next_frame(diagnostics)
-                .map_err(|error| BridgeError {
-                    code: 0x8000_4005_u32 as i32,
-                    stage: error.to_string(),
-                })?;
+            if self.pending_helper_frame.is_none() {
+                self.pending_helper_frame =
+                    helper
+                        .next_frame(timeout, diagnostics)
+                        .map_err(|error| BridgeError {
+                            code: 0x8000_4005_u32 as i32,
+                            stage: error.to_string(),
+                        })?;
+            }
+            let Some(frame) = self.pending_helper_frame.as_ref() else {
+                return Err(BridgeError {
+                    code: DXGI_ERROR_WAIT_TIMEOUT.0,
+                    stage: "interactive WGC frame is not ready".to_owned(),
+                });
+            };
             last_present_time = frame.last_present_time;
             accumulated_frames = frame.accumulated_frames;
             protected_content_masked = i32::from(frame.protected_content_masked);
@@ -844,6 +861,9 @@ impl GpuBridge {
             }
         };
         check_bridge_hresult(result)?;
+        // A timeout must retain the notification: the producer waits for this texture's release
+        // before it can publish the next one.
+        self.pending_helper_frame = None;
         // SAFETY: capture returned one owned COM reference on success.
         let texture = unsafe { ID3D11Texture2D::from_raw(texture) };
         Ok(EncoderTextureLease {

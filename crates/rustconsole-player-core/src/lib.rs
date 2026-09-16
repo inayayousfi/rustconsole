@@ -413,12 +413,19 @@ pub struct TimedInputEvent {
     pub occurred_at: std::time::Instant,
 }
 
+pub type InputSender = tokio::sync::mpsc::Sender<TimedInputEvent>;
+pub type InputReceiver = tokio::sync::mpsc::Receiver<TimedInputEvent>;
+
+pub fn input_channel() -> (InputSender, InputReceiver) {
+    tokio::sync::mpsc::channel(1024)
+}
+
 pub struct StreamConsumers<Audio, Video> {
     pub audio: Audio,
     pub video: Video,
 }
 
-pub struct StreamHostParameters<PasswordFor, Authenticated, Progress, Stop, Input, Audio, Video> {
+pub struct StreamHostParameters<PasswordFor, Authenticated, Progress, Stop, Audio, Video> {
     pub address: SocketAddr,
     pub password_for: PasswordFor,
     pub on_authenticated: Authenticated,
@@ -426,7 +433,7 @@ pub struct StreamHostParameters<PasswordFor, Authenticated, Progress, Stop, Inpu
     pub full_diagnostics: bool,
     pub video: (Vec<DomainCapability>, DomainSettings),
     pub should_stop: Stop,
-    pub next_input: Input,
+    pub input: InputReceiver,
     pub consumers: StreamConsumers<Audio, Video>,
 }
 
@@ -531,24 +538,16 @@ pub fn probe_host_with(
     })
 }
 
-pub fn stream_host<PasswordFor, Authenticated, Progress, Stop, Input, Audio, Video>(
-    parameters: StreamHostParameters<
-        PasswordFor,
-        Authenticated,
-        Progress,
-        Stop,
-        Input,
-        Audio,
-        Video,
-    >,
+pub fn stream_host<PasswordFor, Authenticated, Progress, Stop, Audio, AudioConsumer, Video>(
+    parameters: StreamHostParameters<PasswordFor, Authenticated, Progress, Stop, Audio, Video>,
 ) -> Result<StreamHostResult, Box<dyn std::error::Error>>
 where
     PasswordFor: FnOnce(HostIdentity) -> Option<Vec<u8>>,
     Authenticated: FnOnce(HostIdentity) -> Result<(), Box<dyn std::error::Error>>,
     Progress: FnMut(StreamProgress),
     Stop: Fn() -> bool,
-    Input: FnMut() -> Option<TimedInputEvent> + Send + 'static,
-    Audio: FnMut(AudioPlaybackEvent) -> Result<(), Box<dyn std::error::Error>>,
+    Audio: FnOnce() -> AudioConsumer + Send + 'static,
+    AudioConsumer: FnMut(AudioPlaybackEvent) -> Result<(), Box<dyn std::error::Error>>,
     Video: FnMut(
         VideoFramePayload,
         StreamTransportStatistics,
@@ -562,7 +561,7 @@ where
         full_diagnostics,
         video,
         should_stop,
-        next_input,
+        input,
         consumers,
     } = parameters;
     let (decoder_capabilities, settings) = video;
@@ -726,7 +725,7 @@ where
                 host_pointer_release,
                 diagnostic_stream,
                 should_stop,
-                next_input,
+                input,
                 progress: on_progress,
                 consumers: StreamConsumers {
                     audio: consume_audio,

@@ -400,12 +400,12 @@ pub fn run_authentication_probe(
 pub fn stream_quic_video(
     configuration: StreamConfiguration,
     should_stop: impl Fn() -> bool,
-    next_input: impl FnMut() -> Option<rustconsole_player_core::TimedInputEvent> + Send + 'static,
+    input: rustconsole_player_core::InputReceiver,
     callbacks: StreamCallbacks<
         impl FnOnce([u8; 32]),
         impl FnMut(rustconsole_player_core::StreamProgress),
         impl FnMut(VideoStreamSample),
-        impl FnMut(DecodedAudioEvent) -> Result<(), Box<dyn std::error::Error>>,
+        impl FnMut(DecodedAudioEvent) -> Result<(), Box<dyn std::error::Error>> + Send + 'static,
         impl FnMut(DecodedVideoFrame) -> Result<bool, Box<dyn std::error::Error>>,
     >,
 ) -> Result<rustconsole_player_core::StreamHostResult, Box<dyn std::error::Error>> {
@@ -453,10 +453,6 @@ pub fn stream_quic_video(
     };
     let device = HardwareDevice::open(HardwareDeviceType::VaApi, Some(VAAPI_DEVICE))?;
     let mut decoder = Av1VaApiDecoder::open(&device)?;
-    let mut audio_decoder = StreamAudioDecoder {
-        diagnostics: latency_diagnostics,
-        ..StreamAudioDecoder::default()
-    };
     let mut diagnostic_marker = None;
     let mut diagnostic_baseline_attempted = false;
     let mut last_diagnostic_probe_sequence = 0;
@@ -502,13 +498,19 @@ pub fn stream_quic_video(
         full_diagnostics: latency_diagnostics,
         video: (vec![capability_10, capability_8], settings),
         should_stop,
-        next_input,
+        input,
         consumers: rustconsole_player_core::StreamConsumers {
-            audio: move |event| {
-                for event in audio_decoder.event(event) {
-                    consume_audio(event)?;
+            audio: move || {
+                let mut audio_decoder = StreamAudioDecoder {
+                    diagnostics: latency_diagnostics,
+                    ..StreamAudioDecoder::default()
+                };
+                move |event| {
+                    for event in audio_decoder.event(event) {
+                        consume_audio(event)?;
+                    }
+                    Ok(())
                 }
-                Ok(())
             },
             video: move |
                 frame: rustconsole_player_core::VideoFramePayload,

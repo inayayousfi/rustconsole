@@ -756,22 +756,45 @@ mod windows {
         let pointer_duplicate_or_late = 0_u64;
         let pointer_mode_rejections = 0_u64;
         let pointer_relative_baselines = 0_u64;
+        let (response_tx, mut responses) = tokio::sync::mpsc::channel::<Envelope>(64);
+        let mut response_writer = tokio::task::JoinSet::new();
+        response_writer.spawn(async move {
+            while let Some(response) = responses.recv().await {
+                tokio::time::timeout(Duration::from_secs(3), write_envelope(&mut send, response))
+                    .await
+                    .map_err(|_| "session response write timed out".to_owned())?
+                    .map_err(|error| error.to_string())?;
+            }
+            send.finish().map_err(|error| error.to_string())
+        });
+        let (incoming_tx, mut incoming) = tokio::sync::mpsc::channel(8);
+        let mut readers = tokio::task::JoinSet::new();
+        for (stream, from_input_stream) in std::iter::once((receive, false))
+            .chain(input_receive.take().map(|stream| (stream, true)))
+        {
+            readers.spawn(read_session_messages(
+                stream,
+                from_input_stream,
+                incoming_tx.clone(),
+            ));
+        }
+        drop(incoming_tx);
         let mut input_tick = tokio::time::interval(Duration::from_millis(5));
         input_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         'control: loop {
-            let mut next_control = Box::pin(read_envelope(&mut receive));
-            let mut next_input = Box::pin(async {
-                match input_receive.as_mut() {
-                    Some(receive) => read_envelope(receive).await,
-                    None => std::future::pending().await,
-                }
-            });
             let (envelope, from_input_stream) = loop {
                 tokio::select! {
+                    result = response_writer.join_next() => {
+                        control_error = Some(match result {
+                            Some(Ok(Err(error))) => error,
+                            _ => "session response writer stopped unexpectedly".to_owned(),
+                        });
+                        break 'control;
+                    }
                     state = audio_state_rx.changed(), if audio_state_open => {
                         if state.is_err() { audio_state_open = false; continue; }
                         let state = audio_state_rx.borrow_and_update().clone();
-                        if let Err(error) = write_envelope(&mut send, Envelope { body: Some(envelope::Body::AudioStreamState(state)) }).await {
+                        if let Err(error) = response_tx.try_send(Envelope { body: Some(envelope::Body::AudioStreamState(state)) }) {
                             control_error = Some(error.to_string()); break 'control;
                         }
                     }
@@ -779,11 +802,11 @@ mod windows {
                         media_finished = true;
                         match result {
                             Ok(Ok(WorkerVideoExit::ReconfigurationRequired(cause))) => {
-                                if let Err(error) = write_envelope(&mut send, Envelope {
+                                if let Err(error) = response_tx.try_send(Envelope {
                                     body: Some(envelope::Body::VideoStreamState(
                                         wire::VideoStreamState::reconfiguration_required(cause),
                                     )),
-                                }).await {
+                                }) {
                                     control_error = Some(error.to_string());
                                 }
                             }
@@ -805,11 +828,11 @@ mod windows {
                         if let Some(controls) = session_controls.as_mut() {
                             match controls.try_next_action() {
                                 Ok(Some(HostSessionControlAction::ReleasePointerCapture)) => {
-                                    if let Err(error) = write_envelope(&mut send, Envelope {
+                                    if let Err(error) = response_tx.try_send(Envelope {
                                         body: Some(envelope::Body::HostSessionControl(HostSessionControl {
                                             kind: HostSessionControlKind::ReleasePointerCapture as i32,
                                         })),
-                                    }).await {
+                                    }) {
                                         control_error = Some(error.to_string());
                                         break 'control;
                                     }
@@ -836,18 +859,15 @@ mod windows {
                             Err(_) => { control_error = Some("virtual input owner lock poisoned".to_owned()); break 'control; }
                         };
                         for state in leds {
-                            if let Err(error) = write_envelope(&mut send, Envelope { body: Some(envelope::Body::KeyboardLeds(state)) }).await {
+                            if let Err(error) = response_tx.try_send(Envelope { body: Some(envelope::Body::KeyboardLeds(state)) }) {
                                 control_error = Some(error.to_string()); break 'control;
                             }
                         }
                     }
-                    envelope = &mut next_control => match envelope {
-                        Ok(envelope) => break (envelope, false),
-                        Err(error) => { control_error = Some(error.to_string()); break 'control; }
-                    },
-                    envelope = &mut next_input => match envelope {
-                        Ok(envelope) => break (envelope, true),
-                        Err(error) => { control_error = Some(error.to_string()); break 'control; }
+                    message = incoming.recv() => match message {
+                        Some((Ok(envelope), from_input_stream)) => break (envelope, from_input_stream),
+                        Some((Err(error), _)) => { control_error = Some(error.to_string()); break 'control; }
+                        None => { control_error = Some("session readers stopped".to_owned()); break 'control; }
                     },
                 }
             };
@@ -962,14 +982,9 @@ mod windows {
                         .lock()
                         .unwrap_or_else(|error| error.into_inner()) =
                         (ack.through_sequence, ack.host_submitted_at_micros);
-                    if let Err(error) = write_envelope(
-                        &mut send,
-                        Envelope {
-                            body: Some(envelope::Body::InputAck(ack)),
-                        },
-                    )
-                    .await
-                    {
+                    if let Err(error) = response_tx.try_send(Envelope {
+                        body: Some(envelope::Body::InputAck(ack)),
+                    }) {
                         control_error = Some(error.to_string());
                         break;
                     }
@@ -991,14 +1006,9 @@ mod windows {
                             .transpose()?
                             .unwrap_or(0),
                     };
-                    if let Err(error) = write_envelope(
-                        &mut send,
-                        Envelope {
-                            body: Some(envelope::Body::ClockPong(pong)),
-                        },
-                    )
-                    .await
-                    {
+                    if let Err(error) = response_tx.try_send(Envelope {
+                        body: Some(envelope::Body::ClockPong(pong)),
+                    }) {
                         control_error = Some(error.to_string());
                         break;
                     }
@@ -1038,6 +1048,19 @@ mod windows {
         }
         let _ = control_tx.try_send(WorkerVideoControl::Stop);
         drop(control_tx);
+        drop(readers);
+        drop(response_tx);
+        while let Some(result) = response_writer.join_next().await {
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    control_error.get_or_insert(error);
+                }
+                Err(error) => {
+                    control_error.get_or_insert_with(|| error.to_string());
+                }
+            }
+        }
         if !media_finished {
             match media.await {
                 Ok(Ok(_)) => {}
@@ -1059,8 +1082,112 @@ mod windows {
         ) {
             return Ok(());
         }
-        session_try!("finishing host control stream", send.finish());
         Ok(())
+    }
+
+    async fn read_session_messages(
+        mut stream: quinn::RecvStream,
+        from_input_stream: bool,
+        incoming: tokio::sync::mpsc::Sender<(Result<Envelope, String>, bool)>,
+    ) {
+        loop {
+            // Each stream keeps its partial frame until it completes or the session ends.
+            let message = read_envelope(&mut stream)
+                .await
+                .map_err(|error| error.to_string());
+            let failed = message.is_err();
+            if incoming.send((message, from_input_stream)).await.is_err() || failed {
+                break;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod stream_tests {
+        use super::*;
+
+        #[tokio::test]
+        async fn control_messages_do_not_cancel_partial_input_frames() {
+            let server = Endpoint::server(
+                ephemeral_server_config().unwrap(),
+                "127.0.0.1:0".parse().unwrap(),
+            )
+            .unwrap();
+            let mut client = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+            client.set_default_client_config(
+                rustconsole_session::quic::opaque_client_config().unwrap(),
+            );
+            let connecting = client
+                .connect(server.local_addr().unwrap(), "rustconsole.invalid")
+                .unwrap();
+            let (client_connection, server_connection) =
+                tokio::join!(async { connecting.await.unwrap() }, async {
+                    server.accept().await.unwrap().await.unwrap()
+                },);
+            let (incoming_tx, mut incoming) = tokio::sync::mpsc::channel(8);
+            let mut readers = tokio::task::JoinSet::new();
+            let mut input = client_connection.open_uni().await.unwrap();
+            let down = Envelope {
+                body: Some(envelope::Body::InputPack(wire::InputPack {
+                    transitions: vec![wire::InputTransition {
+                        generation: 1,
+                        sequence: 1,
+                        player_sent_at_micros: 0,
+                        action: Some(wire::input_transition::Action::Key(wire::KeyTransition {
+                            hid_usage: 4,
+                            pressed: true,
+                        })),
+                    }],
+                })),
+            };
+            let bytes = wire::encode_reliable_frame(&down).unwrap();
+            input.write_all(&bytes[..2]).await.unwrap();
+            readers.spawn(read_session_messages(
+                server_connection.accept_uni().await.unwrap(),
+                true,
+                incoming_tx.clone(),
+            ));
+            let mut control = client_connection.open_uni().await.unwrap();
+            let ping = Envelope {
+                body: Some(envelope::Body::ClockPing(wire::ClockPing {
+                    sequence: 1,
+                    player_sent_at_micros: 0,
+                })),
+            };
+            write_envelope(&mut control, ping.clone()).await.unwrap();
+            readers.spawn(read_session_messages(
+                server_connection.accept_uni().await.unwrap(),
+                false,
+                incoming_tx,
+            ));
+            let (message, is_input) = tokio::time::timeout(Duration::from_secs(2), incoming.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!is_input);
+            assert_eq!(message.unwrap(), ping);
+            input.write_all(&bytes[2..]).await.unwrap();
+            let mut up = down.clone();
+            if let Some(envelope::Body::InputPack(pack)) = up.body.as_mut() {
+                pack.transitions[0].sequence = 2;
+                pack.transitions[0].action =
+                    Some(wire::input_transition::Action::Key(wire::KeyTransition {
+                        hid_usage: 4,
+                        pressed: false,
+                    }));
+            }
+            write_envelope(&mut input, up.clone()).await.unwrap();
+            for expected in [down, up] {
+                let (message, is_input) =
+                    tokio::time::timeout(Duration::from_secs(2), incoming.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                assert!(is_input);
+                assert_eq!(message.unwrap(), expected);
+            }
+            readers.abort_all();
+        }
     }
 
     fn detect_vb_cable_status() -> wire::VbCableStatus {
@@ -1279,17 +1406,14 @@ mod windows {
         let mut audio_queued_at = 0_u64;
         let mut local_audio_drops = 0_u64;
         let mut worker_audio_drops = 0_u64;
-        let mut last_keyframe = Instant::now() - Duration::from_secs(1);
+        let mut recovery = rustconsole_host_core::video_recovery::VideoRecovery::default();
         let frame_period = Duration::from_nanos(1_000_000_000 / u64::from(frames_per_second));
-        let mut sender_congested = false;
+        let mut observed_worker_drops = stream.dropped_events();
         loop {
             loop {
                 match controls.try_recv() {
                     Ok(WorkerVideoControl::RequestKeyframe) => {
-                        if last_keyframe.elapsed() >= Duration::from_secs(1) {
-                            stream.request_keyframe()?;
-                            last_keyframe = Instant::now();
-                        }
+                        recovery.require_keyframe();
                     }
                     Ok(WorkerVideoControl::ReceiverReport(report)) => {
                         let path = connection.stats().path;
@@ -1308,7 +1432,6 @@ mod windows {
                                 incomplete_frames: report.incomplete_frames,
                             },
                         );
-                        sender_congested = false;
                         if let Some(change) = change {
                             stream.set_bitrate(change.target_bits_per_second)?;
                         }
@@ -1322,6 +1445,17 @@ mod windows {
             }
             if connection.close_reason().is_some() {
                 return Ok(WorkerVideoExit::Stopped);
+            }
+            let worker_drops = stream.dropped_events();
+            if worker_drops > observed_worker_drops {
+                observed_worker_drops = worker_drops;
+                recovery.require_keyframe();
+                if let Some(change) = controller.observe_sender_congestion() {
+                    stream.set_bitrate(change.target_bits_per_second)?;
+                }
+            }
+            if recovery.request_due(Instant::now()) {
+                stream.request_keyframe()?;
             }
             if enable_audio
                 && audio_pending.is_empty()
@@ -1498,19 +1632,13 @@ mod windows {
             );
             if !video_pending.is_empty() && video_started.elapsed() >= send_deadline {
                 video_pending.clear();
-                if !sender_congested {
-                    sender_congested = true;
-                    if let Some(change) = controller.observe_sender_congestion() {
-                        stream.set_bitrate(change.target_bits_per_second)?;
-                    }
+                if let Some(change) = controller.observe_sender_congestion() {
+                    stream.set_bitrate(change.target_bits_per_second)?;
                 }
                 if let Some(record) = video_pending_diagnostic.take() {
                     submit_payload_digest(diagnostic_tx.as_ref(), record)?;
                 }
-                if last_keyframe.elapsed() >= Duration::from_secs(1) {
-                    stream.request_keyframe()?;
-                    last_keyframe = Instant::now();
-                }
+                recovery.require_keyframe();
             }
             if video_pending.is_empty()
                 && let Some(event) = stream
@@ -1537,6 +1665,9 @@ mod windows {
                         ..
                     } => {
                         let service_received_at_micros = clock.now()?;
+                        if !recovery.accept(sequence, keyframe) {
+                            continue;
+                        }
                         let Some(maximum_datagram_size) = connection.max_datagram_size() else {
                             return Err("QUIC peer does not support datagrams".into());
                         };
@@ -1626,16 +1757,17 @@ mod windows {
                 )) {
                     Ok(true) => {
                         video_pending.pop_front();
-                        if video_pending.is_empty()
-                            && let Some(mut record) = video_pending_diagnostic.take()
-                        {
-                            record.last_send_completed_at_micros = clock.now()?;
-                            submit_payload_digest(diagnostic_tx.as_ref(), record)?;
+                        if video_pending.is_empty() {
+                            if let Some(mut record) = video_pending_diagnostic.take() {
+                                record.last_send_completed_at_micros = clock.now()?;
+                                submit_payload_digest(diagnostic_tx.as_ref(), record)?;
+                            }
                         }
                     }
                     Ok(false) => {}
                     Err(quinn::SendDatagramError::TooLarge) => {
                         video_pending.clear();
+                        recovery.require_keyframe();
                         if let Some(record) = video_pending_diagnostic.take() {
                             submit_payload_digest(diagnostic_tx.as_ref(), record)?;
                         }
@@ -1662,7 +1794,7 @@ mod windows {
         let settings = offer.viewer_settings.ok_or("viewer omitted AV1 settings")?;
         if settings.width != 2560
             || settings.height != 1440
-            || settings.frames_per_second != 120
+            || settings.frames_per_second == 0
             || settings.maximum_bitrate_bits_per_second == 0
             || settings.mode_preferences.is_empty()
         {

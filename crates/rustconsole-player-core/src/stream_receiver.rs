@@ -27,6 +27,8 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
+const KEYFRAME_RETRY_INTERVAL: Duration = Duration::from_millis(250);
+
 enum DiagnosticEvent {
     ReleasePointerCapture,
     Clock(crate::ClockOffsetEstimate),
@@ -599,6 +601,68 @@ struct ReaderGuard {
     task: Option<tokio::task::JoinHandle<Result<StreamEnd, String>>>,
 }
 
+struct AudioConsumerThread {
+    events: Arc<MediaQueue<AudioPlaybackEvent>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for AudioConsumerThread {
+    fn drop(&mut self) {
+        self.events.close();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+struct OutgoingControl {
+    envelope: Envelope,
+    input_events: Vec<(u64, Instant, bool)>,
+}
+
+async fn write_controls(
+    mut stream: quinn::SendStream,
+    mut messages: tokio::sync::mpsc::Receiver<OutgoingControl>,
+    diagnostics: Arc<MediaQueue<DiagnosticEvent>>,
+) -> Result<(), String> {
+    while let Some(message) = messages.recv().await {
+        let sent_at = Instant::now();
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            write_envelope(&mut stream, message.envelope),
+        )
+        .await
+        .map_err(|_| "reliable stream write timed out".to_owned())?
+        .map_err(|error| error.to_string())?;
+        let send_completed_at = Instant::now();
+        for (sequence, occurred_at, correlates_test_marker) in message.input_events {
+            diagnostics.push(DiagnosticEvent::InputSent {
+                sequence,
+                occurred_at,
+                sent_at,
+                send_completed_at,
+                correlates_test_marker,
+            });
+        }
+    }
+    stream.finish().map_err(|error| error.to_string())
+}
+
+fn queue_control(
+    sender: &tokio::sync::mpsc::Sender<OutgoingControl>,
+    envelope: Envelope,
+    input_events: Vec<(u64, Instant, bool)>,
+) -> Result<(), String> {
+    sender
+        .try_send(OutgoingControl {
+            envelope,
+            input_events,
+        })
+        .map_err(|_| {
+            "reliable stream queue unavailable; closing session to release input".to_owned()
+        })
+}
+
 impl Drop for ReaderGuard {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
@@ -617,7 +681,7 @@ pub(super) fn close_with_stream_error(connection: &quinn::Connection, error: &st
     connection.close(0x202_u32.into(), &error.as_bytes()[..end]);
 }
 
-pub(super) struct ReceiveStreamParameters<Stop, Input, Progress, Audio, Video> {
+pub(super) struct ReceiveStreamParameters<Stop, Progress, Audio, Video> {
     pub(super) connection: quinn::Connection,
     pub(super) control: (quinn::SendStream, quinn::RecvStream),
     pub(super) input_stream: Option<quinn::SendStream>,
@@ -626,19 +690,19 @@ pub(super) struct ReceiveStreamParameters<Stop, Input, Progress, Audio, Video> {
     pub(super) host_pointer_release: bool,
     pub(super) diagnostic_stream: Option<quinn::RecvStream>,
     pub(super) should_stop: Stop,
-    pub(super) next_input: Input,
+    pub(super) input: crate::InputReceiver,
     pub(super) progress: Progress,
     pub(super) consumers: StreamConsumers<Audio, Video>,
 }
 
-pub(super) async fn receive_stream<Stop, Input, Progress, Audio, Video>(
-    parameters: ReceiveStreamParameters<Stop, Input, Progress, Audio, Video>,
+pub(super) async fn receive_stream<Stop, Progress, Audio, AudioConsumer, Video>(
+    parameters: ReceiveStreamParameters<Stop, Progress, Audio, Video>,
 ) -> Result<StreamEnd, Box<dyn std::error::Error>>
 where
     Stop: Fn() -> bool,
-    Input: FnMut() -> Option<TimedInputEvent> + Send + 'static,
     Progress: FnMut(StreamProgress),
-    Audio: FnMut(AudioPlaybackEvent) -> Result<(), Box<dyn std::error::Error>>,
+    Audio: FnOnce() -> AudioConsumer + Send + 'static,
+    AudioConsumer: FnMut(AudioPlaybackEvent) -> Result<(), Box<dyn std::error::Error>>,
     Video: FnMut(
         VideoFramePayload,
         StreamTransportStatistics,
@@ -653,16 +717,15 @@ where
         host_pointer_release,
         diagnostic_stream,
         should_stop,
-        mut next_input,
+        input: mut next_input,
         mut progress,
         consumers,
     } = parameters;
     let StreamConsumers {
-        audio: mut consume_audio,
+        audio: create_audio,
         video: mut consume_video,
     } = consumers;
-    let (mut send, mut receive) = control;
-    let mut input_send = input_stream;
+    let (send, mut receive) = control;
     let frames = Arc::new(MediaQueue::new(2));
     let audio_events = Arc::new(MediaQueue::new(AUDIO_QUEUE_PACKETS + 1));
     let diagnostic_events = Arc::new(MediaQueue::new(1024));
@@ -744,12 +807,31 @@ where
             })
         });
     let task = tokio::spawn(async move {
+        // JoinSet aborts both writers if this receiver is cancelled during shutdown.
+        let mut writers = tokio::task::JoinSet::new();
+        let (control_send, control_messages) = tokio::sync::mpsc::channel(8);
+        writers.spawn(write_controls(
+            send,
+            control_messages,
+            Arc::clone(&reader_diagnostics),
+        ));
+        let input_send = if let Some(stream) = input_stream {
+            let (sender, messages) = tokio::sync::mpsc::channel(4);
+            writers.spawn(write_controls(
+                stream,
+                messages,
+                Arc::clone(&reader_diagnostics),
+            ));
+            sender
+        } else {
+            control_send.clone()
+        };
         let result = async {
             let frame_period = Duration::from_nanos(1_000_000_000 / u64::from(fps));
             let mut ticks = tokio::time::interval(frame_period);
             ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut last_report = Instant::now();
-            let mut last_keyframe = Instant::now() - Duration::from_secs(1);
+            let mut last_keyframe = Instant::now() - KEYFRAME_RETRY_INTERVAL;
             let input_generation = 1;
             let mut input_sequence = 0u64;
             let mut clock_sequence = 0_u64;
@@ -760,6 +842,12 @@ where
                 let mut control = Box::pin(read_envelope(&mut receive));
                 loop {
                     tokio::select! {
+                        writer = writers.join_next() => {
+                            return Err(match writer {
+                                Some(Ok(Err(error))) => error,
+                                _ => "reliable stream writer stopped unexpectedly".to_owned(),
+                            });
+                        }
                         message = &mut control => {
                             match message.map_err(|e| e.to_string())?.body {
                                 Some(envelope::Body::AudioStreamState(state)) => receiver.state(state),
@@ -819,21 +907,19 @@ where
                         datagram = reader_connection.read_datagram() => {
                             receiver.datagram(&datagram.map_err(|e| e.to_string())?, Instant::now(), reader_connection.rtt())?;
                         }
-                        _ = ticks.tick() => {
+                        ready = async {
+                            let permit = input_send.reserve().await.map_err(|error| error.to_string())?;
+                            Ok::<_, String>((permit, next_input.recv().await))
+                        } => {
+                            let (permit, first) = ready?;
                             if reader_stop.load(Ordering::Acquire) { break 'stream StreamEnd::Stopped; }
-                            if reader_full_diagnostics && Instant::now() >= next_clock_sync {
-                                clock_sequence = clock_sequence.checked_add(1).ok_or("clock sequence exhausted")?;
-                                let player_sent_at_micros = elapsed_micros(reader_started);
-                                write_envelope(&mut send, Envelope { body: Some(envelope::Body::ClockPing(ClockPing { sequence: clock_sequence, player_sent_at_micros })) }).await.map_err(|e| e.to_string())?;
-                                next_clock_sync = Instant::now() + Duration::from_millis(500);
-                            }
-                            for _ in 0..4 {
-                                let sent_at = Instant::now();
+                            let Some(first) = first else { break 'stream StreamEnd::Stopped; };
                                 let player_sent_at_micros = elapsed_micros(reader_started);
                                 let mut transitions = Vec::with_capacity(rustconsole_protocol::input::MAX_EVENTS_PER_PACK);
                                 let mut sent_events = Vec::with_capacity(rustconsole_protocol::input::MAX_EVENTS_PER_PACK);
+                                let mut first = Some(first);
                                 for _ in 0..rustconsole_protocol::input::MAX_EVENTS_PER_PACK {
-                                    let Some(TimedInputEvent { event, occurred_at }) = next_input() else { break; };
+                                    let Some(TimedInputEvent { event, occurred_at }) = first.take().or_else(|| next_input.try_recv().ok()) else { break; };
                                     input_sequence = input_sequence.checked_add(1).ok_or("input sequence exhausted")?;
                                     let correlates_test_marker = matches!(event, InputEvent::PointerButton { pressed: true, .. });
                                     let action = match event {
@@ -847,19 +933,22 @@ where
                                     transitions.push(InputTransition { generation: input_generation, sequence: input_sequence, action: Some(action), player_sent_at_micros });
                                     sent_events.push((input_sequence, occurred_at, correlates_test_marker));
                                 }
-                                if transitions.is_empty() { break; }
-                                write_envelope(input_send.as_mut().unwrap_or(&mut send), Envelope { body: Some(envelope::Body::InputPack(InputPack { transitions })) }).await.map_err(|e| e.to_string())?;
-                                let send_completed_at = Instant::now();
-                                for (sequence, occurred_at, correlates_test_marker) in sent_events {
-                                    reader_diagnostics.push(DiagnosticEvent::InputSent { sequence, occurred_at, sent_at, send_completed_at, correlates_test_marker });
-                                }
+                                permit.send(OutgoingControl { envelope: Envelope { body: Some(envelope::Body::InputPack(InputPack { transitions })) }, input_events: sent_events });
+                        }
+                        _ = ticks.tick() => {
+                            if reader_stop.load(Ordering::Acquire) { break 'stream StreamEnd::Stopped; }
+                            if reader_full_diagnostics && Instant::now() >= next_clock_sync {
+                                clock_sequence = clock_sequence.checked_add(1).ok_or("clock sequence exhausted")?;
+                                let player_sent_at_micros = elapsed_micros(reader_started);
+                                queue_control(&control_send, Envelope { body: Some(envelope::Body::ClockPing(ClockPing { sequence: clock_sequence, player_sent_at_micros })) }, Vec::new())?;
+                                next_clock_sync = Instant::now() + Duration::from_millis(500);
                             }
                             receiver.audio.expire(Instant::now());
                             let events = receiver.ordered_audio.expire(Instant::now());
                             receiver.queue_audio(events);
                             receiver.publish(reader_connection.rtt());
-                            if (reader_request.load(Ordering::Acquire) || receiver.recover.load(Ordering::Acquire)) && last_keyframe.elapsed() >= Duration::from_secs(1) {
-                                write_envelope(&mut send, Envelope { body: Some(envelope::Body::VideoControl(VideoControl { kind: VideoControlKind::RequestKeyframe as i32 })) }).await.map_err(|e| e.to_string())?;
+                            if (reader_request.load(Ordering::Acquire) || receiver.recover.load(Ordering::Acquire)) && last_keyframe.elapsed() >= KEYFRAME_RETRY_INTERVAL {
+                                queue_control(&control_send, Envelope { body: Some(envelope::Body::VideoControl(VideoControl { kind: VideoControlKind::RequestKeyframe as i32 })) }, Vec::new())?;
                                 reader_keyframe_requests.fetch_add(1, Ordering::Relaxed);
                                 reader_keyframe_recovery_started
                                     .lock()
@@ -880,7 +969,7 @@ where
                                     completed_payload_bytes: stats.completed_payload_bytes,
                                     measurement_interval_micros: last_report.elapsed().as_micros() as u64,
                                 };
-                                write_envelope(&mut send, Envelope { body: Some(envelope::Body::VideoReceiverReport(report)) }).await.map_err(|e| e.to_string())?;
+                                queue_control(&control_send, Envelope { body: Some(envelope::Body::VideoReceiverReport(report)) }, Vec::new())?;
                                 last_report = Instant::now();
                             }
                         }
@@ -888,9 +977,13 @@ where
                 }
             };
             input_sequence = input_sequence.checked_add(1).ok_or("input sequence exhausted")?;
-            write_envelope(input_send.as_mut().unwrap_or(&mut send), Envelope { body: Some(envelope::Body::InputPack(InputPack { transitions: vec![InputTransition { generation: input_generation, sequence: input_sequence, action: Some(input_transition::Action::ReleaseAll(ReleaseAll {})), player_sent_at_micros: elapsed_micros(reader_started) }] })) }).await.map_err(|e| e.to_string())?;
-            write_envelope(&mut send, Envelope { body: Some(envelope::Body::VideoControl(VideoControl { kind: VideoControlKind::Stop as i32 })) }).await.map_err(|e| e.to_string())?;
-            send.finish().map_err(|e| e.to_string())?;
+            queue_control(&input_send, Envelope { body: Some(envelope::Body::InputPack(InputPack { transitions: vec![InputTransition { generation: input_generation, sequence: input_sequence, action: Some(input_transition::Action::ReleaseAll(ReleaseAll {})), player_sent_at_micros: elapsed_micros(reader_started) }] })) }, Vec::new())?;
+            queue_control(&control_send, Envelope { body: Some(envelope::Body::VideoControl(VideoControl { kind: VideoControlKind::Stop as i32 })) }, Vec::new())?;
+            drop(input_send);
+            drop(control_send);
+            while let Some(writer) = writers.join_next().await {
+                writer.map_err(|error| error.to_string())??;
+            }
             Ok(end)
         }.await;
         if let Err(error) = &result {
@@ -905,6 +998,37 @@ where
         stop,
         task: Some(task),
     };
+    let audio_connection = guard.connection.clone();
+    let consumer_events = Arc::clone(&audio_events);
+    let _audio_consumer = AudioConsumerThread {
+        events: Arc::clone(&audio_events),
+        thread: Some(
+            std::thread::Builder::new()
+                .name("audio-decode".to_owned())
+                .spawn(move || {
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let mut consume_audio = create_audio();
+                        loop {
+                            if let Some(event) =
+                                consumer_events.pop_timeout(Duration::from_millis(10))
+                            {
+                                consume_audio(event).map_err(|error| error.to_string())?;
+                            } else if consumer_events.is_closed() {
+                                break;
+                            }
+                        }
+                        Ok::<(), String>(())
+                    }));
+                    match result {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => close_with_stream_error(&audio_connection, &error),
+                        Err(_) => {
+                            close_with_stream_error(&audio_connection, "audio consumer panicked")
+                        }
+                    }
+                })?,
+        ),
+    };
     let mut continuity = DecodeContinuity::default();
     let mut first = true;
     let mut last_progress = Instant::now() - Duration::from_secs(1);
@@ -915,12 +1039,6 @@ where
             break;
         }
         let frame = frames.pop_timeout(Duration::from_millis(2));
-        while let Some(event) = audio_events.pop_timeout(Duration::ZERO) {
-            if let Err(error) = consume_audio(event) {
-                close_with_stream_error(&guard.connection, &error.to_string());
-                return Err(error);
-            }
-        }
         while let Some(event) = diagnostic_events.pop_timeout(Duration::ZERO) {
             match event {
                 DiagnosticEvent::ReleasePointerCapture => {
@@ -1119,6 +1237,49 @@ pub enum StreamEnd {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reliable_queue_preserves_key_transitions_and_rejects_overflow() {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(2);
+        for (sequence, pressed) in [(1, true), (2, false)] {
+            queue_control(
+                &sender,
+                Envelope {
+                    body: Some(envelope::Body::InputPack(InputPack {
+                        transitions: vec![InputTransition {
+                            generation: 1,
+                            sequence,
+                            action: Some(input_transition::Action::Key(KeyTransition {
+                                hid_usage: 4,
+                                pressed,
+                            })),
+                            player_sent_at_micros: 0,
+                        }],
+                    })),
+                },
+                Vec::new(),
+            )
+            .unwrap();
+        }
+        assert_eq!(sender.capacity(), 0);
+        assert!(queue_control(&sender, Envelope { body: None }, Vec::new()).is_err());
+        for (sequence, pressed) in [(1, true), (2, false)] {
+            let message = receiver.try_recv().unwrap();
+            let Some(envelope::Body::InputPack(pack)) = message.envelope.body else {
+                panic!("input pack expected");
+            };
+            assert_eq!(pack.transitions[0].sequence, sequence);
+            assert_eq!(
+                pack.transitions[0].action,
+                Some(input_transition::Action::Key(KeyTransition {
+                    hid_usage: 4,
+                    pressed
+                }))
+            );
+        }
+        drop(receiver);
+        assert!(queue_control(&sender, Envelope { body: None }, Vec::new()).is_err());
+    }
 
     fn video(sequence: u64) -> VideoFramePayload {
         VideoFramePayload {
@@ -1375,7 +1536,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn mixed_loopback_keeps_partial_reads_and_returns_reconfiguration() {
+    async fn mixed_loopback_keeps_input_and_audio_independent_of_video() {
         use rustconsole_session::quic::{ephemeral_server_config, opaque_client_config};
         let server = quinn::Endpoint::server(
             ephemeral_server_config().unwrap(),
@@ -1405,7 +1566,11 @@ mod tests {
             let mut input_preamble = [0; rustconsole_protocol::input::STREAM_PREAMBLE.len()];
             server_input.read_exact(&mut input_preamble).await.unwrap();
             assert_eq!(input_preamble, rustconsole_protocol::input::STREAM_PREAMBLE);
-            let input = read_envelope(&mut server_input).await.unwrap();
+            let input =
+                tokio::time::timeout(Duration::from_millis(500), read_envelope(&mut server_input))
+                    .await
+                    .unwrap()
+                    .unwrap();
             assert!(matches!(
                 input.body,
                 Some(envelope::Body::InputPack(InputPack { transitions }))
@@ -1473,6 +1638,17 @@ mod tests {
                         .unwrap();
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
+                if sequence == 0 {
+                    let mut packet = packet.clone();
+                    packet.sequence = 1;
+                    for data in rustconsole_session::audio_datagram::packetize(&packet, 80).unwrap()
+                    {
+                        server_connection
+                            .send_datagram_wait(data.into())
+                            .await
+                            .unwrap();
+                    }
+                }
             }
             tokio::time::sleep(Duration::from_millis(300)).await;
             write_envelope(
@@ -1491,38 +1667,64 @@ mod tests {
         });
         let started = Instant::now();
         let mut count = 0;
-        let mut audio_count = 0;
+        let audio_count = Arc::new(AtomicU64::new(0));
+        let consumed_audio_count = Arc::clone(&audio_count);
+        let video_audio_count = Arc::clone(&audio_count);
         let mut latest = None;
         let mut release_pointer_capture = false;
-        let mut input = Some(TimedInputEvent {
-            event: InputEvent::Key {
-                hid_usage: 4,
-                pressed: false,
-            },
-            occurred_at: Instant::now(),
+        let (input_tx, input) = crate::input_channel();
+        let input_producer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            input_tx
+                .send(TimedInputEvent {
+                    event: InputEvent::Key {
+                        hid_usage: 4,
+                        pressed: false,
+                    },
+                    occurred_at: Instant::now(),
+                })
+                .await
+                .unwrap();
+            // Keep the input source alive until the receiver's reconfiguration shutdown.
+            tokio::time::sleep(Duration::from_secs(1)).await;
         });
         let end = receive_stream(ReceiveStreamParameters {
             connection: client_connection,
             control: (client_send, client_receive),
             input_stream: Some(client_input),
-            fps: 120,
+            fps: 1,
             audio_enabled: true,
             host_pointer_release: true,
             diagnostic_stream: None,
             should_stop: || started.elapsed() >= Duration::from_millis(550),
-            next_input: move || input.take(),
+            input,
             progress: |event| match event {
                 StreamProgress::AudioTransport(state) => latest = Some(state),
                 StreamProgress::ReleasePointerCapture => release_pointer_capture = true,
                 _ => {}
             },
             consumers: StreamConsumers {
-                audio: |_| {
-                    audio_count += 1;
-                    Ok(())
+                audio: move || {
+                    move |_| {
+                        consumed_audio_count.fetch_add(1, Ordering::Relaxed);
+                        Ok(())
+                    }
                 },
                 video: |_, _| {
                     count += 1;
+                    if count == 1 {
+                        let deadline = Instant::now() + Duration::from_millis(500);
+                        while video_audio_count.load(Ordering::Relaxed) < 2
+                            && Instant::now() < deadline
+                        {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        assert_eq!(
+                            video_audio_count.load(Ordering::Relaxed),
+                            2,
+                            "audio decoding must continue while video is blocked"
+                        );
+                    }
                     Ok(true)
                 },
             },
@@ -1530,10 +1732,11 @@ mod tests {
         .await
         .unwrap();
         sender.await.unwrap();
+        input_producer.abort();
         let latest = latest.unwrap();
         assert_eq!(count, 2);
-        assert_eq!(audio_count, 1);
-        assert_eq!(latest.receive.completed_packets, 1);
+        assert_eq!(audio_count.load(Ordering::Relaxed), 2);
+        assert_eq!(latest.receive.completed_packets, 2);
         assert_eq!(latest.receive.malformed_fragments, 1);
         assert_eq!(latest.host.status, AudioStatus::Failed as i32);
         assert!(release_pointer_capture);

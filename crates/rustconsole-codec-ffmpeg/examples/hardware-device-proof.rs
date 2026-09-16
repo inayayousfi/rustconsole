@@ -2,7 +2,7 @@
 use rustconsole_codec_ffmpeg::Av1VaApiDecoder;
 #[cfg(windows)]
 use rustconsole_codec_ffmpeg::{
-    Av1ColorDescription, Av1EncoderConfiguration, Av1FrameFormat, Av1NvencEncoder,
+    Av1ColorDescription, Av1D3d11Decoder, Av1EncoderConfiguration, Av1FrameFormat, Av1NvencEncoder,
 };
 use rustconsole_codec_ffmpeg::{HardwareDevice, HardwareDeviceType, library_version};
 #[cfg(windows)]
@@ -86,6 +86,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             })
             .transpose()?
             .ok_or("AV1 NVENC returned no packet after reconfiguration")?;
+        encoder.request_keyframe();
+        let recovery_packet = (8..12)
+            .find_map(|timestamp| {
+                encoder
+                    .encode_d3d11_texture(&texture, timestamp)
+                    .transpose()
+            })
+            .transpose()?
+            .ok_or("AV1 NVENC returned no recovery packet")?;
+        if !recovery_packet.keyframe {
+            return Err("NVENC ignored the explicit keyframe request".into());
+        }
+        let mut fresh_decoder = Av1D3d11Decoder::open(&device)?;
+        let recovered = fresh_decoder.decode_packet(
+            &recovery_packet.data,
+            recovery_packet.presentation_timestamp,
+        )?;
+        if recovered.is_none() {
+            return Err("recovery packet did not decode independently".into());
+        }
         std::fs::write(
             std::env::temp_dir().join("rustconsole-av1-10bit.bin"),
             &first_packet.data,
@@ -99,6 +119,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("reconfigured_bitrate_bits_per_second=8000000");
         println!("vbv_frame_budgets=4");
         println!("encoder_recreated=false");
+        println!("requested_keyframe_decoded_independently=true");
     }
     println!("status=ok");
     Ok(())

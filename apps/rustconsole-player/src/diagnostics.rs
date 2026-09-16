@@ -493,6 +493,7 @@ impl WorkerState {
                     | "video_lost_chunks"
                     | "video_late_chunks"
                     | "video_incomplete_frames"
+                    | "video_skipped_frames"
                     | "video_assembly_overflows"
                     | "video_render_queue_drops"
                     | "input_reliable_rejected"

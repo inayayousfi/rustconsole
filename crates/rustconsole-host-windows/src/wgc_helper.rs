@@ -4,8 +4,12 @@ use crate::worker_protocol::{
 };
 use std::fs;
 use std::io::{Read, Write};
+use std::os::windows::io::AsRawHandle;
 use std::path::PathBuf;
+use std::thread;
+use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE};
+use windows::Win32::System::Pipes::PeekNamedPipe;
 use windows::Win32::System::RemoteDesktop::WTSGetActiveConsoleSessionId;
 use windows::Win32::System::Threading::GetCurrentProcess;
 
@@ -109,11 +113,15 @@ impl WgcHelper {
 
     pub fn next_frame(
         &mut self,
+        timeout: Duration,
         diagnostics: bool,
-    ) -> Result<WgcFrame, Box<dyn std::error::Error>> {
+    ) -> Result<Option<WgcFrame>, Box<dyn std::error::Error>> {
         if !self.configured {
             (&self.connection.channel).write_all(&[u8::from(diagnostics)])?;
             self.configured = true;
+        }
+        if !wait_for_frame(&self.connection.channel, timeout)? {
+            return Ok(None);
         }
         let mut frame = [0_u8; FRAME_SIZE];
         read_exact(&self.connection.channel, &mut frame)?;
@@ -129,14 +137,14 @@ impl WgcHelper {
             )
             .into());
         }
-        Ok(WgcFrame {
+        Ok(Some(WgcFrame {
             last_present_time: i64_at(&frame, 8),
             accumulated_frames: u32_at(&frame, 16),
             protected_content_masked: i32_at(&frame, 20) != 0,
             capture_acquisition_micros: u64_at(&frame, 28),
             cross_adapter_copy_micros: u64_at(&frame, 36),
             color_conversion_micros: u64_at(&frame, 44),
-        })
+        }))
     }
 }
 
@@ -165,6 +173,33 @@ fn install_helper() -> Result<PathBuf, Box<dyn std::error::Error>> {
 fn read_exact(file: &fs::File, buffer: &mut [u8]) -> std::io::Result<()> {
     let mut file = file;
     file.read_exact(buffer)
+}
+
+fn wait_for_frame(file: &fs::File, timeout: Duration) -> std::io::Result<bool> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let mut available = 0;
+        // SAFETY: the helper channel is an open named-pipe handle and available is valid output
+        // storage.
+        unsafe {
+            PeekNamedPipe(
+                HANDLE(file.as_raw_handle()),
+                None,
+                0,
+                None,
+                Some(&mut available),
+                None,
+            )?;
+        }
+        if available as usize >= FRAME_SIZE {
+            return Ok(true);
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Ok(false);
+        }
+        thread::sleep(Duration::from_millis(1).min(deadline - now));
+    }
 }
 
 fn u32_at(value: &[u8], offset: usize) -> u32 {

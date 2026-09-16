@@ -732,7 +732,7 @@ fn run_video_stream(
                 WorkerCommand::SetVideoFrameDivisor(_) => {
                     return Err("video frame divisor must be one or two".into());
                 }
-                WorkerCommand::RequestVideoKeyframe => encoder.request_keyframe()?,
+                WorkerCommand::RequestVideoKeyframe => encoder.request_keyframe(),
                 WorkerCommand::StopVideoStream => return Ok(StreamExit::Continue),
                 WorkerCommand::Stop => return Ok(StreamExit::StopWorker),
                 _ => return Err("invalid command received while video stream is active".into()),
@@ -743,6 +743,8 @@ fn run_video_stream(
         if now < next_tick {
             thread::sleep(next_tick - now);
         }
+        // Pace from the actual start, not an old deadline that would create catch-up bursts.
+        let frame_started = Instant::now();
         let encode_started_at_micros = clock.now()?;
         let encoded = if tick.is_multiple_of(u64::from(frame_divisor)) {
             match encoder.encode_next_frame(frame_period) {
@@ -809,12 +811,12 @@ fn run_video_stream(
         }
         tick = tick.wrapping_add(1);
 
-        next_tick += frame_period;
-        let now = Instant::now();
-        while next_tick <= now {
-            next_tick += frame_period;
-        }
+        next_tick = next_frame_tick(frame_started, frame_period, Instant::now());
     }
+}
+
+fn next_frame_tick(previous: Instant, frame_period: Duration, now: Instant) -> Instant {
+    (previous + frame_period).max(now)
 }
 
 fn wait_event(
@@ -1210,6 +1212,38 @@ mod tests {
         );
         assert!(parse_connection_token("0011").is_err());
         assert!(parse_connection_token("00112233445566778899aabbccddeefg").is_err());
+    }
+
+    #[test]
+    fn frame_pacing_does_not_skip_a_slot_for_a_small_overrun() {
+        let started = Instant::now();
+        let period = Duration::from_millis(10);
+
+        assert_eq!(
+            next_frame_tick(started, period, started + Duration::from_millis(11)),
+            started + Duration::from_millis(11)
+        );
+    }
+
+    #[test]
+    fn frame_pacing_rebases_after_a_large_stall() {
+        let started = Instant::now();
+        let period = Duration::from_millis(10);
+        let resumed = started + Duration::from_millis(60);
+
+        assert_eq!(next_frame_tick(started, period, resumed), resumed);
+    }
+
+    #[test]
+    fn frame_pacing_does_not_catch_up_after_a_stall() {
+        let started = Instant::now();
+        let period = Duration::from_millis(10);
+        let resumed = next_frame_tick(started, period, started + Duration::from_millis(24));
+        assert_eq!(resumed, started + Duration::from_millis(24));
+        let next = next_frame_tick(resumed, period, resumed + Duration::from_millis(2));
+        assert_eq!(next, resumed + period);
+        let following = next_frame_tick(next, period, next + Duration::from_millis(2));
+        assert_eq!(following, next + period);
     }
 }
 

@@ -299,9 +299,14 @@ impl VideoFrameAssembler {
         if partial.received_bytes != partial.header.frame_size {
             return Err(VideoDatagramError::InvalidFrameSize(partial.received_bytes));
         }
-        dependency_lost |= self
-            .newest_completed_sequence
-            .is_some_and(|sequence| partial.header.sequence > sequence.saturating_add(1));
+        let skipped_frames = self.newest_completed_sequence.map_or(0, |sequence| {
+            partial
+                .header
+                .sequence
+                .saturating_sub(sequence.saturating_add(1))
+        });
+        dependency_lost |= skipped_frames != 0;
+        self.stats.skipped_frames = self.stats.skipped_frames.saturating_add(skipped_frames);
         let mut payload = Vec::with_capacity(partial.header.frame_size);
         for chunk in partial.chunks {
             payload.extend_from_slice(&chunk.unwrap());
@@ -360,6 +365,8 @@ fn missing_chunks(frame: &PartialFrame) -> u64 {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct VideoAssemblyStats {
+    /// Sequence gaps between completed frames, including frames never seen on the wire.
+    pub skipped_frames: u64,
     pub received_chunks: u64,
     pub lost_chunks: u64,
     pub late_chunks: u64,
@@ -381,7 +388,7 @@ pub struct AssemblyResult {
 #[must_use]
 pub fn assembly_deadline(frame_period: Duration, round_trip_time: Duration) -> Duration {
     frame_period
-        .saturating_mul(3)
+        .saturating_mul(4)
         .max(round_trip_time.saturating_mul(2))
         .min(Duration::from_millis(100))
 }
@@ -485,7 +492,7 @@ mod tests {
             .unwrap();
         assert_eq!(progress.received_chunks, 1);
         assert_eq!(progress.expected_chunks, 91);
-        assert_eq!(progress.budget, Duration::from_nanos(24_999_999));
+        assert_eq!(progress.budget, Duration::from_nanos(33_333_332));
 
         for sequence in 2..=3 {
             let next = packetize_video_frame(&frame(sequence, 2_000), datagram_size)
@@ -526,13 +533,19 @@ mod tests {
             .unwrap();
         assert_eq!(result.frame, Some(frame(3, 16)));
         assert!(result.dependency_lost);
+        assert_eq!(assembler.stats().skipped_frames, 1);
+        assert_eq!(assembler.stats().lost_chunks, 0);
+        assembler
+            .push(&third, now, Duration::from_millis(5))
+            .unwrap();
+        assert_eq!(assembler.stats().skipped_frames, 1);
     }
 
     #[test]
-    fn deadline_uses_three_frames_or_two_rtts_with_a_hard_cap() {
+    fn deadline_uses_four_frames_or_two_rtts_with_a_hard_cap() {
         assert_eq!(
             assembly_deadline(Duration::from_millis(8), Duration::from_millis(5)),
-            Duration::from_millis(24)
+            Duration::from_millis(32)
         );
         assert_eq!(
             assembly_deadline(Duration::from_millis(8), Duration::from_millis(40)),
@@ -568,7 +581,7 @@ mod tests {
         assert_eq!(assembler.stats().completed_frames, 1);
         assert_eq!(assembler.stats().completed_payload_bytes, 16);
         assert_eq!(assembler.stats().last_completed_assembly_micros, 0);
-        assert_eq!(assembler.stats().last_assembly_budget_micros, 24_999);
+        assert_eq!(assembler.stats().last_assembly_budget_micros, 33_333);
         assembler
             .push(&completed, now, Duration::from_millis(5))
             .unwrap();

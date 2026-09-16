@@ -625,6 +625,28 @@ mod tests {
     }
 
     #[test]
+    fn streaming_commands_round_trip() {
+        for command in [
+            WorkerCommand::PrepareVideoStream,
+            WorkerCommand::StartVideoStream {
+                frames_per_second: 120,
+                bitrate_bits_per_second: 20_000_000,
+                audio: true,
+                diagnostics: true,
+            },
+            WorkerCommand::SetVideoBitrate(16_000_000),
+            WorkerCommand::SetVideoFrameDivisor(2),
+            WorkerCommand::RequestVideoKeyframe,
+            WorkerCommand::StopVideoStream,
+            WorkerCommand::Stop,
+        ] {
+            let mut bytes = Vec::new();
+            write_command(&mut bytes, command).unwrap();
+            assert_eq!(read_command(&mut Cursor::new(bytes)).unwrap(), command);
+        }
+    }
+
+    #[test]
     fn hello_round_trip_keeps_identity() {
         let event = WorkerEvent::Hello {
             version: VERSION,
