@@ -1,4 +1,6 @@
-use crate::gpu_encode::{GpuAv1SnapshotEncoder, PreparedGpuCapture, VideoReconfigurationRequired};
+use crate::gpu_encode::{
+    GpuVideoPipeline, PreparedGpuCapture, VideoReconfigurationRequired, prepare_nvenc_capture,
+};
 use crate::worker_protocol::{AudioWorkerEvent, read_audio_event};
 use crate::worker_protocol::{
     VERSION, WorkerCommand, WorkerEvent, WorkerIdentity, read_command, read_event, write_command,
@@ -92,15 +94,50 @@ pub struct MediaWorkerStream {
 }
 
 impl MediaWorker {
+    pub fn discover_displays(
+        executable: &Path,
+    ) -> Result<rustconsole_protocol::display::DisplayInventory, Box<dyn std::error::Error>> {
+        let mut worker = Self::launch(executable)?;
+        let hello = read_event(
+            worker
+                .events
+                .as_mut()
+                .ok_or("worker event pipe unavailable")?,
+        )?;
+        worker.accept_hello(Some(hello))?;
+        write_command(&mut worker.command, WorkerCommand::DiscoverDisplays)?;
+        let event = read_event(
+            worker
+                .events
+                .as_mut()
+                .ok_or("worker event pipe unavailable")?,
+        )?;
+        worker.stop_and_wait(false)?;
+        match event {
+            WorkerEvent::DisplayCatalog(bytes) => {
+                let envelope = rustconsole_protocol::wire::decode_reliable_frame(&bytes)?;
+                let Some(rustconsole_protocol::wire::envelope::Body::DisplayCatalog(catalog)) =
+                    envelope.body
+                else {
+                    return Err("worker returned an invalid display catalog".into());
+                };
+                Ok(catalog.try_into()?)
+            }
+            WorkerEvent::Failure(error) => Err(error.into()),
+            _ => Err("worker returned an unexpected display discovery event".into()),
+        }
+    }
+
     pub fn launch_prepared_video(
         executable: &Path,
         shutdown_rx: &Receiver<()>,
+        display: Option<rustconsole_protocol::display::DisplayId>,
     ) -> Result<
         Option<(Self, crate::worker_protocol::WorkerVideoConfiguration)>,
         Box<dyn std::error::Error>,
     > {
         let mut worker = Self::launch(executable)?;
-        match worker.prepare_video_stream(shutdown_rx)? {
+        match worker.prepare_video_stream(shutdown_rx, display)? {
             VideoPreparation::Ready(configuration) => Ok(Some((worker, configuration))),
             VideoPreparation::Interrupted => Ok(None),
             VideoPreparation::SystemIdentityRequired => {
@@ -337,6 +374,7 @@ impl MediaWorker {
     pub fn prepare_video_stream(
         &mut self,
         shutdown_rx: &Receiver<()>,
+        display: Option<rustconsole_protocol::display::DisplayId>,
     ) -> Result<VideoPreparation, Box<dyn std::error::Error>> {
         if self.hello_accepted {
             return Err("media worker video stream was already prepared".into());
@@ -353,7 +391,10 @@ impl MediaWorker {
             return Ok(VideoPreparation::Interrupted);
         }
         self.hello_accepted = true;
-        write_command(&mut self.command, WorkerCommand::PrepareVideoStream)?;
+        write_command(
+            &mut self.command,
+            WorkerCommand::PrepareVideoStream { display },
+        )?;
         if shutdown_rx.try_recv().is_ok() {
             write_command(&mut self.command, WorkerCommand::Stop)?;
             return Ok(VideoPreparation::Interrupted);
@@ -590,7 +631,25 @@ fn run_files(
 
     loop {
         match read_command(&mut commands)? {
-            WorkerCommand::PrepareVideoStream => {
+            WorkerCommand::DiscoverDisplays => {
+                let result = (|| -> Result<_, Box<dyn std::error::Error>> {
+                    crate::desktop::attach_input_desktop()?;
+                    let inventory = crate::display::discover()?;
+                    Ok(rustconsole_protocol::wire::encode_reliable_frame(
+                        &rustconsole_protocol::wire::Envelope {
+                            body: Some(rustconsole_protocol::wire::envelope::Body::DisplayCatalog(
+                                (&inventory).into(),
+                            )),
+                        },
+                    )?)
+                })();
+                let event = match result {
+                    Ok(bytes) => WorkerEvent::DisplayCatalog(bytes),
+                    Err(error) => WorkerEvent::Failure(error.to_string()),
+                };
+                write_event(&mut events, &event)?;
+            }
+            WorkerCommand::PrepareVideoStream { display } => {
                 if prepared_video.is_some() {
                     write_event(
                         &mut events,
@@ -599,7 +658,13 @@ fn run_files(
                     continue;
                 }
                 let prepared = match crate::desktop::attach_input_desktop() {
-                    Ok(desktop) => PreparedGpuCapture::for_desktop(&desktop),
+                    Ok(desktop) => prepare_nvenc_capture(
+                        &desktop,
+                        &display.map_or(
+                            rustconsole_protocol::display::DisplaySelection::Primary,
+                            rustconsole_protocol::display::DisplaySelection::Id,
+                        ),
+                    ),
                     Err(error)
                         if identity == WorkerIdentity::ActiveUser
                             && error.code() == E_ACCESSDENIED =>
@@ -688,9 +753,9 @@ fn run_video_stream(
     let frame_period = Duration::from_nanos(1_000_000_000 / u64::from(frames_per_second));
     let prepared = prepared.ok_or("video stream was not prepared before start")?;
     let mut encoder =
-        GpuAv1SnapshotEncoder::from_prepared(prepared, frames_per_second, bitrate_bits_per_second)?;
+        GpuVideoPipeline::from_prepared(prepared, frames_per_second, bitrate_bits_per_second)?;
     if diagnostics {
-        encoder.enable_quality_diagnostics()?;
+        encoder.enable_av1_quality_diagnostics()?;
     }
     let clock = crate::clock::HostClock::new()?;
     let _audio = match audio_pipe {
@@ -732,7 +797,7 @@ fn run_video_stream(
                 WorkerCommand::SetVideoFrameDivisor(_) => {
                     return Err("video frame divisor must be one or two".into());
                 }
-                WorkerCommand::RequestVideoKeyframe => encoder.request_keyframe(),
+                WorkerCommand::RequestVideoKeyframe => encoder.request_keyframe()?,
                 WorkerCommand::StopVideoStream => return Ok(StreamExit::Continue),
                 WorkerCommand::Stop => return Ok(StreamExit::StopWorker),
                 _ => return Err("invalid command received while video stream is active".into()),

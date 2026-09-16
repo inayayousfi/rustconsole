@@ -35,6 +35,7 @@ fn vb_cable_status<E>(available: Result<bool, E>) -> rustconsole_protocol::wire:
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ServiceCommand {
+    Displays,
     Run,
     Install,
     InstallElevated,
@@ -104,12 +105,12 @@ mod windows {
     use rustconsole_protocol::diagnostics::{MediaKind, PayloadDigest, STREAM_PREAMBLE};
     use rustconsole_protocol::input::STREAM_PREAMBLE as INPUT_STREAM_PREAMBLE;
     use rustconsole_protocol::wire::{
-        self, Av1CapabilityOffer, Av1HardwareCapability, Av1Mode, EncodedVideoPacket, Envelope,
+        self, Av1Capability, Av1CapabilityOffer, Av1Mode, EncodedVideoPacket, Envelope,
         HostSessionControl, HostSessionControlKind, KeyboardLeds as WireKeyboardLeds,
         SelectedAv1Configuration, SessionAvailabilityResult, VideoControlKind, envelope,
     };
     use rustconsole_protocol::{
-        Av1HardwareCapability as DomainCapability, Av1Mode as DomainMode,
+        Av1Capability as DomainCapability, Av1Mode as DomainMode,
         Av1ViewerSettings as DomainSettings, ChromaSubsampling, VideoBitDepth,
         negotiate_av1_configuration,
     };
@@ -148,6 +149,29 @@ mod windows {
 
     pub fn execute(command: ServiceCommand) -> Result<(), Box<dyn std::error::Error>> {
         match command {
+            ServiceCommand::Displays => {
+                let inventory = crate::display::discover_active_console(&std::env::current_exe()?)?;
+                for (index, display) in inventory.displays().iter().enumerate() {
+                    let adapter = inventory
+                        .adapters()
+                        .iter()
+                        .find(|adapter| adapter.id == display.adapter)
+                        .ok_or("display adapter disappeared")?;
+                    println!(
+                        "display={} name={:?} id={:?} size={}x{} refresh={} primary={} adapter={:016x} gpu={:?}",
+                        index + 1,
+                        display.name,
+                        display.id.as_str(),
+                        display.width,
+                        display.height,
+                        display.refresh_rate,
+                        display.primary,
+                        adapter.id.0,
+                        adapter.name
+                    );
+                }
+                Ok(())
+            }
             ServiceCommand::Run => {
                 let _ = SERVICE_MODE.set(ServiceMode::Idle);
                 service_dispatcher::start(SERVICE_NAME, service_main_ffi)?;
@@ -514,6 +538,31 @@ mod windows {
         );
         if matches!(
             &request.body,
+            Some(envelope::Body::DisplayCatalogRequest(_))
+        ) {
+            let discovery_executable = Arc::clone(&executable);
+            let catalog = tokio::task::spawn_blocking(move || {
+                crate::display::discover_active_console(&discovery_executable)
+                    .map(|inventory| wire::DisplayCatalog::from(&inventory))
+                    .map_err(|error| error.to_string())
+            })
+            .await
+            .map_err(|_| "display discovery task panicked")??;
+            write_envelope(
+                &mut send,
+                Envelope {
+                    body: Some(envelope::Body::DisplayCatalog(catalog)),
+                },
+            )
+            .await?;
+            send.finish()?;
+            if send.stopped().await?.is_some() {
+                return Err("display discovery response was cancelled".into());
+            }
+            return Ok(());
+        }
+        if matches!(
+            &request.body,
             Some(envelope::Body::SessionAvailabilityProbe(_))
         ) {
             let vb_cable_status = refresh_vb_cable_status(&vb_cable_status);
@@ -554,6 +603,14 @@ mod windows {
                 ),
                 _ => (None, false, false, false),
             };
+        let display_id = match &request.body {
+            Some(envelope::Body::Av1CapabilityOffer(offer)) => offer
+                .display_id
+                .clone()
+                .map(rustconsole_protocol::display::DisplayId::new)
+                .transpose()?,
+            _ => None,
+        };
         let (decoder_capabilities, settings) = session_try!(
             "parsing player AV1 capability offer",
             parse_viewer_offer(request)
@@ -587,15 +644,28 @@ mod windows {
         };
         let host_pointer_release = session_controls.is_some();
         let worker_executable = executable.as_ref().to_owned();
+        let worker_display_id = display_id.clone();
         let prepared = tokio::task::spawn_blocking(move || {
             let (_shutdown_tx, shutdown_rx) = shutdown_channel();
-            crate::worker::MediaWorker::launch_prepared_video(&worker_executable, &shutdown_rx)
-                .map_err(|error| error.to_string())?
-                .ok_or_else(|| "media worker preparation was interrupted".to_owned())
+            crate::worker::MediaWorker::launch_prepared_video(
+                &worker_executable,
+                &shutdown_rx,
+                worker_display_id,
+            )
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "media worker preparation was interrupted".to_owned())
         })
         .await
         .map_err(|_| "media worker preparation task panicked")?;
         let (worker, video_configuration) = session_try!("preparing media worker", prepared);
+        if settings.width != video_configuration.width
+            || settings.height != video_configuration.height
+        {
+            return Err(
+                "requested dimensions do not match the selected display; scaling is not configured"
+                    .into(),
+            );
+        }
         let encoder_capability = DomainCapability {
             mode: DomainMode {
                 chroma_subsampling: ChromaSubsampling::Yuv420,
@@ -621,6 +691,7 @@ mod windows {
                 &mut send,
                 Envelope {
                     body: Some(envelope::Body::Av1CapabilityOffer(Av1CapabilityOffer {
+                        display_id: display_id.map(|id| id.as_str().to_owned()),
                         dedicated_input_stream,
                         host_pointer_release,
                         full_diagnostics,
@@ -1792,8 +1863,8 @@ mod windows {
             _ => return Err("viewer sent an invalid AV1 capability offer".into()),
         };
         let settings = offer.viewer_settings.ok_or("viewer omitted AV1 settings")?;
-        if settings.width != 2560
-            || settings.height != 1440
+        if settings.width == 0
+            || settings.height == 0
             || settings.frames_per_second == 0
             || settings.maximum_bitrate_bits_per_second == 0
             || settings.mode_preferences.is_empty()
@@ -1852,8 +1923,8 @@ mod windows {
         ))
     }
 
-    fn wire_capability(capability: DomainCapability) -> Av1HardwareCapability {
-        Av1HardwareCapability {
+    fn wire_capability(capability: DomainCapability) -> Av1Capability {
+        Av1Capability {
             chroma_subsampling: wire::ChromaSubsampling::Yuv420 as i32,
             bit_depth: match capability.mode.bit_depth {
                 VideoBitDepth::Eight => wire::VideoBitDepth::Eight as i32,

@@ -217,6 +217,7 @@ pub struct Av1EncoderConfiguration {
 
 #[derive(Debug)]
 pub enum Av1CodecError {
+    HardwareDevice(HardwareDeviceError),
     Initialization(ffmpeg_next::Error),
     InvalidConfiguration(&'static str),
     DecoderNotFound,
@@ -257,6 +258,9 @@ pub enum Av1CodecError {
 impl fmt::Display for Av1CodecError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::HardwareDevice(error) => {
+                write!(formatter, "codec hardware device failed: {error}")
+            }
             Self::Initialization(error) => {
                 write!(formatter, "FFmpeg initialization failed: {error}")
             }
@@ -1083,6 +1087,8 @@ pub struct Av1NvencEncoder {
     force_next_keyframe: bool,
     #[cfg(windows)]
     device_context: ID3D11DeviceContext,
+    #[cfg(windows)]
+    configuration: Av1EncoderConfiguration,
 }
 
 impl Av1NvencEncoder {
@@ -1175,6 +1181,8 @@ impl Av1NvencEncoder {
             force_next_keyframe: true,
             #[cfg(windows)]
             device_context,
+            #[cfg(windows)]
+            configuration,
         })
     }
 
@@ -1189,6 +1197,10 @@ impl Av1NvencEncoder {
             (*context).bit_rate = bitrate_bits_per_second as i64;
             (*context).rc_max_rate = bitrate_bits_per_second as i64;
             (*context).rc_buffer_size = buffer_size;
+        }
+        #[cfg(windows)]
+        {
+            self.configuration.bitrate_bits_per_second = bitrate_bits_per_second;
         }
         Ok(())
     }
@@ -1331,10 +1343,37 @@ fn set_encoder_option(
     }
 }
 
-pub struct EncodedAv1Packet {
-    pub presentation_timestamp: i64,
-    pub keyframe: bool,
-    pub data: Vec<u8>,
+pub use rustconsole_media::EncodedVideoPacket as EncodedAv1Packet;
+
+#[cfg(windows)]
+impl rustconsole_media::VideoEncoder<ID3D11Texture2D> for Av1NvencEncoder {
+    type Error = Av1CodecError;
+
+    fn encode(
+        &mut self,
+        frame: &ID3D11Texture2D,
+        presentation_timestamp: i64,
+    ) -> Result<Option<EncodedAv1Packet>, Self::Error> {
+        self.encode_d3d11_texture(frame, presentation_timestamp)
+    }
+
+    fn request_keyframe(&mut self) -> Result<(), Self::Error> {
+        Av1NvencEncoder::request_keyframe(self);
+        Ok(())
+    }
+
+    fn set_bitrate(&mut self, bits_per_second: u64) -> Result<(), Self::Error> {
+        Av1NvencEncoder::set_bitrate(self, bits_per_second)
+    }
+
+    fn reset(&mut self) -> Result<(), Self::Error> {
+        let device = unsafe { self.device_context.GetDevice() }
+            .map_err(|_| Av1CodecError::InvalidHardwareFrame("encoder device is unavailable"))?;
+        let hardware =
+            HardwareDevice::from_d3d11_device(&device).map_err(Av1CodecError::HardwareDevice)?;
+        *self = Self::open(&hardware, self.configuration)?;
+        Ok(())
+    }
 }
 
 #[cfg(windows)]

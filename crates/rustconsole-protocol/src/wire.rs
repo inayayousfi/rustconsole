@@ -16,7 +16,7 @@ pub const RELIABLE_FRAME_PREFIX_SIZE: usize = size_of::<u32>();
 pub struct Envelope {
     #[prost(
         oneof = "envelope::Body",
-        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21"
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23"
     )]
     pub body: Option<envelope::Body>,
 }
@@ -32,6 +32,10 @@ pub mod envelope {
 
     #[derive(Clone, PartialEq, Oneof)]
     pub enum Body {
+        #[prost(message, tag = "22")]
+        DisplayCatalogRequest(super::DisplayCatalogRequest),
+        #[prost(message, tag = "23")]
+        DisplayCatalog(super::DisplayCatalog),
         #[prost(message, tag = "14")]
         AudioStreamState(super::AudioStreamState),
         #[prost(message, tag = "15")]
@@ -74,6 +78,117 @@ pub mod envelope {
         SessionAvailabilityProbe(SessionAvailabilityProbe),
         #[prost(message, tag = "13")]
         SessionAvailabilityResult(SessionAvailabilityResult),
+    }
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct DisplayCatalogRequest {}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct DisplayCatalog {
+    #[prost(message, repeated, tag = "1")]
+    pub displays: Vec<DisplayDescription>,
+    #[prost(message, repeated, tag = "2")]
+    pub adapters: Vec<AdapterDescription>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct DisplayDescription {
+    #[prost(string, tag = "1")]
+    pub id: String,
+    #[prost(string, tag = "2")]
+    pub name: String,
+    #[prost(uint64, tag = "3")]
+    pub adapter_id: u64,
+    #[prost(uint32, tag = "4")]
+    pub width: u32,
+    #[prost(uint32, tag = "5")]
+    pub height: u32,
+    #[prost(uint32, tag = "6")]
+    pub refresh_rate: u32,
+    #[prost(bool, tag = "7")]
+    pub primary: bool,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct AdapterDescription {
+    #[prost(uint64, tag = "1")]
+    pub id: u64,
+    #[prost(string, tag = "2")]
+    pub name: String,
+    #[prost(uint32, tag = "3")]
+    pub vendor_id: u32,
+    #[prost(uint32, tag = "4")]
+    pub device_id: u32,
+    #[prost(bool, tag = "5")]
+    pub software: bool,
+}
+
+impl From<&crate::display::DisplayInventory> for DisplayCatalog {
+    fn from(inventory: &crate::display::DisplayInventory) -> Self {
+        Self {
+            displays: inventory
+                .displays()
+                .iter()
+                .map(|display| DisplayDescription {
+                    id: display.id.as_str().to_owned(),
+                    name: display.name.clone(),
+                    adapter_id: display.adapter.0,
+                    width: display.width,
+                    height: display.height,
+                    refresh_rate: display.refresh_rate,
+                    primary: display.primary,
+                })
+                .collect(),
+            adapters: inventory
+                .adapters()
+                .iter()
+                .map(|adapter| AdapterDescription {
+                    id: adapter.id.0,
+                    name: adapter.name.clone(),
+                    vendor_id: adapter.vendor_id,
+                    device_id: adapter.device_id,
+                    software: adapter.software,
+                })
+                .collect(),
+        }
+    }
+}
+
+impl TryFrom<DisplayCatalog> for crate::display::DisplayInventory {
+    type Error = crate::display::DisplayError;
+    fn try_from(catalog: DisplayCatalog) -> Result<Self, Self::Error> {
+        use crate::display::*;
+        if catalog.displays.len() > MAX_DISPLAYS || catalog.adapters.len() > MAX_ADAPTERS {
+            return Err(DisplayError::TooManyDevices);
+        }
+        let displays = catalog
+            .displays
+            .into_iter()
+            .map(|display| {
+                Ok(Display {
+                    id: DisplayId::new(display.id)?,
+                    name: display.name,
+                    adapter: AdapterId(display.adapter_id),
+                    width: display.width,
+                    height: display.height,
+                    refresh_rate: display.refresh_rate,
+                    primary: display.primary,
+                })
+            })
+            .collect::<Result<Vec<_>, DisplayError>>()?;
+        let adapters = catalog
+            .adapters
+            .into_iter()
+            .map(|adapter| GraphicsAdapter {
+                id: AdapterId(adapter.id),
+                name: adapter.name,
+                vendor_id: adapter.vendor_id,
+                device_id: adapter.device_id,
+                software: adapter.software,
+            })
+            .collect();
+        DisplayInventory::new(displays, adapters)
     }
 }
 
@@ -426,10 +541,12 @@ pub struct VideoReceiverReport {
 
 #[derive(Clone, PartialEq, Message)]
 pub struct Av1CapabilityOffer {
+    #[prost(string, optional, tag = "8")]
+    pub display_id: Option<String>,
     #[prost(message, repeated, tag = "1")]
-    pub encoder_capabilities: Vec<Av1HardwareCapability>,
+    pub encoder_capabilities: Vec<Av1Capability>,
     #[prost(message, repeated, tag = "2")]
-    pub decoder_capabilities: Vec<Av1HardwareCapability>,
+    pub decoder_capabilities: Vec<Av1Capability>,
     #[prost(message, optional, tag = "3")]
     pub viewer_settings: Option<Av1ViewerSettings>,
     #[prost(message, optional, tag = "4")]
@@ -443,7 +560,7 @@ pub struct Av1CapabilityOffer {
 }
 
 #[derive(Clone, Copy, PartialEq, Message)]
-pub struct Av1HardwareCapability {
+pub struct Av1Capability {
     #[prost(enumeration = "ChromaSubsampling", tag = "1")]
     pub chroma_subsampling: i32,
     #[prost(enumeration = "VideoBitDepth", tag = "2")]
@@ -777,6 +894,37 @@ pub fn decode_video_packet_frame(frame: &[u8]) -> Result<EncodedVideoPacket, Rel
 mod tests {
     use super::*;
 
+    #[test]
+    fn display_discovery_and_selection_have_fixed_wire_fixtures() {
+        let request = Envelope {
+            body: Some(envelope::Body::DisplayCatalogRequest(
+                DisplayCatalogRequest {},
+            )),
+        };
+        assert_eq!(
+            encode_reliable_frame(&request).unwrap(),
+            [0, 0, 0, 3, 0xb2, 1, 0]
+        );
+        let selected = Envelope {
+            body: Some(envelope::Body::Av1CapabilityOffer(Av1CapabilityOffer {
+                display_id: Some("d".into()),
+                ..Default::default()
+            })),
+        };
+        let bytes = [0, 0, 0, 5, 0x12, 3, 0x42, 1, b'd'];
+        assert_eq!(encode_reliable_frame(&selected).unwrap(), bytes);
+        assert_eq!(decode_reliable_frame(&bytes).unwrap(), selected);
+        let primary = Envelope {
+            body: Some(envelope::Body::Av1CapabilityOffer(
+                Av1CapabilityOffer::default(),
+            )),
+        };
+        assert_eq!(
+            encode_reliable_frame(&primary).unwrap(),
+            [0, 0, 0, 2, 0x12, 0]
+        );
+    }
+
     const VERSION_OFFER_FIXTURE: [u8; 18] = [
         0x00, 0x00, 0x00, 0x0e, 0x0a, 0x0c, 0x08, 0x01, 0x1a, 0x08, 0x08, 0x07, 0x10, 0x01, 0x18,
         0x03, 0x20, 0x01,
@@ -1077,6 +1225,7 @@ mod tests {
 #[test]
 fn audio_offer_has_a_fixed_fixture_and_is_optional_to_older_peers() {
     let offer = Av1CapabilityOffer {
+        display_id: None,
         dedicated_input_stream: false,
         host_pointer_release: false,
         full_diagnostics: false,
@@ -1099,9 +1248,9 @@ fn audio_offer_has_a_fixed_fixture_and_is_optional_to_older_peers() {
     #[derive(Clone, PartialEq, Message)]
     struct OldOffer {
         #[prost(message, repeated, tag = "1")]
-        encoder: Vec<Av1HardwareCapability>,
+        encoder: Vec<Av1Capability>,
         #[prost(message, repeated, tag = "2")]
-        decoder: Vec<Av1HardwareCapability>,
+        decoder: Vec<Av1Capability>,
         #[prost(message, optional, tag = "3")]
         settings: Option<Av1ViewerSettings>,
     }
@@ -1127,6 +1276,7 @@ fn audio_offer_has_a_fixed_fixture_and_is_optional_to_older_peers() {
 #[test]
 fn host_pointer_release_is_negotiated_as_an_optional_field() {
     let offer = Av1CapabilityOffer {
+        display_id: None,
         dedicated_input_stream: false,
         host_pointer_release: true,
         full_diagnostics: false,
@@ -1144,7 +1294,7 @@ fn host_pointer_release_is_negotiated_as_an_optional_field() {
     #[derive(Clone, PartialEq, Message)]
     struct OldOffer {
         #[prost(message, repeated, tag = "1")]
-        encoder: Vec<Av1HardwareCapability>,
+        encoder: Vec<Av1Capability>,
     }
     let old = OldOffer::decode(offer.encode_to_vec().as_slice()).unwrap();
     let decoded = Av1CapabilityOffer::decode(old.encode_to_vec().as_slice()).unwrap();
@@ -1163,6 +1313,7 @@ fn host_pointer_release_is_negotiated_as_an_optional_field() {
 #[test]
 fn dedicated_input_stream_is_negotiated_as_an_optional_field() {
     let offer = Av1CapabilityOffer {
+        display_id: None,
         dedicated_input_stream: true,
         host_pointer_release: false,
         full_diagnostics: false,
@@ -1180,7 +1331,7 @@ fn dedicated_input_stream_is_negotiated_as_an_optional_field() {
     #[derive(Clone, PartialEq, Message)]
     struct OldOffer {
         #[prost(message, repeated, tag = "1")]
-        encoder: Vec<Av1HardwareCapability>,
+        encoder: Vec<Av1Capability>,
     }
     let old = OldOffer::decode(offer.encode_to_vec().as_slice()).unwrap();
     let decoded = Av1CapabilityOffer::decode(old.encode_to_vec().as_slice()).unwrap();

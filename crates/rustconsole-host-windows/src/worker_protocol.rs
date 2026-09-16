@@ -1,6 +1,6 @@
 use std::io::{self, Read, Write};
 
-pub const VERSION: u16 = 15;
+pub const VERSION: u16 = 16;
 const MAX_PAYLOAD: usize = 16 * 1024 * 1024;
 const COMMAND_STOP: u8 = 2;
 const COMMAND_START_VIDEO_STREAM: u8 = 7;
@@ -9,6 +9,8 @@ const COMMAND_REQUEST_VIDEO_KEYFRAME: u8 = 9;
 const COMMAND_STOP_VIDEO_STREAM: u8 = 10;
 const COMMAND_SET_VIDEO_FRAME_DIVISOR: u8 = 11;
 const COMMAND_PREPARE_VIDEO_STREAM: u8 = 14;
+const COMMAND_DISCOVER_DISPLAYS: u8 = 15;
+const EVENT_DISPLAY_CATALOG: u8 = 10;
 const EVENT_HELLO: u8 = 1;
 const EVENT_FAILURE: u8 = 5;
 const EVENT_ENCODED_VIDEO_FRAME: u8 = 6;
@@ -23,40 +25,17 @@ pub enum WorkerIdentity {
     LocalSystem = 2,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(u8)]
-pub enum WorkerCaptureEngine {
-    WindowsGraphicsCapture = 1,
-    DesktopDuplication = 2,
-}
+pub use crate::video_configuration::{
+    CaptureEngine as WorkerCaptureEngine, ColorDescription as WorkerVideoColor,
+    PixelFormat as WorkerVideoFormat, VideoCaptureConfiguration as WorkerVideoConfiguration,
+};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(u8)]
-pub enum WorkerVideoFormat {
-    Nv12 = 1,
-    P010 = 2,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(u8)]
-pub enum WorkerVideoColor {
-    Bt709Limited = 1,
-    Bt2020PqLimited = 2,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct WorkerVideoConfiguration {
-    pub width: u32,
-    pub height: u32,
-    pub refresh_rate: u32,
-    pub capture_engine: WorkerCaptureEngine,
-    pub format: WorkerVideoFormat,
-    pub color: WorkerVideoColor,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WorkerCommand {
-    PrepareVideoStream,
+    DiscoverDisplays,
+    PrepareVideoStream {
+        display: Option<rustconsole_protocol::display::DisplayId>,
+    },
     StartVideoStream {
         frames_per_second: u16,
         bitrate_bits_per_second: u64,
@@ -72,6 +51,7 @@ pub enum WorkerCommand {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WorkerEvent {
+    DisplayCatalog(Vec<u8>),
     Hello {
         version: u16,
         process_id: u32,
@@ -118,7 +98,16 @@ pub struct WorkerVideoQuality {
 
 pub fn write_command(writer: &mut impl Write, command: WorkerCommand) -> io::Result<()> {
     let payload = match command {
-        WorkerCommand::PrepareVideoStream => vec![COMMAND_PREPARE_VIDEO_STREAM],
+        WorkerCommand::DiscoverDisplays => vec![COMMAND_DISCOVER_DISPLAYS],
+        WorkerCommand::PrepareVideoStream { display } => {
+            let mut payload = vec![COMMAND_PREPARE_VIDEO_STREAM];
+            if let Some(display) = display {
+                let bytes = display.as_str().as_bytes();
+                payload.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
+                payload.extend_from_slice(bytes);
+            }
+            payload
+        }
         WorkerCommand::StartVideoStream {
             frames_per_second,
             bitrate_bits_per_second,
@@ -150,7 +139,21 @@ pub fn write_command(writer: &mut impl Write, command: WorkerCommand) -> io::Res
 pub fn read_command(reader: &mut impl Read) -> io::Result<WorkerCommand> {
     let payload = read_frame(reader)?;
     match payload.as_slice() {
-        [COMMAND_PREPARE_VIDEO_STREAM] => Ok(WorkerCommand::PrepareVideoStream),
+        [COMMAND_DISCOVER_DISPLAYS] => Ok(WorkerCommand::DiscoverDisplays),
+        [COMMAND_PREPARE_VIDEO_STREAM] => Ok(WorkerCommand::PrepareVideoStream { display: None }),
+        [COMMAND_PREPARE_VIDEO_STREAM, high, low, name @ ..]
+            if usize::from(u16::from_be_bytes([*high, *low])) == name.len()
+                && name.len() <= rustconsole_protocol::display::MAX_DISPLAY_ID_BYTES =>
+        {
+            let value = std::str::from_utf8(name).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "display identity is not UTF-8")
+            })?;
+            let display = rustconsole_protocol::display::DisplayId::new(value.to_owned())
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            Ok(WorkerCommand::PrepareVideoStream {
+                display: Some(display),
+            })
+        }
         [COMMAND_START_VIDEO_STREAM, rest @ ..]
             if rest.len() == 12 && rest[10] <= 1 && rest[11] <= 1 =>
         {
@@ -177,6 +180,13 @@ pub fn read_command(reader: &mut impl Read) -> io::Result<WorkerCommand> {
 pub fn write_event(writer: &mut impl Write, event: &WorkerEvent) -> io::Result<()> {
     let mut payload = Vec::new();
     match event {
+        WorkerEvent::DisplayCatalog(bytes) => {
+            if bytes.len() > rustconsole_protocol::wire::MAX_RELIABLE_MESSAGE_SIZE + 4 {
+                return Err(invalid_data("display catalog exceeds its bound"));
+            }
+            payload.push(EVENT_DISPLAY_CATALOG);
+            payload.extend_from_slice(bytes);
+        }
         WorkerEvent::Hello {
             version,
             process_id,
@@ -268,6 +278,11 @@ pub fn write_event(writer: &mut impl Write, event: &WorkerEvent) -> io::Result<(
 pub fn read_event(reader: &mut impl Read) -> io::Result<WorkerEvent> {
     let payload = read_frame(reader)?;
     match payload.first().copied() {
+        Some(EVENT_DISPLAY_CATALOG)
+            if payload.len() <= rustconsole_protocol::wire::MAX_RELIABLE_MESSAGE_SIZE + 5 =>
+        {
+            Ok(WorkerEvent::DisplayCatalog(payload[1..].to_vec()))
+        }
         Some(EVENT_HELLO) if payload.len() == 28 => Ok(WorkerEvent::Hello {
             version: u16::from_be_bytes(payload[1..3].try_into().unwrap()),
             process_id: u32::from_be_bytes(payload[3..7].try_into().unwrap()),
@@ -627,7 +642,13 @@ mod tests {
     #[test]
     fn streaming_commands_round_trip() {
         for command in [
-            WorkerCommand::PrepareVideoStream,
+            WorkerCommand::DiscoverDisplays,
+            WorkerCommand::PrepareVideoStream { display: None },
+            WorkerCommand::PrepareVideoStream {
+                display: Some(
+                    rustconsole_protocol::display::DisplayId::new("display-test".into()).unwrap(),
+                ),
+            },
             WorkerCommand::StartVideoStream {
                 frames_per_second: 120,
                 bitrate_bits_per_second: 20_000_000,
@@ -641,9 +662,23 @@ mod tests {
             WorkerCommand::Stop,
         ] {
             let mut bytes = Vec::new();
-            write_command(&mut bytes, command).unwrap();
+            write_command(&mut bytes, command.clone()).unwrap();
             assert_eq!(read_command(&mut Cursor::new(bytes)).unwrap(), command);
         }
+    }
+
+    #[test]
+    fn display_catalog_round_trips_and_rejects_oversized_payloads() {
+        let event = WorkerEvent::DisplayCatalog(vec![0, 0, 0, 3, 0xba, 1, 0]);
+        let mut bytes = Vec::new();
+        write_event(&mut bytes, &event).unwrap();
+        assert_eq!(read_event(&mut Cursor::new(bytes)).unwrap(), event);
+        let oversized = WorkerEvent::DisplayCatalog(vec![
+            0;
+            rustconsole_protocol::wire::MAX_RELIABLE_MESSAGE_SIZE
+                + 5
+        ]);
+        assert!(write_event(&mut Vec::new(), &oversized).is_err());
     }
 
     #[test]

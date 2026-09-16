@@ -50,17 +50,27 @@ pub struct EncodedAudioPacket {
     pub payload: Vec<u8>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EncodedVideoPacket {
+    pub presentation_timestamp: i64,
+    pub keyframe: bool,
+    pub data: Vec<u8>,
+}
+
 pub trait VideoEncoder<InputFrame> {
     type Error;
 
     fn encode(
         &mut self,
-        frame: VideoFrame<InputFrame>,
-    ) -> Result<Option<EncodedVideoFrame>, Self::Error>;
+        frame: &InputFrame,
+        presentation_timestamp: i64,
+    ) -> Result<Option<EncodedVideoPacket>, Self::Error>;
 
     fn request_keyframe(&mut self) -> Result<(), Self::Error>;
 
     fn set_bitrate(&mut self, bits_per_second: u64) -> Result<(), Self::Error>;
+
+    fn reset(&mut self) -> Result<(), Self::Error>;
 }
 
 pub trait VideoDecoder {

@@ -3,6 +3,8 @@ use rustconsole_codec_ffmpeg::{
     Av1ColorDescription, Av1D3d11Decoder, Av1EncoderConfiguration, Av1FrameFormat, Av1NvencEncoder,
     EncodedAv1Packet, HardwareDevice,
 };
+use rustconsole_media::VideoEncoder;
+use rustconsole_protocol::display::{AdapterId, DisplayId, DisplaySelection};
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::{CStr, c_char, c_void};
 use std::fmt;
@@ -21,6 +23,8 @@ unsafe extern "C" {
         bridge: *mut *mut c_void,
         encoder_device: *mut *mut c_void,
         normal_desktop: i32,
+        display_id: *const u16,
+        encoder_adapter_id: u64,
         width: *mut u32,
         height: *mut u32,
         refresh_rate: *mut u32,
@@ -43,6 +47,7 @@ unsafe extern "C" {
         bridge: *mut *mut c_void,
         encoder_device: *mut *mut c_void,
         shared_texture: *mut c_void,
+        encoder_adapter_id: u64,
         width: u32,
         height: u32,
         refresh_rate: u32,
@@ -60,7 +65,7 @@ unsafe extern "C" {
     fn rustconsole_gpu_bridge_reconfiguration_cause(bridge: *mut c_void) -> u32;
 }
 
-pub type VideoCaptureConfiguration = crate::worker_protocol::WorkerVideoConfiguration;
+pub use crate::video_configuration::VideoCaptureConfiguration;
 
 pub struct PreparedGpuCapture {
     bridge: GpuBridge,
@@ -68,19 +73,33 @@ pub struct PreparedGpuCapture {
     configuration: VideoCaptureConfiguration,
 }
 
-impl PreparedGpuCapture {
-    pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        let desktop = attach_input_desktop()?;
-        Self::for_desktop(&desktop)
-    }
+pub fn prepare_nvenc_capture(
+    desktop: &str,
+    selection: &DisplaySelection,
+) -> Result<PreparedGpuCapture, Box<dyn std::error::Error>> {
+    let inventory = crate::display::discover()?;
+    let display = inventory.resolve(selection)?;
+    let adapter = inventory
+        .adapters()
+        .iter()
+        .filter(|adapter| adapter.vendor_id == 0x10de && !adapter.software)
+        .min_by_key(|adapter| adapter.id != display.adapter)
+        .ok_or("NVENC requires an available NVIDIA adapter")?;
+    PreparedGpuCapture::for_display(desktop, &display.id, adapter.id)
+}
 
-    pub fn for_desktop(desktop: &str) -> Result<Self, Box<dyn std::error::Error>> {
+impl PreparedGpuCapture {
+    pub fn for_display(
+        desktop: &str,
+        display_id: &DisplayId,
+        processing_adapter: AdapterId,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let normal_desktop = desktop.eq_ignore_ascii_case("Default");
         let (bridge, device, configuration) = if normal_desktop {
-            GpuBridge::new_external()
+            GpuBridge::new_external(display_id, processing_adapter)
                 .map_err(|error| format!("interactive WGC helper initialization failed: {error}"))?
         } else {
-            GpuBridge::new(false)
+            GpuBridge::new(false, display_id, processing_adapter)
                 .map_err(|error| format!("GPU bridge initialization failed: {error}"))?
         };
         Ok(Self {
@@ -93,6 +112,10 @@ impl PreparedGpuCapture {
     #[must_use]
     pub const fn configuration(&self) -> VideoCaptureConfiguration {
         self.configuration
+    }
+
+    pub fn processing_device(&self) -> &ID3D11Device {
+        &self.device
     }
 }
 
@@ -113,20 +136,30 @@ impl fmt::Display for VideoReconfigurationRequired {
 
 impl std::error::Error for VideoReconfigurationRequired {}
 
-pub struct GpuAv1SnapshotEncoder {
-    bridge: GpuBridge,
+pub struct GpuVideoPipeline<E = Av1NvencEncoder> {
+    capture: GpuCapture,
     device: ID3D11Device,
-    context: ID3D11DeviceContext,
-    encoder: Av1NvencEncoder,
-    cached_texture: Option<ID3D11Texture2D>,
-    cached_metadata: Option<CachedFrameMetadata>,
-    width: u32,
-    height: u32,
-    frames_per_second: u16,
+    encoder: E,
     bitrate_bits_per_second: u64,
     next_presentation_timestamp: i64,
     pending_metadata: VecDeque<FrameMetadata>,
-    quality: Option<VideoQualityDiagnostics>,
+    quality: Option<Av1QualityDiagnostics>,
+}
+
+pub struct GpuCapture {
+    bridge: GpuBridge,
+    device: ID3D11Device,
+    context: ID3D11DeviceContext,
+    cached_texture: Option<ID3D11Texture2D>,
+    cached_metadata: Option<CaptureMetadata>,
+}
+
+pub struct CapturedGpuFrame<'a> {
+    pub texture: &'a ID3D11Texture2D,
+    pub metadata: CaptureMetadata,
+    pub capture_acquisition_micros: u64,
+    pub cross_adapter_copy_micros: u64,
+    pub color_conversion_micros: u64,
 }
 
 pub struct EncodedSnapshot {
@@ -167,10 +200,10 @@ struct FrameMetadata {
 }
 
 #[derive(Clone, Copy)]
-struct CachedFrameMetadata {
-    last_present_time: i64,
-    accumulated_frames: u32,
-    protected_content_masked: bool,
+pub struct CaptureMetadata {
+    pub last_present_time: i64,
+    pub accumulated_frames: u32,
+    pub protected_content_masked: bool,
 }
 
 struct QualitySource {
@@ -182,19 +215,19 @@ struct QualitySource {
     readback_bytes: u64,
 }
 
-struct VideoQualityDiagnostics {
+struct Av1QualityDiagnostics {
     decoder: Av1D3d11Decoder,
     next_sample: Instant,
     sources: BTreeMap<i64, QualitySource>,
 }
 
-impl GpuAv1SnapshotEncoder {
+impl GpuVideoPipeline {
     pub fn new(
         frames_per_second: u16,
         bitrate_bits_per_second: u64,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         Self::from_prepared(
-            PreparedGpuCapture::new()?,
+            prepare_nvenc_capture(&attach_input_desktop()?, &DisplaySelection::Primary)?,
             frames_per_second,
             bitrate_bits_per_second,
         )
@@ -218,9 +251,6 @@ impl GpuAv1SnapshotEncoder {
             color,
             ..
         } = configuration;
-        if width != 2560 || height != 1440 {
-            return Err(format!("GPU encoder requires 2560x1440, found {width}x{height}").into());
-        }
         if display_refresh_rate < u32::from(frames_per_second) {
             return Err(format!(
                 "GPU encoder requires {frames_per_second} Hz, display reports {display_refresh_rate} Hz"
@@ -237,31 +267,47 @@ impl GpuAv1SnapshotEncoder {
                 frames_per_second,
                 bitrate_bits_per_second,
                 frame_format: match format {
-                    crate::worker_protocol::WorkerVideoFormat::Nv12 => Av1FrameFormat::Yuv420Eight,
-                    crate::worker_protocol::WorkerVideoFormat::P010 => Av1FrameFormat::Yuv420Ten,
+                    crate::video_configuration::PixelFormat::Nv12 => Av1FrameFormat::Yuv420Eight,
+                    crate::video_configuration::PixelFormat::P010 => Av1FrameFormat::Yuv420Ten,
                 },
                 color_description: match color {
-                    crate::worker_protocol::WorkerVideoColor::Bt709Limited => {
+                    crate::video_configuration::ColorDescription::Bt709Limited => {
                         Av1ColorDescription::Bt709Limited
                     }
-                    crate::worker_protocol::WorkerVideoColor::Bt2020PqLimited => {
+                    crate::video_configuration::ColorDescription::Bt2020PqLimited => {
                         Av1ColorDescription::Bt2020PqLimited
                     }
                 },
             },
         )
         .map_err(|error| format!("NVENC AV1 encoder initialization failed: {error}"))?;
-        let context = unsafe { device.GetImmediateContext()? };
-        Ok(Self {
-            bridge,
-            device,
-            context,
+        Self::with_encoder(
+            PreparedGpuCapture {
+                bridge,
+                device,
+                configuration,
+            },
             encoder,
-            cached_texture: None,
-            cached_metadata: None,
-            width,
-            height,
-            frames_per_second,
+            bitrate_bits_per_second,
+        )
+    }
+}
+
+impl<E> GpuVideoPipeline<E>
+where
+    E: VideoEncoder<ID3D11Texture2D>,
+    E::Error: std::fmt::Display,
+{
+    pub fn with_encoder(
+        prepared: PreparedGpuCapture,
+        encoder: E,
+        bitrate_bits_per_second: u64,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let device = prepared.device.clone();
+        Ok(Self {
+            capture: GpuCapture::from_prepared(prepared)?,
+            device,
+            encoder,
             bitrate_bits_per_second,
             next_presentation_timestamp: 0,
             pending_metadata: VecDeque::with_capacity(2),
@@ -269,25 +315,39 @@ impl GpuAv1SnapshotEncoder {
         })
     }
 
-    pub fn enable_quality_diagnostics(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn enable_av1_quality_diagnostics(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let hardware = HardwareDevice::from_d3d11_device(&self.device)
             .map_err(|error| format!("FFmpeg D3D11 device import failed: {error}"))?;
         let decoder = Av1D3d11Decoder::open(&hardware).map_err(|error| {
             format!("D3D11VA AV1 mirror decoder initialization failed: {error}")
         })?;
-        self.quality = Some(VideoQualityDiagnostics {
+        self.quality = Some(Av1QualityDiagnostics {
             decoder,
             next_sample: Instant::now(),
             sources: BTreeMap::new(),
         });
         Ok(())
     }
+}
 
-    pub fn encode_next_frame(
+impl GpuCapture {
+    pub fn from_prepared(prepared: PreparedGpuCapture) -> Result<Self, Box<dyn std::error::Error>> {
+        let PreparedGpuCapture { bridge, device, .. } = prepared;
+        let context = unsafe { device.GetImmediateContext()? };
+        Ok(Self {
+            bridge,
+            device,
+            context,
+            cached_texture: None,
+            cached_metadata: None,
+        })
+    }
+
+    pub fn next_frame(
         &mut self,
         timeout: Duration,
-    ) -> Result<Option<EncodedSnapshot>, Box<dyn std::error::Error>> {
-        let diagnostics = self.quality.is_some();
+        diagnostics: bool,
+    ) -> Result<Option<CapturedGpuFrame<'_>>, Box<dyn std::error::Error>> {
         let capture_timeout = if self.cached_texture.is_some() {
             Duration::ZERO
         } else {
@@ -307,7 +367,7 @@ impl GpuAv1SnapshotEncoder {
                     self.cached_texture =
                         Some(texture.ok_or("D3D11 frame cache created no texture")?);
                 }
-                let metadata = CachedFrameMetadata {
+                let metadata = CaptureMetadata {
                     last_present_time: lease.last_present_time,
                     accumulated_frames: lease.accumulated_frames,
                     protected_content_masked: lease.protected_content_masked,
@@ -357,11 +417,40 @@ impl GpuAv1SnapshotEncoder {
             .as_ref()
             .ok_or("video frame cache is unavailable")?;
 
+        Ok(Some(CapturedGpuFrame {
+            texture,
+            metadata,
+            capture_acquisition_micros,
+            cross_adapter_copy_micros,
+            color_conversion_micros,
+        }))
+    }
+}
+
+impl<E> GpuVideoPipeline<E>
+where
+    E: VideoEncoder<ID3D11Texture2D>,
+    E::Error: std::fmt::Display,
+{
+    pub fn encode_next_frame(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<Option<EncodedSnapshot>, Box<dyn std::error::Error>> {
+        let diagnostics = self.quality.is_some();
+        let Some(frame) = self.capture.next_frame(timeout, diagnostics)? else {
+            return Ok(None);
+        };
+        let metadata = frame.metadata;
+        let texture = frame.texture;
+        let capture_acquisition_micros = frame.capture_acquisition_micros;
+        let cross_adapter_copy_micros = frame.cross_adapter_copy_micros;
+        let color_conversion_micros = frame.color_conversion_micros;
+
         let presentation_timestamp = self.next_presentation_timestamp;
         self.next_presentation_timestamp = self
             .next_presentation_timestamp
             .checked_add(1)
-            .ok_or("NVENC presentation timestamp exhausted")?;
+            .ok_or("video presentation timestamp exhausted")?;
         let quality_source = match self.quality.as_mut() {
             Some(quality) if Instant::now() >= quality.next_sample => {
                 quality.next_sample = Instant::now() + Duration::from_millis(200);
@@ -383,8 +472,8 @@ impl GpuAv1SnapshotEncoder {
         let encoder_started = diagnostics.then(Instant::now);
         let packet = self
             .encoder
-            .encode_d3d11_texture(texture, presentation_timestamp)
-            .map_err(|error| format!("NVENC AV1 frame submission failed: {error}"))?;
+            .encode(texture, presentation_timestamp)
+            .map_err(|error| format!("video frame submission failed: {error}"))?;
         if let Some(started) = encoder_started
             && let Some(metadata) = self.pending_metadata.back_mut()
         {
@@ -399,10 +488,10 @@ impl GpuAv1SnapshotEncoder {
         let metadata = self
             .pending_metadata
             .pop_front()
-            .ok_or("NVENC returned a packet without submitted frame metadata")?;
+            .ok_or("video encoder returned a packet without submitted frame metadata")?;
         if metadata.presentation_timestamp != packet.presentation_timestamp {
             return Err(format!(
-                "NVENC returned presentation timestamp {}, expected {}",
+                "video encoder returned presentation timestamp {}, expected {}",
                 packet.presentation_timestamp, metadata.presentation_timestamp
             )
             .into());
@@ -434,54 +523,37 @@ impl GpuAv1SnapshotEncoder {
         }
         self.encoder
             .set_bitrate(bitrate_bits_per_second)
-            .map_err(|error| format!("NVENC AV1 bitrate reconfiguration failed: {error}"))?;
+            .map_err(|error| format!("video bitrate reconfiguration failed: {error}"))?;
         self.bitrate_bits_per_second = bitrate_bits_per_second;
         Ok(())
     }
 
-    pub fn request_keyframe(&mut self) {
-        self.encoder.request_keyframe();
+    pub fn request_keyframe(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        self.encoder
+            .request_keyframe()
+            .map_err(|error| format!("video keyframe request failed: {error}").into())
     }
 
     fn rebuild_encoder(
         &mut self,
         bitrate_bits_per_second: u64,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let hardware = HardwareDevice::from_d3d11_device(&self.device)
-            .map_err(|error| format!("FFmpeg D3D11 device import failed: {error}"))?;
-        let encoder = Av1NvencEncoder::open(
-            &hardware,
-            Av1EncoderConfiguration {
-                width: self.width,
-                height: self.height,
-                frames_per_second: self.frames_per_second,
-                bitrate_bits_per_second,
-                frame_format: match self.bridge.configuration.format {
-                    crate::worker_protocol::WorkerVideoFormat::Nv12 => Av1FrameFormat::Yuv420Eight,
-                    crate::worker_protocol::WorkerVideoFormat::P010 => Av1FrameFormat::Yuv420Ten,
-                },
-                color_description: match self.bridge.configuration.color {
-                    crate::worker_protocol::WorkerVideoColor::Bt709Limited => {
-                        Av1ColorDescription::Bt709Limited
-                    }
-                    crate::worker_protocol::WorkerVideoColor::Bt2020PqLimited => {
-                        Av1ColorDescription::Bt2020PqLimited
-                    }
-                },
-            },
-        )
-        .map_err(|error| format!("NVENC AV1 encoder reinitialization failed: {error}"))?;
-        self.encoder = encoder;
+        self.encoder
+            .set_bitrate(bitrate_bits_per_second)
+            .map_err(|error| format!("video bitrate update failed: {error}"))?;
+        self.encoder
+            .reset()
+            .map_err(|error| format!("video encoder reset failed: {error}"))?;
         self.bitrate_bits_per_second = bitrate_bits_per_second;
         self.pending_metadata.clear();
         if self.quality.is_some() {
-            self.enable_quality_diagnostics()?;
+            self.enable_av1_quality_diagnostics()?;
         }
         Ok(())
     }
 }
 
-impl VideoQualityDiagnostics {
+impl Av1QualityDiagnostics {
     fn observe(
         &mut self,
         packet: &EncodedAv1Packet,
@@ -662,7 +734,6 @@ impl Drop for TextureMapping<'_> {
 
 struct GpuBridge {
     raw: NonNull<c_void>,
-    configuration: VideoCaptureConfiguration,
     helper: Option<crate::wgc_helper::WgcHelper>,
     pending_helper_frame: Option<crate::wgc_helper::WgcFrame>,
 }
@@ -670,7 +741,14 @@ struct GpuBridge {
 impl GpuBridge {
     fn new(
         normal_desktop: bool,
+        display_id: &DisplayId,
+        processing_adapter: AdapterId,
     ) -> Result<(Self, ID3D11Device, VideoCaptureConfiguration), BridgeError> {
+        let display_id = display_id
+            .as_str()
+            .encode_utf16()
+            .chain(Some(0))
+            .collect::<Vec<_>>();
         let mut bridge = ptr::null_mut();
         let mut device = ptr::null_mut();
         let mut width = 0;
@@ -685,6 +763,8 @@ impl GpuBridge {
                 &mut bridge,
                 &mut device,
                 i32::from(normal_desktop),
+                display_id.as_ptr(),
+                processing_adapter.0,
                 &mut width,
                 &mut height,
                 &mut refresh_rate,
@@ -705,8 +785,8 @@ impl GpuBridge {
             height,
             refresh_rate,
             capture_engine: match capture_engine {
-                1 => crate::worker_protocol::WorkerCaptureEngine::WindowsGraphicsCapture,
-                2 => crate::worker_protocol::WorkerCaptureEngine::DesktopDuplication,
+                1 => crate::video_configuration::CaptureEngine::WindowsGraphicsCapture,
+                2 => crate::video_configuration::CaptureEngine::DesktopDuplication,
                 _ => {
                     return Err(BridgeError::invalid(
                         "GPU bridge returned an invalid capture engine",
@@ -714,8 +794,8 @@ impl GpuBridge {
                 }
             },
             format: match video_format {
-                1 => crate::worker_protocol::WorkerVideoFormat::Nv12,
-                2 => crate::worker_protocol::WorkerVideoFormat::P010,
+                1 => crate::video_configuration::PixelFormat::Nv12,
+                2 => crate::video_configuration::PixelFormat::P010,
                 _ => {
                     return Err(BridgeError::invalid(
                         "GPU bridge returned an invalid video format",
@@ -723,8 +803,8 @@ impl GpuBridge {
                 }
             },
             color: match video_color {
-                1 => crate::worker_protocol::WorkerVideoColor::Bt709Limited,
-                2 => crate::worker_protocol::WorkerVideoColor::Bt2020PqLimited,
+                1 => crate::video_configuration::ColorDescription::Bt709Limited,
+                2 => crate::video_configuration::ColorDescription::Bt2020PqLimited,
                 _ => {
                     return Err(BridgeError::invalid(
                         "GPU bridge returned an invalid video color",
@@ -735,7 +815,6 @@ impl GpuBridge {
         Ok((
             Self {
                 raw,
-                configuration,
                 helper: None,
                 pending_helper_frame: None,
             },
@@ -744,11 +823,16 @@ impl GpuBridge {
         ))
     }
 
-    fn new_external() -> Result<(Self, ID3D11Device, VideoCaptureConfiguration), BridgeError> {
-        let helper = crate::wgc_helper::WgcHelper::launch().map_err(|error| BridgeError {
-            code: 0x8000_4005_u32 as i32,
-            stage: error.to_string(),
-        })?;
+    fn new_external(
+        display_id: &DisplayId,
+        processing_adapter: AdapterId,
+    ) -> Result<(Self, ID3D11Device, VideoCaptureConfiguration), BridgeError> {
+        let helper = crate::wgc_helper::WgcHelper::launch(display_id, processing_adapter).map_err(
+            |error| BridgeError {
+                code: 0x8000_4005_u32 as i32,
+                stage: error.to_string(),
+            },
+        )?;
         let configuration = helper.configuration;
         let mut bridge = ptr::null_mut();
         let mut device = ptr::null_mut();
@@ -759,16 +843,17 @@ impl GpuBridge {
                 &mut bridge,
                 &mut device,
                 helper.shared_texture().0,
+                processing_adapter.0,
                 configuration.width,
                 configuration.height,
                 configuration.refresh_rate,
                 match configuration.format {
-                    crate::worker_protocol::WorkerVideoFormat::Nv12 => 1,
-                    crate::worker_protocol::WorkerVideoFormat::P010 => 2,
+                    crate::video_configuration::PixelFormat::Nv12 => 1,
+                    crate::video_configuration::PixelFormat::P010 => 2,
                 },
                 match configuration.color {
-                    crate::worker_protocol::WorkerVideoColor::Bt709Limited => 1,
-                    crate::worker_protocol::WorkerVideoColor::Bt2020PqLimited => 2,
+                    crate::video_configuration::ColorDescription::Bt709Limited => 1,
+                    crate::video_configuration::ColorDescription::Bt2020PqLimited => 2,
                 },
             )
         };
@@ -780,7 +865,6 @@ impl GpuBridge {
         Ok((
             Self {
                 raw,
-                configuration,
                 helper: Some(helper),
                 pending_helper_frame: None,
             },

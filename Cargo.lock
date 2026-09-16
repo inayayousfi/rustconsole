@@ -3986,6 +3986,7 @@ version = "0.1.0"
 dependencies = [
  "criterion",
  "ffmpeg-next",
+ "rustconsole-media",
  "windows 0.62.2",
 ]
 

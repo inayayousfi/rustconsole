@@ -2,6 +2,7 @@ use crate::interactive_worker::{self, InteractiveHelperConnection};
 use crate::worker_protocol::{
     WorkerCaptureEngine, WorkerVideoColor, WorkerVideoConfiguration, WorkerVideoFormat,
 };
+use rustconsole_protocol::display::{AdapterId, DisplayId};
 use std::fs;
 use std::io::{Read, Write};
 use std::os::windows::io::AsRawHandle;
@@ -11,7 +12,9 @@ use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE};
 use windows::Win32::System::Pipes::PeekNamedPipe;
 use windows::Win32::System::RemoteDesktop::WTSGetActiveConsoleSessionId;
-use windows::Win32::System::Threading::GetCurrentProcess;
+use windows::Win32::System::Threading::{
+    GetCurrentProcess, GetExitCodeProcess, WaitForSingleObject,
+};
 
 const HELLO_MAGIC: u32 = 0x4847_4352;
 const FRAME_MAGIC: u32 = 0x4647_4352;
@@ -36,7 +39,10 @@ pub struct WgcFrame {
 }
 
 impl WgcHelper {
-    pub fn launch() -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn launch(
+        display_id: &DisplayId,
+        processing_adapter: AdapterId,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let helper_path = install_helper()?;
         // SAFETY: the function returns a value and does not retain pointers.
         let session_id = unsafe { WTSGetActiveConsoleSessionId() };
@@ -45,9 +51,29 @@ impl WgcHelper {
         }
         let connection = interactive_worker::launch_helper(&helper_path, session_id)?;
 
+        let name = display_id.as_str().encode_utf16().collect::<Vec<_>>();
+        if name.len() >= 128 {
+            return Err("display identity exceeds helper bound".into());
+        }
+        let mut request = vec![0_u8; 268];
+        request[..4].copy_from_slice(&2_u32.to_le_bytes());
+        request[4..12].copy_from_slice(&processing_adapter.0.to_le_bytes());
+        for (index, value) in name.into_iter().enumerate() {
+            request[12 + index * 2..14 + index * 2].copy_from_slice(&value.to_le_bytes());
+        }
+        (&connection.channel).write_all(&request)?;
+
         let mut hello = [0_u8; HELLO_SIZE];
-        read_exact(&connection.channel, &mut hello)?;
-        if u32_at(&hello, 0) != HELLO_MAGIC || u32_at(&hello, 4) != 1 {
+        read_exact(&connection.channel, &mut hello).map_err(|error| {
+            let mut exit_code = 0;
+            // SAFETY: the connection owns a live process handle throughout the diagnostic query.
+            unsafe {
+                WaitForSingleObject(connection.process, 1000);
+                let _ = GetExitCodeProcess(connection.process, &mut exit_code);
+            }
+            format!("WGC helper hello failed: {error}; exit code {exit_code:#010x}")
+        })?;
+        if u32_at(&hello, 0) != HELLO_MAGIC || u32_at(&hello, 4) != 2 {
             return Err("WGC helper returned an invalid protocol header".into());
         }
         if hello[8..24] != connection.connection_token {

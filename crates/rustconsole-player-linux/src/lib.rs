@@ -27,13 +27,12 @@ use rustconsole_codec_ffmpeg::{
 use rustconsole_media::{AudioFormat, AudioSamples, MediaTimestampMicros};
 use rustconsole_player_core::AudioPlaybackEvent;
 use rustconsole_protocol::wire::{
-    self, Av1CapabilityOffer, Av1HardwareCapability, Av1Mode, Av1ViewerSettings, ChromaSubsampling,
+    self, Av1Capability, Av1CapabilityOffer, Av1Mode, Av1ViewerSettings, ChromaSubsampling,
     EncodedVideoPacket, Envelope, SelectedAv1Configuration, VideoBitDepth, envelope,
 };
 use rustconsole_protocol::{
-    Av1HardwareCapability as DomainCapability, Av1Mode as DomainMode,
-    Av1ViewerSettings as DomainSettings, ChromaSubsampling as DomainChroma,
-    VideoBitDepth as DomainDepth, negotiate_av1_configuration,
+    Av1Capability as DomainCapability, Av1Mode as DomainMode, Av1ViewerSettings as DomainSettings,
+    ChromaSubsampling as DomainChroma, VideoBitDepth as DomainDepth, negotiate_av1_configuration,
 };
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -100,6 +99,7 @@ pub struct StreamCallbacks<Authenticated, Progress, Statistics, Audio, Video> {
 }
 
 pub struct StreamConfiguration {
+    pub display: Option<rustconsole_protocol::display::Display>,
     pub address: String,
     pub password: Option<Vec<u8>>,
     pub remember_password: bool,
@@ -410,6 +410,7 @@ pub fn stream_quic_video(
     >,
 ) -> Result<rustconsole_player_core::StreamHostResult, Box<dyn std::error::Error>> {
     let StreamConfiguration {
+        display,
         address,
         password,
         remember_password,
@@ -445,8 +446,8 @@ pub fn stream_quic_video(
         maximum_frames_per_second: frames_per_second,
     };
     let settings = DomainSettings {
-        width: WIDTH,
-        height: HEIGHT,
+        width: display.as_ref().map_or(WIDTH, |display| display.width),
+        height: display.as_ref().map_or(HEIGHT, |display| display.height),
         frames_per_second,
         mode_preferences: vec![capability_10.mode, capability_8.mode],
         maximum_bitrate_bits_per_second,
@@ -464,6 +465,7 @@ pub fn stream_quic_video(
     let supplied_password = password.map(Zeroizing::new);
     let password_to_store = supplied_password.clone();
     let identity = rustconsole_player_core::stream_host(rustconsole_player_core::StreamHostParameters {
+        display: display.map(|display| display.id),
         address,
         password_for: move |host_identity: rustconsole_player_core::HostIdentity| {
             supplied_password
@@ -711,6 +713,7 @@ pub fn run_one_frame_proof(
     };
     let offer = Envelope {
         body: Some(envelope::Body::Av1CapabilityOffer(Av1CapabilityOffer {
+            display_id: None,
             dedicated_input_stream: false,
             host_pointer_release: false,
             full_diagnostics: false,
@@ -855,8 +858,8 @@ pub fn decode_fixture_dma_buf() -> Result<NativeDmaBufFrame, Box<dyn std::error:
     Ok(decoded.map_dma_buf()?)
 }
 
-fn wire_capability(capability: DomainCapability) -> Av1HardwareCapability {
-    Av1HardwareCapability {
+fn wire_capability(capability: DomainCapability) -> Av1Capability {
+    Av1Capability {
         chroma_subsampling: ChromaSubsampling::Yuv420 as i32,
         bit_depth: VideoBitDepth::Eight as i32,
         maximum_width: capability.maximum_width,
@@ -866,7 +869,7 @@ fn wire_capability(capability: DomainCapability) -> Av1HardwareCapability {
 }
 
 fn domain_capability(
-    capability: &Av1HardwareCapability,
+    capability: &Av1Capability,
 ) -> Result<DomainCapability, Box<dyn std::error::Error>> {
     if ChromaSubsampling::try_from(capability.chroma_subsampling) != Ok(ChromaSubsampling::Yuv420)
         || VideoBitDepth::try_from(capability.bit_depth) != Ok(VideoBitDepth::Eight)

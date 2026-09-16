@@ -10,6 +10,12 @@
 #include <cwchar>
 
 #pragma pack(push, 1)
+struct HelperRequest {
+    uint32_t version;
+    uint64_t processing_adapter;
+    wchar_t display_id[128];
+};
+
 struct HelperHello {
     uint32_t magic;
     uint32_t version;
@@ -38,6 +44,10 @@ struct HelperFrame {
     char failure_stage[192];
 };
 #pragma pack(pop)
+
+static_assert(sizeof(HelperRequest) == 268);
+static_assert(sizeof(HelperHello) == 252);
+static_assert(sizeof(HelperFrame) == 244);
 
 static constexpr uint32_t HELLO_MAGIC = 0x48474352;
 static constexpr uint32_t FRAME_MAGIC = 0x46474352;
@@ -94,15 +104,26 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         arguments[1], GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
     LocalFree(arguments);
     if (pipe == INVALID_HANDLE_VALUE) return 3;
+    DWORD pipe_mode = PIPE_READMODE_BYTE | PIPE_WAIT;
+    if (!SetNamedPipeHandleState(pipe, &pipe_mode, nullptr, nullptr)) {
+        CloseHandle(pipe);
+        return 3;
+    }
 
+    HelperRequest request{};
+    if (!read_all(pipe, &request, sizeof(request)) || request.version != 2 ||
+        !request.display_id[0] || request.display_id[127] != 0) {
+        CloseHandle(pipe);
+        return 5;
+    }
     RustConsoleGpuBridge* bridge = nullptr;
     ID3D11Device* device = nullptr;
     HelperHello hello{};
     hello.magic = HELLO_MAGIC;
-    hello.version = 1;
+    hello.version = 2;
     hello.token = token;
     hello.result = rustconsole_gpu_bridge_create(
-        &bridge, &device, TRUE, &hello.width, &hello.height,
+        &bridge, &device, TRUE, request.display_id, request.processing_adapter, &hello.width, &hello.height,
         &hello.refresh_rate, &hello.capture_engine, &hello.video_format,
         &hello.video_color);
     if (device) device->Release();

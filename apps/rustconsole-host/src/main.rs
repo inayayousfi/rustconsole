@@ -21,6 +21,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum HostCommand {
+    /// List active-console displays and GPUs using host service privileges.
+    Displays,
     Install,
     #[command(hide = true)]
     InstallElevated,
@@ -68,6 +70,7 @@ enum FirewallScopeArgument {
 
 fn service_command(command: Option<HostCommand>) -> ServiceCommand {
     match command {
+        Some(HostCommand::Displays) => ServiceCommand::Displays,
         None => ServiceCommand::Run,
         Some(HostCommand::Install) => ServiceCommand::Install,
         Some(HostCommand::InstallElevated) => ServiceCommand::InstallElevated,
@@ -151,6 +154,11 @@ mod tests {
 
     #[test]
     fn existing_service_and_worker_commands_keep_their_shape() {
+        assert_eq!(
+            parse(&["host", "displays"]).unwrap(),
+            ServiceCommand::Displays
+        );
+        assert!(parse(&["host", "displays", "unexpected"]).is_err());
         assert_eq!(parse(&["host"]).unwrap(), ServiceCommand::Run);
         assert_eq!(
             parse(&["host", "media-worker", "12", "34", "56"]).unwrap(),

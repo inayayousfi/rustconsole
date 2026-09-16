@@ -1,4 +1,4 @@
-//! Deterministic hardware-only AV1 capability negotiation.
+//! Deterministic AV1 capability negotiation.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -25,14 +25,14 @@ pub struct Av1Mode {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Av1HardwareCapability {
+pub struct Av1Capability {
     pub mode: Av1Mode,
     pub maximum_width: u32,
     pub maximum_height: u32,
     pub maximum_frames_per_second: u16,
 }
 
-impl Av1HardwareCapability {
+impl Av1Capability {
     fn supports(self, settings: &Av1ViewerSettings, mode: Av1Mode) -> bool {
         self.mode == mode
             && settings.width <= self.maximum_width
@@ -78,7 +78,7 @@ pub enum Av1NegotiationError {
     DuplicateEncoderCapability(Av1Mode),
     DuplicateDecoderCapability(Av1Mode),
     DuplicateModePreference(Av1Mode),
-    NoCompatibleHardwareMode,
+    NoCompatibleMode,
 }
 
 impl fmt::Display for Av1NegotiationError {
@@ -115,9 +115,7 @@ impl fmt::Display for Av1NegotiationError {
             Self::DuplicateModePreference(mode) => {
                 write!(formatter, "duplicate AV1 mode preference: {mode:?}")
             }
-            Self::NoCompatibleHardwareMode => {
-                formatter.write_str("no compatible hardware AV1 mode")
-            }
+            Self::NoCompatibleMode => formatter.write_str("no compatible AV1 mode"),
         }
     }
 }
@@ -125,8 +123,8 @@ impl fmt::Display for Av1NegotiationError {
 impl std::error::Error for Av1NegotiationError {}
 
 pub fn negotiate_av1_configuration(
-    encoder_capabilities: &[Av1HardwareCapability],
-    decoder_capabilities: &[Av1HardwareCapability],
+    encoder_capabilities: &[Av1Capability],
+    decoder_capabilities: &[Av1Capability],
     settings: &Av1ViewerSettings,
 ) -> Result<NegotiatedAv1Configuration, Av1NegotiationError> {
     validate_capabilities(
@@ -162,11 +160,11 @@ pub fn negotiate_av1_configuration(
         }
     }
 
-    Err(Av1NegotiationError::NoCompatibleHardwareMode)
+    Err(Av1NegotiationError::NoCompatibleMode)
 }
 
 fn validate_capabilities(
-    capabilities: &[Av1HardwareCapability],
+    capabilities: &[Av1Capability],
     empty_error: Av1NegotiationError,
     invalid_error: fn(Av1Mode) -> Av1NegotiationError,
     duplicate_error: fn(Av1Mode) -> Av1NegotiationError,
@@ -235,8 +233,8 @@ mod tests {
         bit_depth: VideoBitDepth::Ten,
     };
 
-    fn capability(mode: Av1Mode) -> Av1HardwareCapability {
-        Av1HardwareCapability {
+    fn capability(mode: Av1Mode) -> Av1Capability {
+        Av1Capability {
             mode,
             maximum_width: 3_840,
             maximum_height: 2_160,
@@ -306,7 +304,7 @@ mod tests {
 
     #[test]
     fn limits_must_support_the_complete_requested_configuration() {
-        let encoder = [Av1HardwareCapability {
+        let encoder = [Av1Capability {
             maximum_frames_per_second: 60,
             ..capability(YUV420_10)
         }];
@@ -316,18 +314,18 @@ mod tests {
 
         assert_eq!(
             negotiate_av1_configuration(&encoder, &decoder, &settings),
-            Err(Av1NegotiationError::NoCompatibleHardwareMode)
+            Err(Av1NegotiationError::NoCompatibleMode)
         );
     }
 
     #[test]
-    fn no_hardware_intersection_is_rejected() {
+    fn no_codec_mode_intersection_is_rejected() {
         let encoder = [capability(YUV444_10)];
         let decoder = [capability(YUV420_10)];
 
         assert_eq!(
             negotiate_av1_configuration(&encoder, &decoder, &settings()),
-            Err(Av1NegotiationError::NoCompatibleHardwareMode)
+            Err(Av1NegotiationError::NoCompatibleMode)
         );
     }
 
@@ -359,7 +357,7 @@ mod tests {
     #[test]
     fn zero_settings_and_capability_limits_are_rejected() {
         let valid = [capability(YUV420_10)];
-        let invalid = [Av1HardwareCapability {
+        let invalid = [Av1Capability {
             maximum_width: 0,
             ..valid[0]
         }];

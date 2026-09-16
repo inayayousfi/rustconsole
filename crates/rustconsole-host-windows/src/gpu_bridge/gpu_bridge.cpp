@@ -45,6 +45,7 @@ enum : uint32_t {
 
 struct RustConsoleGpuBridge {
     bool normal_desktop = false;
+    bool cross_adapter = false;
     bool ro_initialized = false;
     uint32_t capture_engine = 0;
     uint32_t video_format = 0;
@@ -54,35 +55,35 @@ struct RustConsoleGpuBridge {
     ComPtr<IDXGIOutputDuplication> duplication;
     winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool frame_pool{nullptr};
     winrt::Windows::Graphics::Capture::GraphicsCaptureSession capture_session{nullptr};
-    ComPtr<ID3D11Device> intel_capture_device;
-    ComPtr<ID3D11DeviceContext> intel_capture_context;
-    ComPtr<ID3D11DeviceContext4> intel_capture_context4;
-    ComPtr<ID3D11Texture2D> intel_cross_resource11;
-    ComPtr<ID3D11Fence> intel_cross_fence11;
-    ComPtr<ID3D12Device> intel_device12;
-    ComPtr<ID3D12Resource> intel_cross_resource;
-    ComPtr<ID3D12Fence> intel_cross_fence;
+    ComPtr<ID3D11Device> capture_device;
+    ComPtr<ID3D11DeviceContext> capture_context;
+    ComPtr<ID3D11DeviceContext4> capture_context4;
+    ComPtr<ID3D11Texture2D> capture_cross_resource11;
+    ComPtr<ID3D11Fence> capture_cross_fence11;
+    ComPtr<ID3D12Device> capture_device12;
+    ComPtr<ID3D12Resource> capture_cross_resource;
+    ComPtr<ID3D12Fence> capture_cross_fence;
 
-    ComPtr<ID3D12Device> nvidia_device12;
-    ComPtr<ID3D12CommandQueue> nvidia_queue;
-    ComPtr<ID3D12CommandAllocator> nvidia_allocator;
-    ComPtr<ID3D12GraphicsCommandList> nvidia_commands;
-    ComPtr<ID3D12Resource> nvidia_cross_resource;
-    ComPtr<ID3D12Fence> nvidia_cross_fence;
-    ComPtr<ID3D12Fence> nvidia_copy_fence;
-    ComPtr<ID3D12Resource> nvidia_local_source12;
-    ComPtr<ID3D11Device> nvidia_device11on12;
-    ComPtr<ID3D11DeviceContext> nvidia_context11on12;
-    ComPtr<ID3D11On12Device> nvidia_interop;
-    ComPtr<ID3D11Texture2D> nvidia_local_source11;
-    ComPtr<ID3D11Texture2D> nvidia_converted_rgb;
+    ComPtr<ID3D12Device> processing_device12;
+    ComPtr<ID3D12CommandQueue> processing_queue;
+    ComPtr<ID3D12CommandAllocator> processing_allocator;
+    ComPtr<ID3D12GraphicsCommandList> processing_commands;
+    ComPtr<ID3D12Resource> processing_cross_resource;
+    ComPtr<ID3D12Fence> processing_cross_fence;
+    ComPtr<ID3D12Fence> processing_copy_fence;
+    ComPtr<ID3D12Resource> processing_local_source12;
+    ComPtr<ID3D11Device> processing_device;
+    ComPtr<ID3D11DeviceContext> processing_context;
+    ComPtr<ID3D11On12Device> processing_interop;
+    ComPtr<ID3D11Texture2D> processing_local_source11;
+    ComPtr<ID3D11Texture2D> processing_converted_rgb;
     ComPtr<ID3D11ShaderResourceView> shader_input;
     ComPtr<ID3D11RenderTargetView> shader_output;
     ComPtr<ID3D11VertexShader> vertex_shader;
     ComPtr<ID3D11PixelShader> pixel_shader;
     ComPtr<ID3D11SamplerState> sampler;
-    ComPtr<ID3D11VideoDevice> nvidia_video_device;
-    ComPtr<ID3D11VideoContext> nvidia_video_context;
+    ComPtr<ID3D11VideoDevice> processing_video_device;
+    ComPtr<ID3D11VideoContext> processing_video_context;
     ComPtr<ID3D11VideoProcessorEnumerator> video_enumerator;
     ComPtr<ID3D11VideoProcessor> video_processor;
     ComPtr<ID3D11VideoProcessorInputView> video_input;
@@ -91,8 +92,8 @@ struct RustConsoleGpuBridge {
     ComPtr<ID3D11DeviceContext> encoder_context;
     ComPtr<ID3D11Texture2D> encoder_texture;
     ComPtr<IDXGIKeyedMutex> encoder_mutex;
-    ComPtr<ID3D11Texture2D> nvidia11on12_output;
-    ComPtr<IDXGIKeyedMutex> nvidia11on12_mutex;
+    ComPtr<ID3D11Texture2D> processing_output;
+    ComPtr<IDXGIKeyedMutex> processing_mutex;
     ComPtr<ID3D11VideoProcessorOutputView> video_output;
 
     HANDLE cross_handle = nullptr;
@@ -111,6 +112,9 @@ struct RustConsoleGpuBridge {
             if (frame_pool) frame_pool.Close();
         } catch (...) {
         }
+        // Release WinRT objects before their apartment is uninitialized, including failed setup.
+        capture_session = nullptr;
+        frame_pool = nullptr;
         if (encoder_texture_outstanding && encoder_mutex) {
             encoder_mutex->ReleaseSync(0);
         }
@@ -121,19 +125,6 @@ struct RustConsoleGpuBridge {
         if (ro_initialized) RoUninitialize();
     }
 };
-
-static HRESULT primary_display_name(wchar_t name[CCHDEVICENAME]) {
-    for (DWORD index = 0;; ++index) {
-        DISPLAY_DEVICEW display{};
-        display.cb = sizeof(display);
-        if (!EnumDisplayDevicesW(nullptr, index, &display, 0)) break;
-        if ((display.StateFlags & DISPLAY_DEVICE_PRIMARY_DEVICE) != 0) {
-            wcsncpy_s(name, CCHDEVICENAME, display.DeviceName, _TRUNCATE);
-            return S_OK;
-        }
-    }
-    return DXGI_ERROR_NOT_FOUND;
-}
 
 static HRESULT input_desktop_is_normal(bool* normal) {
     HDESK desktop = OpenInputDesktop(0, FALSE, DESKTOP_READOBJECTS);
@@ -195,12 +186,13 @@ static HRESULT check_configuration(RustConsoleGpuBridge* bridge) {
 
 static HRESULT select_adapters(
     IDXGIFactory1* factory,
-    IDXGIAdapter1** intel,
+    const wchar_t* display_id,
+    uint64_t encoder_adapter_id,
+    IDXGIAdapter1** capture,
     IDXGIOutput6** output,
-    IDXGIAdapter1** nvidia) {
-    wchar_t primary[CCHDEVICENAME]{};
-    HRESULT result = primary_display_name(primary);
-    if (FAILED(result)) return result;
+    IDXGIAdapter1** processing) {
+    if (!display_id || !*display_id) return E_INVALIDARG;
+    HRESULT result;
 
     for (UINT adapter_index = 0;; ++adapter_index) {
         ComPtr<IDXGIAdapter1> adapter;
@@ -209,11 +201,11 @@ static HRESULT select_adapters(
         if (FAILED(result)) return result;
         DXGI_ADAPTER_DESC1 adapter_description{};
         if (FAILED(result = adapter->GetDesc1(&adapter_description))) return result;
-        if (adapter_description.VendorId == 0x10de && !*nvidia) {
-            *nvidia = adapter.Detach();
-            continue;
+        const uint64_t adapter_id = uint64_t(adapter_description.AdapterLuid.LowPart) |
+            (uint64_t(uint32_t(adapter_description.AdapterLuid.HighPart)) << 32);
+        if (adapter_id == encoder_adapter_id && !*processing) {
+            adapter.CopyTo(processing);
         }
-        if (adapter_description.VendorId != 0x8086) continue;
         for (UINT output_index = 0;; ++output_index) {
             ComPtr<IDXGIOutput> candidate;
             result = adapter->EnumOutputs(output_index, &candidate);
@@ -221,16 +213,20 @@ static HRESULT select_adapters(
             if (FAILED(result)) return result;
             DXGI_OUTPUT_DESC description{};
             if (FAILED(result = candidate->GetDesc(&description))) return result;
-            if (description.AttachedToDesktop && _wcsicmp(primary, description.DeviceName) == 0) {
+            DISPLAY_DEVICEW monitor{};
+            monitor.cb = sizeof(monitor);
+            if (description.AttachedToDesktop &&
+                EnumDisplayDevicesW(description.DeviceName, 0, &monitor, EDD_GET_DEVICE_INTERFACE_NAME) &&
+                _wcsicmp(display_id, monitor.DeviceID) == 0) {
                 ComPtr<IDXGIOutput6> output6;
                 if (FAILED(result = candidate.As(&output6))) return result;
-                *intel = adapter.Detach();
+                *capture = adapter.Detach();
                 *output = output6.Detach();
                 break;
             }
         }
     }
-    return *intel && *output && *nvidia ? S_OK : DXGI_ERROR_NOT_FOUND;
+    return *capture && *output && *processing ? S_OK : DXGI_ERROR_NOT_FOUND;
 }
 
 static HRESULT create_queue(ID3D12Device* device, ID3D12CommandQueue** queue) {
@@ -330,14 +326,14 @@ float4 pixel_main(VertexOutput input) : SV_Target {
     if (FAILED(result = D3DCompile(
                    source, sizeof(source), nullptr, selected_macros, nullptr, "pixel_main", "ps_5_0",
                    D3DCOMPILE_ENABLE_STRICTNESS, 0, &pixel_bytecode, &errors))) return result;
-    if (FAILED(result = bridge->nvidia_device11on12->CreateVertexShader(
+    if (FAILED(result = bridge->processing_device->CreateVertexShader(
                    vertex_bytecode->GetBufferPointer(), vertex_bytecode->GetBufferSize(), nullptr,
                    &bridge->vertex_shader))) return result;
-    if (FAILED(result = bridge->nvidia_device11on12->CreatePixelShader(
+    if (FAILED(result = bridge->processing_device->CreatePixelShader(
                    pixel_bytecode->GetBufferPointer(), pixel_bytecode->GetBufferSize(), nullptr,
                    &bridge->pixel_shader))) return result;
-    if (FAILED(result = bridge->nvidia_device11on12->CreateShaderResourceView(
-                   bridge->nvidia_local_source11.Get(), nullptr, &bridge->shader_input))) return result;
+    if (FAILED(result = bridge->processing_device->CreateShaderResourceView(
+                   bridge->processing_local_source11.Get(), nullptr, &bridge->shader_input))) return result;
     D3D11_TEXTURE2D_DESC output{};
     output.Width = bridge->width;
     output.Height = bridge->height;
@@ -349,21 +345,23 @@ float4 pixel_main(VertexOutput input) : SV_Target {
     output.SampleDesc.Count = 1;
     output.Usage = D3D11_USAGE_DEFAULT;
     output.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-    if (FAILED(result = bridge->nvidia_device11on12->CreateTexture2D(
-                   &output, nullptr, &bridge->nvidia_converted_rgb))) return result;
-    if (FAILED(result = bridge->nvidia_device11on12->CreateRenderTargetView(
-                   bridge->nvidia_converted_rgb.Get(), nullptr, &bridge->shader_output))) return result;
+    if (FAILED(result = bridge->processing_device->CreateTexture2D(
+                   &output, nullptr, &bridge->processing_converted_rgb))) return result;
+    if (FAILED(result = bridge->processing_device->CreateRenderTargetView(
+                   bridge->processing_converted_rgb.Get(), nullptr, &bridge->shader_output))) return result;
     D3D11_SAMPLER_DESC sampler{};
     sampler.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
     sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
     sampler.MaxLOD = D3D11_FLOAT32_MAX;
-    return bridge->nvidia_device11on12->CreateSamplerState(&sampler, &bridge->sampler);
+    return bridge->processing_device->CreateSamplerState(&sampler, &bridge->sampler);
 }
 
 static HRESULT initialize_bridge(
     RustConsoleGpuBridge* bridge,
     ID3D11Device** encoder_device,
     bool normal_desktop,
+    const wchar_t* display_id,
+    uint64_t encoder_adapter_id,
     uint32_t* width,
     uint32_t* height,
     uint32_t* refresh_rate,
@@ -378,15 +376,20 @@ static HRESULT initialize_bridge(
         bridge->ro_initialized = true;
     }
     ComPtr<IDXGIFactory1> factory;
-    ComPtr<IDXGIAdapter1> intel_adapter;
-    ComPtr<IDXGIAdapter1> nvidia_adapter;
+    ComPtr<IDXGIAdapter1> capture_adapter;
+    ComPtr<IDXGIAdapter1> processing_adapter;
     ComPtr<IDXGIOutput6> output;
     const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
     failure_stage = "create DXGI factory";
     if (FAILED(result = CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return result;
-    failure_stage = "select Intel display and NVIDIA encode adapters";
+    failure_stage = "select capture display and processing encode adapters";
     if (FAILED(result = select_adapters(
-                   factory.Get(), &intel_adapter, &output, &nvidia_adapter))) return result;
+                   factory.Get(), display_id, encoder_adapter_id, &capture_adapter, &output, &processing_adapter))) return result;
+    DXGI_ADAPTER_DESC1 capture_adapter_description{};
+    if (FAILED(result = capture_adapter->GetDesc1(&capture_adapter_description))) return result;
+    const uint64_t capture_adapter_id = uint64_t(capture_adapter_description.AdapterLuid.LowPart) |
+        (uint64_t(uint32_t(capture_adapter_description.AdapterLuid.HighPart)) << 32);
+    bridge->cross_adapter = capture_adapter_id != encoder_adapter_id;
     bridge->normal_desktop = normal_desktop;
     bridge->output = output;
     DXGI_OUTPUT_DESC1 output_description{};
@@ -406,32 +409,41 @@ static HRESULT initialize_bridge(
     bridge->video_format = bridge->video_color == VIDEO_COLOR_BT2020_PQ
         ? VIDEO_FORMAT_P010
         : VIDEO_FORMAT_NV12;
-    failure_stage = "create D3D12 and D3D11On12 devices";
-    if (FAILED(result = D3D12CreateDevice(
-                   intel_adapter.Get(), D3D_FEATURE_LEVEL_11_0,
-                   IID_PPV_ARGS(&bridge->intel_device12)))) return result;
-    if (FAILED(result = D3D12CreateDevice(
-                   nvidia_adapter.Get(), D3D_FEATURE_LEVEL_11_0,
-                   IID_PPV_ARGS(&bridge->nvidia_device12)))) return result;
-    if (FAILED(result = create_queue(bridge->nvidia_device12.Get(), &bridge->nvidia_queue))) return result;
-    if (FAILED(result = create_11on12(
-                   bridge->nvidia_device12.Get(), bridge->nvidia_queue.Get(),
-                   &bridge->nvidia_device11on12, &bridge->nvidia_context11on12))) return result;
-    if (FAILED(result = bridge->nvidia_device11on12.As(&bridge->nvidia_interop))) return result;
-    if (FAILED(result = bridge->nvidia_device11on12.As(&bridge->nvidia_video_device))) return result;
-    if (FAILED(result = bridge->nvidia_context11on12.As(&bridge->nvidia_video_context))) return result;
-
-    failure_stage = "create native Intel D3D11 capture device";
+    failure_stage = "create native D3D11 capture device";
     if (FAILED(result = D3D11CreateDevice(
-                   intel_adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
+                   capture_adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
                    D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
                    levels, ARRAYSIZE(levels),
-                   D3D11_SDK_VERSION, &bridge->intel_capture_device, nullptr,
-                   &bridge->intel_capture_context))) return result;
+                   D3D11_SDK_VERSION, &bridge->capture_device, nullptr,
+                   &bridge->capture_context))) return result;
+    if (bridge->cross_adapter) {
+        failure_stage = "create D3D12 and D3D11On12 devices";
+        if (FAILED(result = D3D12CreateDevice(capture_adapter.Get(), D3D_FEATURE_LEVEL_11_0,
+                                              IID_PPV_ARGS(&bridge->capture_device12))))
+            return result;
+        if (FAILED(result = D3D12CreateDevice(processing_adapter.Get(), D3D_FEATURE_LEVEL_11_0,
+                                              IID_PPV_ARGS(&bridge->processing_device12))))
+            return result;
+        if (FAILED(result = create_queue(bridge->processing_device12.Get(), &bridge->processing_queue)))
+            return result;
+        if (FAILED(result = create_11on12(bridge->processing_device12.Get(), bridge->processing_queue.Get(),
+                                          &bridge->processing_device, &bridge->processing_context)))
+            return result;
+        if (FAILED(result = bridge->processing_device.As(&bridge->processing_interop)))
+            return result;
+    } else {
+        bridge->processing_device = bridge->capture_device;
+        bridge->processing_context = bridge->capture_context;
+    }
+    if (FAILED(result = bridge->processing_device.As(&bridge->processing_video_device)))
+        return result;
+    if (FAILED(result = bridge->processing_context.As(&bridge->processing_video_context)))
+        return result;
+
     if (normal_desktop) {
         ComPtr<IDXGIDevice> dxgi_device;
-        failure_stage = "query the Intel capture DXGI device";
-        if (FAILED(result = bridge->intel_capture_device.As(&dxgi_device))) return result;
+        failure_stage = "query the capture capture DXGI device";
+        if (FAILED(result = bridge->capture_device.As(&dxgi_device))) return result;
         winrt::com_ptr<IInspectable> inspectable_device;
         failure_stage = "create the Windows Runtime Direct3D capture device";
         if (FAILED(result = CreateDirect3D11DeviceFromDXGIDevice(
@@ -460,80 +472,95 @@ static HRESULT initialize_bridge(
         ComPtr<IDXGIOutput1> output1;
         if (FAILED(result = output.As(&output1))) return result;
         if (FAILED(result = output1->DuplicateOutput(
-                       bridge->intel_capture_device.Get(), &bridge->duplication))) return result;
+                       bridge->capture_device.Get(), &bridge->duplication))) return result;
     }
 
     const DXGI_FORMAT source_format = normal_desktop
         ? DXGI_FORMAT_R16G16B16A16_FLOAT
         : DXGI_FORMAT_B8G8R8A8_UNORM;
 
-    D3D12_HEAP_PROPERTIES heap_properties{};
-    heap_properties.Type = D3D12_HEAP_TYPE_DEFAULT;
-    heap_properties.CreationNodeMask = 1;
-    heap_properties.VisibleNodeMask = 1;
-    auto cross_description = texture_description(
-        bridge->width,
-        bridge->height,
-        source_format,
-        D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-        D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER |
-            D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS);
-    failure_stage = "create and share cross-adapter capture resource";
-    if (FAILED(result = bridge->intel_device12->CreateCommittedResource(
-                   &heap_properties,
-                   D3D12_HEAP_FLAG_SHARED | D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER,
-                   &cross_description,
-                   D3D12_RESOURCE_STATE_COMMON,
-                   nullptr,
-                   IID_PPV_ARGS(&bridge->intel_cross_resource)))) return result;
-    if (FAILED(result = bridge->intel_device12->CreateSharedHandle(
-                   bridge->intel_cross_resource.Get(), nullptr, GENERIC_ALL,
-                   nullptr, &bridge->cross_handle))) return result;
-    if (FAILED(result = bridge->nvidia_device12->OpenSharedHandle(
-                   bridge->cross_handle, IID_PPV_ARGS(&bridge->nvidia_cross_resource)))) return result;
-    ComPtr<ID3D11Device1> intel_capture_device1;
-    failure_stage = "open D3D12 cross-adapter capture resource on native Intel D3D11";
-    if (FAILED(result = bridge->intel_capture_device.As(&intel_capture_device1))) return result;
-    if (FAILED(result = intel_capture_device1->OpenSharedResource1(
-                   bridge->cross_handle, IID_PPV_ARGS(&bridge->intel_cross_resource11)))) return result;
+    if (bridge->cross_adapter) {
+        D3D12_HEAP_PROPERTIES heap_properties{};
+        heap_properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+        heap_properties.CreationNodeMask = 1;
+        heap_properties.VisibleNodeMask = 1;
+        auto cross_description = texture_description(
+            bridge->width, bridge->height, source_format, D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER | D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS);
+        failure_stage = "create and share cross-adapter capture resource";
+        if (FAILED(result = bridge->capture_device12->CreateCommittedResource(
+                       &heap_properties, D3D12_HEAP_FLAG_SHARED | D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER,
+                       &cross_description, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                       IID_PPV_ARGS(&bridge->capture_cross_resource))))
+            return result;
+        if (FAILED(result = bridge->capture_device12->CreateSharedHandle(bridge->capture_cross_resource.Get(), nullptr,
+                                                                         GENERIC_ALL, nullptr, &bridge->cross_handle)))
+            return result;
+        if (FAILED(result = bridge->processing_device12->OpenSharedHandle(
+                       bridge->cross_handle, IID_PPV_ARGS(&bridge->processing_cross_resource))))
+            return result;
+        ComPtr<ID3D11Device1> capture_device1;
+        failure_stage = "open D3D12 cross-adapter capture resource on native capture D3D11";
+        if (FAILED(result = bridge->capture_device.As(&capture_device1)))
+            return result;
+        if (FAILED(result = capture_device1->OpenSharedResource1(bridge->cross_handle,
+                                                                 IID_PPV_ARGS(&bridge->capture_cross_resource11))))
+            return result;
 
-    failure_stage = "create and share cross-adapter fence";
-    if (FAILED(result = bridge->intel_device12->CreateFence(
-                   0, D3D12_FENCE_FLAG_SHARED | D3D12_FENCE_FLAG_SHARED_CROSS_ADAPTER,
-                   IID_PPV_ARGS(&bridge->intel_cross_fence)))) return result;
-    if (FAILED(result = bridge->intel_device12->CreateSharedHandle(
-                   bridge->intel_cross_fence.Get(), nullptr, GENERIC_ALL,
-                   nullptr, &bridge->cross_fence_handle))) return result;
-    if (FAILED(result = bridge->nvidia_device12->OpenSharedHandle(
-                   bridge->cross_fence_handle, IID_PPV_ARGS(&bridge->nvidia_cross_fence)))) return result;
-    ComPtr<ID3D11Device5> intel_capture_device5;
-    failure_stage = "open D3D12 cross-adapter fence on native Intel D3D11";
-    if (FAILED(result = bridge->intel_capture_device.As(&intel_capture_device5))) return result;
-    if (FAILED(result = bridge->intel_capture_context.As(&bridge->intel_capture_context4))) return result;
-    if (FAILED(result = intel_capture_device5->OpenSharedFence(
-                   bridge->cross_fence_handle, IID_PPV_ARGS(&bridge->intel_cross_fence11)))) return result;
+        failure_stage = "create and share cross-adapter fence";
+        if (FAILED(result = bridge->capture_device12->CreateFence(
+                       0, D3D12_FENCE_FLAG_SHARED | D3D12_FENCE_FLAG_SHARED_CROSS_ADAPTER,
+                       IID_PPV_ARGS(&bridge->capture_cross_fence))))
+            return result;
+        if (FAILED(result = bridge->capture_device12->CreateSharedHandle(
+                       bridge->capture_cross_fence.Get(), nullptr, GENERIC_ALL, nullptr, &bridge->cross_fence_handle)))
+            return result;
+        if (FAILED(result = bridge->processing_device12->OpenSharedHandle(
+                       bridge->cross_fence_handle, IID_PPV_ARGS(&bridge->processing_cross_fence))))
+            return result;
+        ComPtr<ID3D11Device5> capture_device5;
+        failure_stage = "open D3D12 cross-adapter fence on native capture D3D11";
+        if (FAILED(result = bridge->capture_device.As(&capture_device5)))
+            return result;
+        if (FAILED(result = bridge->capture_context.As(&bridge->capture_context4)))
+            return result;
+        if (FAILED(result = capture_device5->OpenSharedFence(bridge->cross_fence_handle,
+                                                             IID_PPV_ARGS(&bridge->capture_cross_fence11))))
+            return result;
 
-    auto local_description = texture_description(
-        bridge->width,
-        bridge->height,
-        source_format,
-        D3D12_TEXTURE_LAYOUT_UNKNOWN,
-        D3D12_RESOURCE_FLAG_NONE);
-    failure_stage = "create and wrap NVIDIA-local capture resource";
-    if (FAILED(result = bridge->nvidia_device12->CreateCommittedResource(
-                   &heap_properties, D3D12_HEAP_FLAG_NONE, &local_description,
-                   D3D12_RESOURCE_STATE_COMMON, nullptr,
-                   IID_PPV_ARGS(&bridge->nvidia_local_source12)))) return result;
-    D3D11_RESOURCE_FLAGS no_bind_flags{};
-    if (normal_desktop) no_bind_flags.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-    if (FAILED(result = bridge->nvidia_interop->CreateWrappedResource(
-                   bridge->nvidia_local_source12.Get(), &no_bind_flags,
-                   D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COMMON,
-                   IID_PPV_ARGS(&bridge->nvidia_local_source11)))) return result;
+        auto local_description = texture_description(bridge->width, bridge->height, source_format,
+                                                     D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_NONE);
+        failure_stage = "create and wrap processing-local capture resource";
+        if (FAILED(result = bridge->processing_device12->CreateCommittedResource(
+                       &heap_properties, D3D12_HEAP_FLAG_NONE, &local_description, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                       IID_PPV_ARGS(&bridge->processing_local_source12))))
+            return result;
+        D3D11_RESOURCE_FLAGS no_bind_flags{};
+        if (normal_desktop)
+            no_bind_flags.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        if (FAILED(result = bridge->processing_interop->CreateWrappedResource(
+                       bridge->processing_local_source12.Get(), &no_bind_flags, D3D12_RESOURCE_STATE_COMMON,
+                       D3D12_RESOURCE_STATE_COMMON, IID_PPV_ARGS(&bridge->processing_local_source11))))
+            return result;
+    } else {
+        failure_stage = "create same-adapter capture texture";
+        D3D11_TEXTURE2D_DESC source{};
+        source.Width = bridge->width;
+        source.Height = bridge->height;
+        source.MipLevels = 1;
+        source.ArraySize = 1;
+        source.Format = source_format;
+        source.SampleDesc.Count = 1;
+        source.Usage = D3D11_USAGE_DEFAULT;
+        source.BindFlags = normal_desktop ? D3D11_BIND_SHADER_RESOURCE : 0;
+        if (FAILED(result =
+                       bridge->capture_device->CreateTexture2D(&source, nullptr, &bridge->processing_local_source11)))
+            return result;
+    }
 
-    failure_stage = "create native NVIDIA D3D11 device";
+    failure_stage = "create native processing D3D11 device";
     if (FAILED(result = D3D11CreateDevice(
-                   nvidia_adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
+                   processing_adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
                    D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
                    levels, ARRAYSIZE(levels), D3D11_SDK_VERSION,
                    &bridge->encoder_device, nullptr, &bridge->encoder_context))) return result;
@@ -550,26 +577,26 @@ static HRESULT initialize_bridge(
     encoder_description.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
     encoder_description.MiscFlags =
         D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
-    failure_stage = "create native NVIDIA shared keyed-mutex encoder texture";
+    failure_stage = "create native processing shared keyed-mutex encoder texture";
     if (FAILED(result = bridge->encoder_device->CreateTexture2D(
                    &encoder_description, nullptr, &bridge->encoder_texture))) return result;
     ComPtr<IDXGIResource1> encoder_resource;
-    failure_stage = "query native NVIDIA encoder IDXGIResource1";
+    failure_stage = "query native processing encoder IDXGIResource1";
     if (FAILED(result = bridge->encoder_texture.As(&encoder_resource))) return result;
-    failure_stage = "create native NVIDIA encoder shared handle";
+    failure_stage = "create native processing encoder shared handle";
     if (FAILED(result = encoder_resource->CreateSharedHandle(
                    nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
                    nullptr, &bridge->output_handle))) return result;
-    ComPtr<ID3D11Device1> nvidia_device1;
-    failure_stage = "query NVIDIA D3D11On12 ID3D11Device1";
-    if (FAILED(result = bridge->nvidia_device11on12.As(&nvidia_device1))) return result;
-    failure_stage = "open native NVIDIA encoder texture on D3D11On12";
-    if (FAILED(result = nvidia_device1->OpenSharedResource1(
-                   bridge->output_handle, IID_PPV_ARGS(&bridge->nvidia11on12_output)))) return result;
-    failure_stage = "query native NVIDIA encoder keyed mutex";
+    ComPtr<ID3D11Device1> processing_device1;
+    failure_stage = "query processing D3D11On12 ID3D11Device1";
+    if (FAILED(result = bridge->processing_device.As(&processing_device1))) return result;
+    failure_stage = "open native processing encoder texture on D3D11On12";
+    if (FAILED(result = processing_device1->OpenSharedResource1(
+                   bridge->output_handle, IID_PPV_ARGS(&bridge->processing_output)))) return result;
+    failure_stage = "query native processing encoder keyed mutex";
     if (FAILED(result = bridge->encoder_texture.As(&bridge->encoder_mutex))) return result;
     failure_stage = "query D3D11On12 encoder keyed mutex";
-    if (FAILED(result = bridge->nvidia11on12_output.As(&bridge->nvidia11on12_mutex))) return result;
+    if (FAILED(result = bridge->processing_output.As(&bridge->processing_mutex))) return result;
 
     if (normal_desktop) {
         failure_stage = "create scRGB conversion shader resources";
@@ -585,10 +612,10 @@ static HRESULT initialize_bridge(
     content.OutputWidth = bridge->width;
     content.OutputHeight = bridge->height;
     content.Usage = D3D11_VIDEO_USAGE_PLAYBACK_NORMAL;
-    failure_stage = "create NVIDIA video processor and views";
-    if (FAILED(result = bridge->nvidia_video_device->CreateVideoProcessorEnumerator(
+    failure_stage = "create processing video processor and views";
+    if (FAILED(result = bridge->processing_video_device->CreateVideoProcessorEnumerator(
                    &content, &bridge->video_enumerator))) return result;
-    if (FAILED(result = bridge->nvidia_video_device->CreateVideoProcessor(
+    if (FAILED(result = bridge->processing_video_device->CreateVideoProcessor(
                    bridge->video_enumerator.Get(), 0, &bridge->video_processor))) return result;
     const RECT destination = {
         0,
@@ -596,10 +623,10 @@ static HRESULT initialize_bridge(
         static_cast<LONG>(bridge->width),
         static_cast<LONG>(bridge->height),
     };
-    bridge->nvidia_video_context->VideoProcessorSetStreamDestRect(
+    bridge->processing_video_context->VideoProcessorSetStreamDestRect(
         bridge->video_processor.Get(), 0, TRUE, &destination);
     ComPtr<ID3D11VideoContext1> video_context1;
-    if (FAILED(result = bridge->nvidia_video_context.As(&video_context1))) return result;
+    if (FAILED(result = bridge->processing_video_context.As(&video_context1))) return result;
     if (bridge->video_color == VIDEO_COLOR_BT2020_PQ) {
         video_context1->VideoProcessorSetStreamColorSpace1(
             bridge->video_processor.Get(), 0, DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020);
@@ -613,27 +640,34 @@ static HRESULT initialize_bridge(
     }
     D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC input_description{};
     input_description.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
-    if (FAILED(result = bridge->nvidia_video_device->CreateVideoProcessorInputView(
-                   (normal_desktop ? bridge->nvidia_converted_rgb : bridge->nvidia_local_source11).Get(),
+    if (FAILED(result = bridge->processing_video_device->CreateVideoProcessorInputView(
+                   (normal_desktop ? bridge->processing_converted_rgb : bridge->processing_local_source11).Get(),
                    bridge->video_enumerator.Get(),
                    &input_description, &bridge->video_input))) return result;
     D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC output_view_description{};
     output_view_description.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
-    if (FAILED(result = bridge->nvidia_video_device->CreateVideoProcessorOutputView(
-                   bridge->nvidia11on12_output.Get(), bridge->video_enumerator.Get(),
+    if (FAILED(result = bridge->processing_video_device->CreateVideoProcessorOutputView(
+                   bridge->processing_output.Get(), bridge->video_enumerator.Get(),
                    &output_view_description, &bridge->video_output))) return result;
 
-    failure_stage = "create cross-adapter command infrastructure";
-    if (FAILED(result = bridge->nvidia_device12->CreateCommandAllocator(
-                   D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&bridge->nvidia_allocator)))) return result;
-    if (FAILED(result = bridge->nvidia_device12->CreateCommandList(
-                   0, D3D12_COMMAND_LIST_TYPE_DIRECT, bridge->nvidia_allocator.Get(), nullptr,
-                   IID_PPV_ARGS(&bridge->nvidia_commands)))) return result;
-    if (FAILED(result = bridge->nvidia_commands->Close())) return result;
-    if (FAILED(result = bridge->nvidia_device12->CreateFence(
-                   0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&bridge->nvidia_copy_fence)))) return result;
-    bridge->fence_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    if (!bridge->fence_event) return HRESULT_FROM_WIN32(GetLastError());
+    if (bridge->cross_adapter) {
+        failure_stage = "create cross-adapter command infrastructure";
+        if (FAILED(result = bridge->processing_device12->CreateCommandAllocator(
+                       D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&bridge->processing_allocator))))
+            return result;
+        if (FAILED(result = bridge->processing_device12->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                                           bridge->processing_allocator.Get(), nullptr,
+                                                                           IID_PPV_ARGS(&bridge->processing_commands))))
+            return result;
+        if (FAILED(result = bridge->processing_commands->Close()))
+            return result;
+        if (FAILED(result = bridge->processing_device12->CreateFence(0, D3D12_FENCE_FLAG_NONE,
+                                                                     IID_PPV_ARGS(&bridge->processing_copy_fence))))
+            return result;
+        bridge->fence_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (!bridge->fence_event)
+            return HRESULT_FROM_WIN32(GetLastError());
+    }
 
     if (normal_desktop) {
         failure_stage = "start the Windows.Graphics.Capture session";
@@ -665,8 +699,8 @@ static D3D12_RESOURCE_BARRIER transition(
 }
 
 static HRESULT wait_for_fence(RustConsoleGpuBridge* bridge, uint64_t value) {
-    if (bridge->nvidia_copy_fence->GetCompletedValue() >= value) return S_OK;
-    HRESULT result = bridge->nvidia_copy_fence->SetEventOnCompletion(value, bridge->fence_event);
+    if (bridge->processing_copy_fence->GetCompletedValue() >= value) return S_OK;
+    HRESULT result = bridge->processing_copy_fence->SetEventOnCompletion(value, bridge->fence_event);
     if (FAILED(result)) return result;
     const DWORD wait = WaitForSingleObject(bridge->fence_event, 5000);
     return wait == WAIT_OBJECT_0 ? S_OK : HRESULT_FROM_WIN32(wait == WAIT_TIMEOUT ? ERROR_TIMEOUT : GetLastError());
@@ -746,87 +780,104 @@ static HRESULT capture_frame(
             timeout_millis, &frame_info, &desktop_resource);
         if (FAILED(result)) return result;
         frame_acquired = true;
-        failure_stage = "query Intel Desktop Duplication texture";
+        failure_stage = "query capture Desktop Duplication texture";
         result = desktop_resource.As(&source_texture);
     }
     if (SUCCEEDED(result)) {
         if (diagnostics) *capture_acquisition_micros = std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now() - acquisition_started).count();
         if (diagnostics) copy_started = std::chrono::steady_clock::now();
-        failure_stage = "copy native Intel frame into D3D12 cross-adapter resource";
-        bridge->intel_capture_context->CopyResource(
-            bridge->intel_cross_resource11.Get(), source_texture.Get());
-        result = bridge->intel_capture_context4->Signal(
-            bridge->intel_cross_fence11.Get(), ++bridge->fence_value);
+        if (bridge->cross_adapter) {
+            failure_stage = "copy native capture frame into D3D12 cross-adapter resource";
+            bridge->capture_context->CopyResource(bridge->capture_cross_resource11.Get(), source_texture.Get());
+            result = bridge->capture_context4->Signal(bridge->capture_cross_fence11.Get(), ++bridge->fence_value);
+        } else {
+            failure_stage = "copy same-adapter capture frame";
+            bridge->capture_context->CopyResource(bridge->processing_local_source11.Get(), source_texture.Get());
+        }
     }
     const uint64_t value = bridge->fence_value;
     if (frame_acquired) {
         const HRESULT released = bridge->duplication->ReleaseFrame();
-        if (SUCCEEDED(result)) result = released;
+        if (SUCCEEDED(result))
+            result = released;
     }
-    if (FAILED(result)) return result;
+    if (FAILED(result))
+        return result;
 
-    failure_stage = "copy cross-adapter frame into NVIDIA-local texture";
-    if (FAILED(result = bridge->nvidia_queue->Wait(bridge->nvidia_cross_fence.Get(), value))) return result;
-    if (FAILED(result = bridge->nvidia_allocator->Reset())) return result;
-    if (FAILED(result = bridge->nvidia_commands->Reset(bridge->nvidia_allocator.Get(), nullptr))) return result;
-    D3D12_RESOURCE_BARRIER nvidia_barriers[] = {
-        transition(bridge->nvidia_cross_resource.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE),
-        transition(bridge->nvidia_local_source12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST),
-    };
-    bridge->nvidia_commands->ResourceBarrier(ARRAYSIZE(nvidia_barriers), nvidia_barriers);
-    bridge->nvidia_commands->CopyResource(
-        bridge->nvidia_local_source12.Get(), bridge->nvidia_cross_resource.Get());
-    nvidia_barriers[0] = transition(
-        bridge->nvidia_cross_resource.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
-    nvidia_barriers[1] = transition(
-        bridge->nvidia_local_source12.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
-    bridge->nvidia_commands->ResourceBarrier(ARRAYSIZE(nvidia_barriers), nvidia_barriers);
-    if (FAILED(result = bridge->nvidia_commands->Close())) return result;
-    ID3D12CommandList* nvidia_lists[] = {bridge->nvidia_commands.Get()};
-    bridge->nvidia_queue->ExecuteCommandLists(ARRAYSIZE(nvidia_lists), nvidia_lists);
-    if (FAILED(result = bridge->nvidia_queue->Signal(bridge->nvidia_copy_fence.Get(), value))) return result;
-    if (FAILED(result = wait_for_fence(bridge, value))) return result;
-    if (diagnostics) *cross_adapter_copy_micros = std::chrono::duration_cast<std::chrono::microseconds>(
-        std::chrono::steady_clock::now() - copy_started).count();
+    if (bridge->cross_adapter) {
+        failure_stage = "copy cross-adapter frame into processing-local texture";
+        if (FAILED(result = bridge->processing_queue->Wait(bridge->processing_cross_fence.Get(), value)))
+            return result;
+        if (FAILED(result = bridge->processing_allocator->Reset()))
+            return result;
+        if (FAILED(result = bridge->processing_commands->Reset(bridge->processing_allocator.Get(), nullptr)))
+            return result;
+        D3D12_RESOURCE_BARRIER processing_barriers[] = {
+            transition(bridge->processing_cross_resource.Get(), D3D12_RESOURCE_STATE_COMMON,
+                       D3D12_RESOURCE_STATE_COPY_SOURCE),
+            transition(bridge->processing_local_source12.Get(), D3D12_RESOURCE_STATE_COMMON,
+                       D3D12_RESOURCE_STATE_COPY_DEST),
+        };
+        bridge->processing_commands->ResourceBarrier(ARRAYSIZE(processing_barriers), processing_barriers);
+        bridge->processing_commands->CopyResource(bridge->processing_local_source12.Get(),
+                                                  bridge->processing_cross_resource.Get());
+        processing_barriers[0] = transition(bridge->processing_cross_resource.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                            D3D12_RESOURCE_STATE_COMMON);
+        processing_barriers[1] = transition(bridge->processing_local_source12.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+                                            D3D12_RESOURCE_STATE_COMMON);
+        bridge->processing_commands->ResourceBarrier(ARRAYSIZE(processing_barriers), processing_barriers);
+        if (FAILED(result = bridge->processing_commands->Close()))
+            return result;
+        ID3D12CommandList *processing_lists[] = {bridge->processing_commands.Get()};
+        bridge->processing_queue->ExecuteCommandLists(ARRAYSIZE(processing_lists), processing_lists);
+        if (FAILED(result = bridge->processing_queue->Signal(bridge->processing_copy_fence.Get(), value)))
+            return result;
+        if (FAILED(result = wait_for_fence(bridge, value)))
+            return result;
+    }
+    if (diagnostics)
+        *cross_adapter_copy_micros =
+            std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - copy_started)
+                .count();
 
-    const auto conversion_started = diagnostics ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    failure_stage = "convert NVIDIA-local capture texture to encoder format";
-    if (FAILED(result = keyed_mutex_result(bridge->nvidia11on12_mutex->AcquireSync(0, 5000)))) return result;
-    ID3D11Resource* wrapped[] = {bridge->nvidia_local_source11.Get()};
-    bridge->nvidia_interop->AcquireWrappedResources(wrapped, ARRAYSIZE(wrapped));
+    const auto conversion_started =
+        diagnostics ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    failure_stage = "convert processing-local capture texture to encoder format";
+    if (FAILED(result = keyed_mutex_result(bridge->processing_mutex->AcquireSync(0, 5000))))
+        return result;
+    ID3D11Resource *wrapped[] = {bridge->processing_local_source11.Get()};
+    if (bridge->cross_adapter)
+        bridge->processing_interop->AcquireWrappedResources(wrapped, ARRAYSIZE(wrapped));
     if (bridge->normal_desktop) {
-        const D3D11_VIEWPORT viewport{
-            0.0f, 0.0f, static_cast<float>(bridge->width),
-            static_cast<float>(bridge->height), 0.0f, 1.0f};
-        bridge->nvidia_context11on12->RSSetViewports(1, &viewport);
-        bridge->nvidia_context11on12->OMSetRenderTargets(
-            1, bridge->shader_output.GetAddressOf(), nullptr);
-        bridge->nvidia_context11on12->IASetPrimitiveTopology(
-            D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        bridge->nvidia_context11on12->VSSetShader(bridge->vertex_shader.Get(), nullptr, 0);
-        bridge->nvidia_context11on12->PSSetShader(bridge->pixel_shader.Get(), nullptr, 0);
-        bridge->nvidia_context11on12->PSSetShaderResources(
-            0, 1, bridge->shader_input.GetAddressOf());
-        bridge->nvidia_context11on12->PSSetSamplers(0, 1, bridge->sampler.GetAddressOf());
-        bridge->nvidia_context11on12->Draw(3, 0);
-        ID3D11ShaderResourceView* null_view = nullptr;
-        bridge->nvidia_context11on12->PSSetShaderResources(0, 1, &null_view);
+        const D3D11_VIEWPORT viewport{0.0f, 0.0f, static_cast<float>(bridge->width), static_cast<float>(bridge->height),
+                                      0.0f, 1.0f};
+        bridge->processing_context->RSSetViewports(1, &viewport);
+        bridge->processing_context->OMSetRenderTargets(1, bridge->shader_output.GetAddressOf(), nullptr);
+        bridge->processing_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        bridge->processing_context->VSSetShader(bridge->vertex_shader.Get(), nullptr, 0);
+        bridge->processing_context->PSSetShader(bridge->pixel_shader.Get(), nullptr, 0);
+        bridge->processing_context->PSSetShaderResources(0, 1, bridge->shader_input.GetAddressOf());
+        bridge->processing_context->PSSetSamplers(0, 1, bridge->sampler.GetAddressOf());
+        bridge->processing_context->Draw(3, 0);
+        ID3D11ShaderResourceView *null_view = nullptr;
+        bridge->processing_context->PSSetShaderResources(0, 1, &null_view);
     }
     D3D11_VIDEO_PROCESSOR_STREAM stream{};
     stream.Enable = TRUE;
     stream.pInputSurface = bridge->video_input.Get();
-    result = bridge->nvidia_video_context->VideoProcessorBlt(
-        bridge->video_processor.Get(), bridge->video_output.Get(), 0, 1, &stream);
-    bridge->nvidia_interop->ReleaseWrappedResources(wrapped, ARRAYSIZE(wrapped));
-    bridge->nvidia_context11on12->Flush();
-    const HRESULT released_nv12 = bridge->nvidia11on12_mutex->ReleaseSync(1);
+    result = bridge->processing_video_context->VideoProcessorBlt(bridge->video_processor.Get(),
+                                                                 bridge->video_output.Get(), 0, 1, &stream);
+    if (bridge->cross_adapter)
+        bridge->processing_interop->ReleaseWrappedResources(wrapped, ARRAYSIZE(wrapped));
+    bridge->processing_context->Flush();
+    const HRESULT released_nv12 = bridge->processing_mutex->ReleaseSync(1);
     if (SUCCEEDED(result)) result = released_nv12;
     if (FAILED(result)) return result;
     if (diagnostics) *color_conversion_micros = std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::steady_clock::now() - conversion_started).count();
     if (!external_consumer) {
-        failure_stage = "acquire native NVIDIA encoder texture";
+        failure_stage = "acquire native processing encoder texture";
         if (FAILED(result = keyed_mutex_result(bridge->encoder_mutex->AcquireSync(1, 5000)))) return result;
         bridge->encoder_texture_outstanding = true;
         bridge->encoder_texture.CopyTo(encoder_texture);
@@ -842,6 +893,8 @@ extern "C" HRESULT rustconsole_gpu_bridge_create(
     RustConsoleGpuBridge** bridge,
     ID3D11Device** encoder_device,
     int32_t normal_desktop,
+    const wchar_t* display_id,
+    uint64_t encoder_adapter_id,
     uint32_t* width,
     uint32_t* height,
     uint32_t* refresh_rate,
@@ -857,7 +910,7 @@ extern "C" HRESULT rustconsole_gpu_bridge_create(
     HRESULT result;
     try {
         result = initialize_bridge(
-            value, encoder_device, normal_desktop != 0, width, height, refresh_rate,
+            value, encoder_device, normal_desktop != 0, display_id, encoder_adapter_id, width, height, refresh_rate,
             capture_engine, video_format, video_color);
     } catch (...) {
         result = winrt::to_hresult();
@@ -923,6 +976,7 @@ extern "C" HRESULT rustconsole_gpu_bridge_open_external(
     RustConsoleGpuBridge** bridge,
     ID3D11Device** encoder_device,
     HANDLE shared_texture,
+    uint64_t encoder_adapter_id,
     uint32_t width,
     uint32_t height,
     uint32_t refresh_rate,
@@ -940,19 +994,26 @@ extern "C" HRESULT rustconsole_gpu_bridge_open_external(
     HRESULT result = E_FAIL;
     do {
         ComPtr<IDXGIFactory1> factory;
-        ComPtr<IDXGIAdapter1> intel_adapter;
-        ComPtr<IDXGIAdapter1> nvidia_adapter;
-        ComPtr<IDXGIOutput6> output;
+        ComPtr<IDXGIAdapter1> processing_adapter;
         failure_stage = "create DXGI factory for external WGC texture";
         if (FAILED(result = CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) break;
-        failure_stage = "select NVIDIA adapter for external WGC texture";
-        if (FAILED(result = select_adapters(
-                       factory.Get(), &intel_adapter, &output, &nvidia_adapter))) break;
+        failure_stage = "select processing adapter for external WGC texture";
+        for (UINT index = 0;; ++index) {
+            ComPtr<IDXGIAdapter1> candidate;
+            result = factory->EnumAdapters1(index, &candidate);
+            if (FAILED(result)) break;
+            DXGI_ADAPTER_DESC1 description{};
+            if (FAILED(result = candidate->GetDesc1(&description))) break;
+            const uint64_t id = uint64_t(description.AdapterLuid.LowPart) |
+                (uint64_t(uint32_t(description.AdapterLuid.HighPart)) << 32);
+            if (id == encoder_adapter_id) { processing_adapter = candidate; break; }
+        }
+        if (FAILED(result) || !processing_adapter) break;
         const D3D_FEATURE_LEVEL levels[] = {
             D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
-        failure_stage = "create NVIDIA device for external WGC texture";
+        failure_stage = "create processing device for external WGC texture";
         if (FAILED(result = D3D11CreateDevice(
-                       nvidia_adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
+                       processing_adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
                        D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
                        levels, ARRAYSIZE(levels), D3D11_SDK_VERSION,
                        &value->encoder_device, nullptr, &value->encoder_context))) break;

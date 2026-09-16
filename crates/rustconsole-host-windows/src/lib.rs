@@ -14,9 +14,11 @@ mod clock;
 mod credentials;
 #[cfg(windows)]
 mod desktop;
+#[cfg(windows)]
+pub mod display;
 pub mod firewall;
 #[cfg(windows)]
-mod gpu_encode;
+pub mod gpu_encode;
 #[cfg(windows)]
 mod installation;
 #[cfg(windows)]
@@ -24,6 +26,7 @@ mod interactive_worker;
 pub mod service;
 #[cfg(windows)]
 mod session_controls;
+pub mod video_configuration;
 #[cfg(windows)]
 mod wgc_helper;
 #[cfg(windows)]

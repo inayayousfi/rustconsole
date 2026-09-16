@@ -318,6 +318,7 @@ fn start_stream_session(
         let statistics_tx = events.clone();
         let result = rustconsole_player_linux::stream_quic_video(
             rustconsole_player_linux::StreamConfiguration {
+                display: None,
                 address,
                 password,
                 remember_password,
@@ -1032,17 +1033,17 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
                                     (
                                         "video_cross_adapter_copy",
                                         sample.cross_adapter_copy_micros,
-                                        "Intel source copied into NVIDIA-local texture",
+                                        "captured image transferred to the processing adapter",
                                     ),
                                     (
                                         "video_color_conversion",
                                         sample.color_conversion_micros,
-                                        "NVIDIA-local source converted to encoder format",
+                                        "captured image converted to encoder format",
                                     ),
                                     (
                                         "video_encoder_call",
                                         sample.encoder_call_micros,
-                                        "NVENC texture submission returned",
+                                        "video encoder submission returned",
                                     ),
                                 ] {
                                     latency_diagnostics

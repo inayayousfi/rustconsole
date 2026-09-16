@@ -6,6 +6,8 @@ use rustconsole_codec_ffmpeg::{
 };
 use rustconsole_codec_ffmpeg::{HardwareDevice, HardwareDeviceType, library_version};
 #[cfg(windows)]
+use rustconsole_media::VideoEncoder;
+#[cfg(windows)]
 use windows::Win32::Foundation::HMODULE;
 #[cfg(windows)]
 use windows::Win32::Graphics::Direct3D::{
@@ -70,29 +72,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
         )?;
         let first_packet = (0..4)
-            .find_map(|timestamp| {
-                encoder
-                    .encode_d3d11_texture(&texture, timestamp)
-                    .transpose()
-            })
+            .find_map(|timestamp| encoder.encode(&texture, timestamp).transpose())
             .transpose()?
             .ok_or("AV1 NVENC returned no packet before reconfiguration")?;
-        encoder.set_bitrate(8_000_000)?;
+        VideoEncoder::set_bitrate(&mut encoder, 8_000_000)?;
         let second_packet = (4..8)
-            .find_map(|timestamp| {
-                encoder
-                    .encode_d3d11_texture(&texture, timestamp)
-                    .transpose()
-            })
+            .find_map(|timestamp| encoder.encode(&texture, timestamp).transpose())
             .transpose()?
             .ok_or("AV1 NVENC returned no packet after reconfiguration")?;
-        encoder.request_keyframe();
+        VideoEncoder::request_keyframe(&mut encoder)?;
         let recovery_packet = (8..12)
-            .find_map(|timestamp| {
-                encoder
-                    .encode_d3d11_texture(&texture, timestamp)
-                    .transpose()
-            })
+            .find_map(|timestamp| encoder.encode(&texture, timestamp).transpose())
             .transpose()?
             .ok_or("AV1 NVENC returned no recovery packet")?;
         if !recovery_packet.keyframe {
@@ -106,6 +96,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if recovered.is_none() {
             return Err("recovery packet did not decode independently".into());
         }
+        VideoEncoder::reset(&mut encoder)?;
+        let reset_packet = (12..16)
+            .find_map(|timestamp| encoder.encode(&texture, timestamp).transpose())
+            .transpose()?
+            .ok_or("reset encoder returned no packet")?;
+        if !reset_packet.keyframe {
+            return Err("reset encoder did not start with a keyframe".into());
+        }
         std::fs::write(
             std::env::temp_dir().join("rustconsole-av1-10bit.bin"),
             &first_packet.data,
@@ -118,8 +116,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("initial_bitrate_bits_per_second=20000000");
         println!("reconfigured_bitrate_bits_per_second=8000000");
         println!("vbv_frame_budgets=4");
-        println!("encoder_recreated=false");
+        println!("keyframe_request_recreated_encoder=false");
         println!("requested_keyframe_decoded_independently=true");
+        println!("encoder_interface_reset_verified=true");
     }
     println!("status=ok");
     Ok(())

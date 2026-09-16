@@ -4,6 +4,10 @@ pub use rustconsole_player_core::process_protocol::{LaunchRequest, PlayerEvent};
 use rustconsole_player_core::process_protocol::{
     read_event, write_launch, write_reconnect, write_stop,
 };
+pub use rustconsole_player_core::{
+    AdapterId, Display, DisplayId, DisplayInventory, DisplaySelection, GraphicsAdapter,
+    discover_displays_with,
+};
 pub use rustconsole_player_core::{HostAvailability, HostProbeResult, VbCableAvailability};
 use std::io::{BufReader, BufWriter};
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};

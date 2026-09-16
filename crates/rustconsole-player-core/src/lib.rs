@@ -1,18 +1,21 @@
 //! Platform-neutral player session orchestration.
 
 pub mod process_protocol;
+pub use rustconsole_protocol::display::{
+    AdapterId, Display, DisplayId, DisplayInventory, DisplaySelection, GraphicsAdapter,
+};
 mod stream_receiver;
 pub use stream_receiver::{AudioPlaybackEvent, AudioTransportSnapshot, StreamEnd};
 
 use rustconsole_media::{AudioSamples, VideoFormat, VideoFrame};
 use rustconsole_protocol::InputEvent;
 use rustconsole_protocol::wire::{
-    Av1CapabilityOffer, Av1HardwareCapability, Av1Mode, Av1ViewerSettings, ChromaSubsampling,
-    Envelope, SelectedAv1Configuration, SessionAvailabilityProbe, VideoBitDepth, envelope,
+    Av1Capability, Av1CapabilityOffer, Av1Mode, Av1ViewerSettings, ChromaSubsampling, Envelope,
+    SelectedAv1Configuration, SessionAvailabilityProbe, VideoBitDepth, envelope,
 };
 pub use rustconsole_protocol::wire::{HostFirewallStatus, HostOperatingSystem};
 use rustconsole_protocol::{
-    Av1HardwareCapability as DomainCapability, Av1ViewerSettings as DomainSettings,
+    Av1Capability as DomainCapability, Av1ViewerSettings as DomainSettings,
     ChromaSubsampling as DomainChroma, VideoBitDepth as DomainDepth, negotiate_av1_configuration,
 };
 pub use rustconsole_session::authentication::{HostIdentity, SessionIdentity};
@@ -426,6 +429,7 @@ pub struct StreamConsumers<Audio, Video> {
 }
 
 pub struct StreamHostParameters<PasswordFor, Authenticated, Progress, Stop, Audio, Video> {
+    pub display: Option<rustconsole_protocol::display::DisplayId>,
     pub address: SocketAddr,
     pub password_for: PasswordFor,
     pub on_authenticated: Authenticated,
@@ -464,6 +468,48 @@ pub fn authenticate_host_with(
         )
         .await?;
         Ok(authenticated.session_identity)
+    })
+}
+
+pub fn discover_displays_with(
+    address: SocketAddr,
+    password_for: impl FnOnce(HostIdentity) -> Option<Vec<u8>>,
+) -> Result<rustconsole_protocol::display::DisplayInventory, Box<dyn std::error::Error>> {
+    let runtime = tokio::runtime::Runtime::new()?;
+    runtime.block_on(async move {
+        tokio::time::timeout(Duration::from_secs(10), async move {
+            let endpoint = client_endpoint(address)?;
+            let authenticated = rustconsole_session::quic::connect_and_authenticate_with(
+                &endpoint,
+                address,
+                password_for,
+            )
+            .await?;
+            let (mut send, mut receive) = authenticated.connection.open_bi().await?;
+            rustconsole_session::quic::write_envelope(
+                &mut send,
+                Envelope {
+                    body: Some(envelope::Body::DisplayCatalogRequest(
+                        rustconsole_protocol::wire::DisplayCatalogRequest {},
+                    )),
+                },
+            )
+            .await?;
+            send.finish()?;
+            let response = rustconsole_session::quic::read_envelope(&mut receive).await?;
+            let Some(envelope::Body::DisplayCatalog(catalog)) = response.body else {
+                return Err(
+                    "host does not support display discovery or returned an invalid catalog".into(),
+                );
+            };
+            let inventory = rustconsole_protocol::display::DisplayInventory::try_from(catalog)?;
+            authenticated
+                .connection
+                .close(0_u32.into(), b"display discovery complete");
+            Ok(inventory)
+        })
+        .await
+        .map_err(|_| "display discovery timed out")?
     })
 }
 
@@ -554,6 +600,7 @@ where
     ) -> Result<bool, Box<dyn std::error::Error>>,
 {
     let StreamHostParameters {
+        display,
         address,
         password_for,
         on_authenticated,
@@ -602,6 +649,7 @@ where
                 &mut send,
                 Envelope {
                     body: Some(envelope::Body::Av1CapabilityOffer(Av1CapabilityOffer {
+                        display_id: display.as_ref().map(|id| id.as_str().to_owned()),
                         dedicated_input_stream: true,
                         host_pointer_release: true,
                         full_diagnostics,
@@ -631,6 +679,9 @@ where
             Some(envelope::Body::Av1CapabilityOffer(offer))
                 if offer.decoder_capabilities.is_empty() && offer.viewer_settings.is_none() =>
             {
+                if offer.display_id.as_deref() != display.as_ref().map(|id| id.as_str()) {
+                    return Err("host did not confirm the requested display".into());
+                }
                 host_pointer_release = offer.host_pointer_release;
                 dedicated_input_stream = offer.dedicated_input_stream;
                 audio_transport = offer
@@ -748,8 +799,8 @@ pub struct StreamTransportStatistics {
     pub assembled_payload_sha256: Option<[u8; 32]>,
 }
 
-fn wire_capability(capability: DomainCapability) -> Av1HardwareCapability {
-    Av1HardwareCapability {
+fn wire_capability(capability: DomainCapability) -> Av1Capability {
+    Av1Capability {
         chroma_subsampling: match capability.mode.chroma_subsampling {
             DomainChroma::Yuv420 => ChromaSubsampling::Yuv420 as i32,
             DomainChroma::Yuv422 => ChromaSubsampling::Yuv422 as i32,
@@ -766,7 +817,7 @@ fn wire_capability(capability: DomainCapability) -> Av1HardwareCapability {
 }
 
 fn domain_capability(
-    capability: &Av1HardwareCapability,
+    capability: &Av1Capability,
 ) -> Result<DomainCapability, Box<dyn std::error::Error>> {
     Ok(DomainCapability {
         mode: rustconsole_protocol::Av1Mode {
@@ -879,6 +930,83 @@ pub trait SecretStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn authenticated_display_discovery_preserves_source_and_adapter_identity() {
+        use rustconsole_session::authentication::OpaqueServerRecord;
+        use rustconsole_session::quic::{
+            AuthenticationRateLimiter, HostMetadata, authenticate_server, ephemeral_server_config,
+            read_envelope, write_envelope,
+        };
+        let server = quinn::Endpoint::server(
+            ephemeral_server_config().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .unwrap();
+        let address = server.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let connection = server.accept().await.unwrap().await.unwrap();
+            let record = OpaqueServerRecord::enroll(b"display-test".to_vec()).unwrap();
+            let limiter = std::sync::Mutex::new(AuthenticationRateLimiter::default());
+            let metadata = HostMetadata::new(
+                "display-host".into(),
+                rustconsole_protocol::wire::HostOperatingSystem::Windows,
+            )
+            .unwrap();
+            let authenticated = authenticate_server(connection, &record, &limiter, &metadata)
+                .await
+                .unwrap();
+            let (mut send, mut receive) = authenticated.connection.accept_bi().await.unwrap();
+            assert!(matches!(
+                read_envelope(&mut receive).await.unwrap().body,
+                Some(envelope::Body::DisplayCatalogRequest(_))
+            ));
+            let inventory = DisplayInventory::new(
+                vec![Display {
+                    id: DisplayId::new("panel".into()).unwrap(),
+                    name: "Panel".into(),
+                    adapter: AdapterId(7),
+                    width: 1920,
+                    height: 1080,
+                    refresh_rate: 60,
+                    primary: true,
+                }],
+                vec![GraphicsAdapter {
+                    id: AdapterId(7),
+                    name: "GPU".into(),
+                    vendor_id: 0,
+                    device_id: 0,
+                    software: false,
+                }],
+            )
+            .unwrap();
+            write_envelope(
+                &mut send,
+                Envelope {
+                    body: Some(envelope::Body::DisplayCatalog((&inventory).into())),
+                },
+            )
+            .await
+            .unwrap();
+            send.finish().unwrap();
+            authenticated.connection.closed().await;
+        });
+        let inventory = tokio::task::spawn_blocking(move || {
+            discover_displays_with(address, |_| Some(b"display-test".to_vec()))
+                .map_err(|error| error.to_string())
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        let panel = inventory
+            .resolve(&DisplaySelection::Id(
+                DisplayId::new("panel".into()).unwrap(),
+            ))
+            .unwrap();
+        assert_eq!(panel.adapter, AdapterId(7));
+        assert_eq!(panel.width, 1920);
+        task.await.unwrap();
+    }
 
     #[test]
     fn discovery_lanes_share_the_approved_global_limit() {

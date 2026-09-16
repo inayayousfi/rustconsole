@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
 
 const allowedDependencies = new Map([
-  ["rustconsole-codec-ffmpeg", []],
+  ["rustconsole-codec-ffmpeg", ["rustconsole-media"]],
   ["rustconsole-protocol", []],
   ["rustconsole-session", ["rustconsole-protocol"]],
   ["rustconsole-discovery", []],

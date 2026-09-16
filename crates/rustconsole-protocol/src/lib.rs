@@ -7,11 +7,12 @@ use std::num::NonZeroU16;
 pub mod audio;
 pub mod av1;
 pub mod diagnostics;
+pub mod display;
 pub mod input;
 pub mod wire;
 
 pub use av1::{
-    Av1HardwareCapability, Av1Mode, Av1NegotiationError, Av1ViewerSettings, ChromaSubsampling,
+    Av1Capability, Av1Mode, Av1NegotiationError, Av1ViewerSettings, ChromaSubsampling,
     NegotiatedAv1Configuration, VideoBitDepth, negotiate_av1_configuration,
 };
 
@@ -27,7 +28,7 @@ pub enum InputEvent {
 }
 
 /// The protocol version implemented by this build.
-pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(2, 0);
+pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(2, 1);
 
 /// A protocol version whose major number marks breaking changes.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
