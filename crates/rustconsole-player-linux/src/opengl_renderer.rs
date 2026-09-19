@@ -2,7 +2,7 @@ use glow::HasContext;
 use gtk::glib::{ControlFlow, Propagation};
 use gtk::prelude::*;
 use rustconsole_codec_ffmpeg::MappedDmaBufFrame;
-use std::collections::VecDeque;
+use rustconsole_player_core::LatestVideoQueue;
 use std::ffi::{CStr, c_char, c_void};
 use std::ptr;
 use std::rc::Rc;
@@ -39,16 +39,12 @@ unsafe extern "C" {
 
 #[derive(Clone)]
 pub struct NativeVideoSink {
-    queue: Arc<Mutex<VecDeque<MappedDmaBufFrame>>>,
+    queue: Arc<LatestVideoQueue<MappedDmaBufFrame>>,
 }
 
 impl NativeVideoSink {
     pub fn submit(&self, frame: MappedDmaBufFrame) {
-        let mut queue = self.queue.lock().unwrap();
-        while queue.len() >= 2 {
-            queue.pop_front();
-        }
-        queue.push_back(frame);
+        self.queue.push(frame);
     }
 }
 
@@ -83,7 +79,7 @@ impl NativeVideoSurface {
         widget.set_has_alpha(false);
         widget.set_hexpand(true);
         widget.set_vexpand(true);
-        let queue = Arc::new(Mutex::new(VecDeque::with_capacity(2)));
+        let queue = Arc::new(LatestVideoQueue::default());
         let result = Arc::new(Mutex::new(None));
         let renderer = Rc::new(std::cell::RefCell::new(None::<OpenGlRenderer>));
         let last_frame = Rc::new(std::cell::RefCell::new(None::<MappedDmaBufFrame>));
@@ -93,12 +89,7 @@ impl NativeVideoSurface {
         let render_state = Rc::clone(&renderer);
         let render_last_frame = Rc::clone(&last_frame);
         widget.connect_render(move |area, _| {
-            let latest = {
-                let mut queue = render_queue.lock().unwrap();
-                let latest = queue.pop_back();
-                queue.clear();
-                latest
-            };
+            let (latest, _) = render_queue.take_latest();
             if let Some(frame) = latest {
                 *render_last_frame.borrow_mut() = Some(frame);
             }
@@ -131,7 +122,7 @@ impl NativeVideoSurface {
 
         let tick_queue = Arc::clone(&queue);
         widget.add_tick_callback(move |area, _| {
-            if !tick_queue.lock().unwrap().is_empty() {
+            if !tick_queue.is_empty() {
                 area.queue_render();
             }
             ControlFlow::Continue

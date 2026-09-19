@@ -8,10 +8,7 @@ mod opengl_renderer;
 mod renderer_benchmark;
 
 #[cfg(target_os = "linux")]
-pub use audio_output::{
-    AudioPlaybackDecision, AudioPlaybackQueue, AudioPlaybackSnapshot, SdlAudioOutput,
-    run_sdl_audio_proof,
-};
+pub use audio_output::{AudioPlaybackSnapshot, SdlAudioOutput, run_sdl_audio_proof};
 #[cfg(target_os = "linux")]
 pub use opengl_renderer::{NativeVideoSink, NativeVideoSurface, NativeVideoSurfaceStatus};
 pub use rustconsole_codec_ffmpeg::Av1ColorDescription;
@@ -25,7 +22,10 @@ use rustconsole_codec_ffmpeg::{
     Av1VaApiDecoder, DecodedAv1Frame, HardwareDevice, HardwareDeviceType,
 };
 use rustconsole_media::{AudioFormat, AudioSamples, MediaTimestampMicros};
-use rustconsole_player_core::AudioPlaybackEvent;
+use rustconsole_player_core::{
+    AudioDecodeAction, AudioDecodePlanner, AudioPlaybackEvent, DecodedAudioEvent,
+    DecodedAudioSamples, EncodedAudioDecodeInput, VideoStreamSample,
+};
 use rustconsole_protocol::wire::{
     self, Av1Capability, Av1CapabilityOffer, Av1Mode, Av1ViewerSettings, ChromaSubsampling,
     EncodedVideoPacket, Envelope, SelectedAv1Configuration, VideoBitDepth, envelope,
@@ -54,20 +54,6 @@ const CAPABILITY_FIXTURE: &[u8] = include_bytes!("../test-data/av1-2560x1440-420
 
 #[cfg(target_os = "linux")]
 pub struct LinuxSecretStore;
-
-#[derive(Clone, Copy, Debug)]
-pub struct VideoStreamSample {
-    pub encoded_frame_bytes: usize,
-    pub target_bitrate_bits_per_second: u64,
-    pub estimated_capacity_bits_per_second: u64,
-    pub soft_ceiling_bits_per_second: Option<u64>,
-    pub round_trip_time: Duration,
-    pub lost_chunks: u64,
-    pub late_chunks: u64,
-    pub assembly_overflows: u64,
-    pub completed_frames: u64,
-    pub incomplete_frames: u64,
-}
 
 pub struct DecodedVideoFrame {
     pub sequence: u64,
@@ -110,171 +96,86 @@ pub struct StreamConfiguration {
     pub diagnostic_probe_sequence: Arc<AtomicU64>,
 }
 
-#[derive(Debug)]
-pub enum DecodedAudioEvent {
-    Reset { generation: u64 },
-    Samples(DecodedAudioSamples),
-    Failed { generation: u64, detail: String },
-}
-
-#[derive(Debug)]
-pub struct DecodedAudioSamples {
-    pub generation: u64,
-    pub sequence: u64,
-    pub diagnostics: bool,
-    pub assembled_at: Instant,
-    pub assembled_at_micros: u64,
-    pub decoded_at: Instant,
-    pub ordered_playout_duration: Option<Duration>,
-    pub decoder_queue_duration: Option<Duration>,
-    pub decode_duration: Duration,
-    pub encoded_bytes: usize,
-    pub concealed_packets: u64,
-    pub decoder_input_hash_duration: Duration,
-    pub assembly_to_decoder_matched: Option<bool>,
-    pub samples: AudioSamples,
-}
-
 #[derive(Default)]
 struct StreamAudioDecoder {
     decoder: Option<OpusDecoder>,
-    generation: u64,
-    expected: Option<u64>,
-    failed_generation: Option<u64>,
+    planner: AudioDecodePlanner,
     diagnostics: bool,
 }
 
 impl StreamAudioDecoder {
     fn event(&mut self, event: AudioPlaybackEvent) -> Vec<DecodedAudioEvent> {
-        match event {
-            AudioPlaybackEvent::Packet {
-                packet,
-                assembled_at,
-                released_at,
-                assembled_at_micros,
-                assembled_payload_sha256,
-            } => self.packet(
-                packet,
-                assembled_at,
-                released_at,
-                assembled_at_micros,
-                assembled_payload_sha256,
-            ),
-            AudioPlaybackEvent::Missing {
-                generation,
-                sequence,
-                captured_at_micros,
-                missing_packets,
-            } => {
-                let mut output = self.prepare_generation(generation);
-                if let Some(decoder) = self.decoder.as_mut() {
-                    decoder.reset();
-                }
-                if !matches!(
-                    output.last(),
-                    Some(DecodedAudioEvent::Reset {
-                        generation: current
-                    }) if *current == generation
-                ) {
+        let mut output = Vec::new();
+        for action in self.planner.plan(event) {
+            match action {
+                AudioDecodeAction::Reset { generation } => {
+                    if let Some(decoder) = self.decoder.as_mut() {
+                        decoder.reset();
+                    }
                     output.push(DecodedAudioEvent::Reset { generation });
                 }
-                let count = missing_packets.min(4);
-                output.push(DecodedAudioEvent::Samples(DecodedAudioSamples {
+                AudioDecodeAction::Conceal {
                     generation,
                     sequence,
-                    diagnostics: self.diagnostics,
-                    assembled_at: Instant::now(),
-                    assembled_at_micros: 0,
-                    decoded_at: Instant::now(),
-                    ordered_playout_duration: None,
-                    decoder_queue_duration: None,
-                    decode_duration: Duration::ZERO,
-                    encoded_bytes: 0,
-                    concealed_packets: count,
-                    decoder_input_hash_duration: Duration::ZERO,
-                    assembly_to_decoder_matched: None,
-                    samples: AudioSamples {
-                        captured_at: MediaTimestampMicros(captured_at_micros),
-                        format: AudioFormat {
-                            sample_rate: 48_000,
-                            channels: 2,
+                    captured_at_micros,
+                    packets,
+                    timing,
+                } => {
+                    let (assembled_at, released_at, assembled_at_micros) =
+                        timing.unwrap_or_else(|| {
+                            let now = Instant::now();
+                            (now, now, 0)
+                        });
+                    output.push(DecodedAudioEvent::Samples(DecodedAudioSamples {
+                        generation,
+                        sequence,
+                        diagnostics: self.diagnostics,
+                        assembled_at,
+                        assembled_at_micros,
+                        decoded_at: Instant::now(),
+                        ordered_playout_duration: self
+                            .diagnostics
+                            .then(|| released_at.saturating_duration_since(assembled_at)),
+                        decoder_queue_duration: None,
+                        decode_duration: Duration::ZERO,
+                        encoded_bytes: 0,
+                        concealed_packets: packets,
+                        decoder_input_hash_duration: Duration::ZERO,
+                        assembly_to_decoder_matched: None,
+                        samples: AudioSamples {
+                            captured_at: MediaTimestampMicros(captured_at_micros),
+                            format: AudioFormat {
+                                sample_rate: 48_000,
+                                channels: 2,
+                            },
+                            interleaved: vec![0.0; packets as usize * 480 * 2],
                         },
-                        interleaved: vec![0.0; count as usize * 480 * 2],
-                    },
-                }));
-                self.expected = sequence.checked_add(missing_packets);
-                output
+                    }));
+                }
+                AudioDecodeAction::Decode(input) => self.decode(input, &mut output),
             }
         }
+        output
     }
 
-    fn packet(
-        &mut self,
-        packet: rustconsole_protocol::audio::AudioPacket,
-        assembled_at: Instant,
-        released_at: Instant,
-        assembled_at_micros: u64,
-        assembled_payload_sha256: Option<[u8; 32]>,
-    ) -> Vec<DecodedAudioEvent> {
-        let mut output = self.prepare_generation(packet.generation);
-        if self.failed_generation == Some(packet.generation) {
-            return output;
-        }
-        if self
-            .expected
-            .is_some_and(|expected| packet.sequence < expected)
-        {
-            return output;
-        }
-        if let Some(expected) = self.expected
-            && packet.sequence > expected
-        {
-            if let Some(decoder) = self.decoder.as_mut() {
-                decoder.reset();
-            }
-            output.push(DecodedAudioEvent::Reset {
-                generation: packet.generation,
-            });
-            let missing = (packet.sequence - expected).min(4);
-            let captured_at = packet
-                .captured_at_micros
-                .saturating_sub(missing * rustconsole_protocol::audio::PACKET_DURATION_MICROS);
-            output.push(DecodedAudioEvent::Samples(DecodedAudioSamples {
-                generation: packet.generation,
-                sequence: expected,
-                diagnostics: self.diagnostics,
-                assembled_at,
-                assembled_at_micros,
-                decoded_at: Instant::now(),
-                ordered_playout_duration: self
-                    .diagnostics
-                    .then(|| released_at.saturating_duration_since(assembled_at)),
-                decoder_queue_duration: None,
-                decode_duration: Duration::ZERO,
-                encoded_bytes: 0,
-                concealed_packets: missing,
-                decoder_input_hash_duration: Duration::ZERO,
-                assembly_to_decoder_matched: None,
-                samples: AudioSamples {
-                    captured_at: MediaTimestampMicros(captured_at),
-                    format: AudioFormat {
-                        sample_rate: 48_000,
-                        channels: 2,
-                    },
-                    interleaved: vec![0.0; missing as usize * 480 * 2],
-                },
-            }));
-        }
+    fn decode(&mut self, input: EncodedAudioDecodeInput, output: &mut Vec<DecodedAudioEvent>) {
+        let EncodedAudioDecodeInput {
+            packet,
+            assembled_at,
+            released_at,
+            assembled_at_micros,
+            assembled_payload_sha256,
+        } = input;
         if self.decoder.is_none() {
             match OpusDecoder::open() {
                 Ok(decoder) => self.decoder = Some(decoder),
                 Err(error) => {
-                    self.failed_generation = Some(packet.generation);
+                    self.planner.decoder_failed(packet.generation);
                     output.push(DecodedAudioEvent::Failed {
                         generation: packet.generation,
                         detail: error.to_string(),
                     });
-                    return output;
+                    return;
                 }
             }
         }
@@ -301,7 +202,6 @@ impl StreamAudioDecoder {
         match self.decoder.as_mut().unwrap().decode(&encoded) {
             Ok(interleaved) => {
                 let decode_duration = decode_started.elapsed();
-                self.expected = packet.sequence.checked_add(1);
                 output.push(DecodedAudioEvent::Samples(DecodedAudioSamples {
                     generation: packet.generation,
                     sequence: packet.sequence,
@@ -330,27 +230,13 @@ impl StreamAudioDecoder {
             }
             Err(error) => {
                 self.decoder = None;
-                self.failed_generation = Some(packet.generation);
+                self.planner.decoder_failed(packet.generation);
                 output.push(DecodedAudioEvent::Failed {
                     generation: packet.generation,
                     detail: error.to_string(),
                 });
             }
         }
-        output
-    }
-
-    fn prepare_generation(&mut self, generation: u64) -> Vec<DecodedAudioEvent> {
-        if generation <= self.generation {
-            return Vec::new();
-        }
-        self.generation = generation;
-        self.expected = None;
-        self.failed_generation = None;
-        if let Some(decoder) = self.decoder.as_mut() {
-            decoder.reset();
-        }
-        vec![DecodedAudioEvent::Reset { generation }]
     }
 }
 
@@ -519,18 +405,10 @@ pub fn stream_quic_video(
                 frame: rustconsole_player_core::VideoFramePayload,
                 transport: rustconsole_player_core::StreamTransportStatistics,
             | {
-                observe_statistics(VideoStreamSample {
-                    encoded_frame_bytes: frame.payload.len(),
-                    target_bitrate_bits_per_second: frame.target_bitrate_bits_per_second,
-                    estimated_capacity_bits_per_second: frame.estimated_capacity_bits_per_second,
-                    soft_ceiling_bits_per_second: frame.soft_ceiling_bits_per_second,
-                    round_trip_time: transport.round_trip_time,
-                    lost_chunks: transport.assembly.lost_chunks,
-                    late_chunks: transport.assembly.late_chunks,
-                    assembly_overflows: transport.assembly.assembly_overflows,
-                    completed_frames: transport.assembly.completed_frames,
-                    incomplete_frames: transport.assembly.incomplete_frames,
-                });
+                observe_statistics(rustconsole_player_core::VideoStreamSample::from_frame(
+                    &frame,
+                    transport,
+                ));
                 let (decoder_input_hash_duration, assembly_to_decoder_matched) =
                     if let Some(assembled_sha256) = transport.assembled_payload_sha256 {
                         let started = Instant::now();

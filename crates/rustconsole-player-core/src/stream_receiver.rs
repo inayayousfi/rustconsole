@@ -7,9 +7,8 @@ use rustconsole_protocol::audio::AudioPacket;
 use rustconsole_protocol::diagnostics::{MediaKind, PayloadDigest, RECORD_SIZE, STREAM_PREAMBLE};
 use rustconsole_protocol::wire::{
     AudioStatus, AudioStreamState, ClockPing, ClockPong, Envelope, HostSessionControlKind,
-    InputPack, InputTransition, KeyTransition, KeyboardLeds, PointerButtonTransition,
-    PointerMotionTransition, PointerPositionTransition, ReleaseAll, VideoControl, VideoControlKind,
-    VideoReceiverReport, VideoReconfigurationCause, WheelTransition, envelope, input_transition,
+    InputPack, KeyboardLeds, VideoControl, VideoControlKind, VideoReceiverReport,
+    VideoReconfigurationCause, envelope,
 };
 use rustconsole_session::audio_datagram::{
     AUDIO_QUEUE_PACKETS, AUDIO_WAIT, AudioAssembler, AudioReceiveStatistics,
@@ -922,15 +921,7 @@ where
                                     let Some(TimedInputEvent { event, occurred_at }) = first.take().or_else(|| next_input.try_recv().ok()) else { break; };
                                     input_sequence = input_sequence.checked_add(1).ok_or("input sequence exhausted")?;
                                     let correlates_test_marker = matches!(event, InputEvent::PointerButton { pressed: true, .. });
-                                    let action = match event {
-                                        InputEvent::Key { hid_usage, pressed } => input_transition::Action::Key(KeyTransition { hid_usage: u32::from(hid_usage), pressed }),
-                                        InputEvent::ReleaseAll => input_transition::Action::ReleaseAll(ReleaseAll {}),
-                                        InputEvent::PointerButton { button, pressed } => input_transition::Action::PointerButton(PointerButtonTransition { button: u32::from(button), pressed }),
-                                        InputEvent::PointerMotion { delta_x, delta_y } => input_transition::Action::PointerMotion(PointerMotionTransition { delta_x, delta_y }),
-                                        InputEvent::PointerPosition { x, y } => input_transition::Action::PointerPosition(PointerPositionTransition { x: u32::from(x), y: u32::from(y) }),
-                                        InputEvent::Wheel { horizontal, vertical } => input_transition::Action::Wheel(WheelTransition { horizontal: i32::from(horizontal), vertical: i32::from(vertical) }),
-                                    };
-                                    transitions.push(InputTransition { generation: input_generation, sequence: input_sequence, action: Some(action), player_sent_at_micros });
+                                    transitions.push(crate::encode_reliable_input(event, input_generation, input_sequence, player_sent_at_micros));
                                     sent_events.push((input_sequence, occurred_at, correlates_test_marker));
                                 }
                                 permit.send(OutgoingControl { envelope: Envelope { body: Some(envelope::Body::InputPack(InputPack { transitions })) }, input_events: sent_events });
@@ -977,7 +968,7 @@ where
                 }
             };
             input_sequence = input_sequence.checked_add(1).ok_or("input sequence exhausted")?;
-            queue_control(&input_send, Envelope { body: Some(envelope::Body::InputPack(InputPack { transitions: vec![InputTransition { generation: input_generation, sequence: input_sequence, action: Some(input_transition::Action::ReleaseAll(ReleaseAll {})), player_sent_at_micros: elapsed_micros(reader_started) }] })) }, Vec::new())?;
+            queue_control(&input_send, Envelope { body: Some(envelope::Body::InputPack(InputPack { transitions: vec![crate::encode_reliable_input(InputEvent::ReleaseAll, input_generation, input_sequence, elapsed_micros(reader_started))] })) }, Vec::new())?;
             queue_control(&control_send, Envelope { body: Some(envelope::Body::VideoControl(VideoControl { kind: VideoControlKind::Stop as i32 })) }, Vec::new())?;
             drop(input_send);
             drop(control_send);
@@ -1238,6 +1229,7 @@ pub enum StreamEnd {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustconsole_protocol::wire::{InputTransition, KeyTransition, input_transition};
 
     #[test]
     fn reliable_queue_preserves_key_transitions_and_rejects_overflow() {

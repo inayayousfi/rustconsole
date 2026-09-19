@@ -69,6 +69,30 @@ fn benchmark_video_datagrams(criterion: &mut Criterion) {
         });
     }
     assemble.finish();
+
+    let mut round_trip = criterion.benchmark_group("video_datagram/round_trip");
+    for size in [64 * 1024_usize, 1024 * 1024] {
+        round_trip.throughput(Throughput::Bytes(size as u64));
+        round_trip.bench_with_input(BenchmarkId::from_parameter(size), &size, |bench, size| {
+            bench.iter_batched(
+                || video_frame(*size),
+                |frame| {
+                    let datagrams = packetize_video_frame(&frame, 1_200).unwrap();
+                    let mut assembler = VideoFrameAssembler::new(120);
+                    let now = Instant::now();
+                    for datagram in datagrams {
+                        black_box(
+                            assembler
+                                .push(&datagram, now, Duration::from_millis(5))
+                                .unwrap(),
+                        );
+                    }
+                },
+                BatchSize::LargeInput,
+            );
+        });
+    }
+    round_trip.finish();
 }
 
 fn benchmark_audio_datagrams(criterion: &mut Criterion) {
@@ -93,6 +117,27 @@ fn benchmark_audio_datagrams(criterion: &mut Criterion) {
                 BatchSize::SmallInput,
             );
         });
+    }
+    for size in [400_usize, 1_275, 7_657] {
+        group.throughput(Throughput::Bytes(size as u64));
+        group.bench_with_input(
+            BenchmarkId::new("round_trip", size),
+            &size,
+            |bench, size| {
+                bench.iter_batched(
+                    || audio_packet(*size),
+                    |packet| {
+                        let datagrams = packetize_audio(&packet, 1_200).unwrap();
+                        let mut assembler = AudioAssembler::default();
+                        let now = Instant::now();
+                        for datagram in datagrams {
+                            black_box(assembler.push(&datagram, now));
+                        }
+                    },
+                    BatchSize::SmallInput,
+                );
+            },
+        );
     }
     group.finish();
 }

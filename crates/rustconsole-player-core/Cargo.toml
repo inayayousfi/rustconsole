@@ -21,7 +21,12 @@ zeroize.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
+prost.workspace = true
 
 [[bench]]
 name = "process_protocol"
+harness = false
+
+[[bench]]
+name = "playback"
 harness = false

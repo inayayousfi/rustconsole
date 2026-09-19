@@ -8,6 +8,7 @@ use crate::worker_protocol::{
 };
 use rustconsole_host_core::LatestQueue;
 use rustconsole_host_core::audio_transport::{AUDIO_QUEUE_PACKETS, MediaQueue};
+use rustconsole_host_core::video_pacing::VideoFramePacer;
 use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io;
@@ -747,10 +748,9 @@ fn run_video_stream(
     diagnostics: bool,
     prepared: Option<PreparedGpuCapture>,
 ) -> Result<StreamExit, Box<dyn std::error::Error>> {
-    if frames_per_second == 0 {
-        return Err("video stream frame rate is zero".into());
-    }
-    let frame_period = Duration::from_nanos(1_000_000_000 / u64::from(frames_per_second));
+    let mut pacer = VideoFramePacer::new(frames_per_second, Instant::now())
+        .ok_or("video stream frame rate is zero")?;
+    let frame_period = pacer.frame_period();
     let prepared = prepared.ok_or("video stream was not prepared before start")?;
     let mut encoder =
         GpuVideoPipeline::from_prepared(prepared, frames_per_second, bitrate_bits_per_second)?;
@@ -782,21 +782,13 @@ fn run_video_stream(
         },
         None => None,
     };
-    let mut next_tick = Instant::now();
     let mut sequence = 0_u64;
-    let mut tick = 0_u64;
-    let mut frame_divisor = 1_u8;
 
     loop {
         while stop_requested(commands)? {
             match read_command(commands)? {
                 WorkerCommand::SetVideoBitrate(bitrate) => encoder.set_bitrate(bitrate)?,
-                WorkerCommand::SetVideoFrameDivisor(divisor) if matches!(divisor, 1 | 2) => {
-                    frame_divisor = divisor;
-                }
-                WorkerCommand::SetVideoFrameDivisor(_) => {
-                    return Err("video frame divisor must be one or two".into());
-                }
+                WorkerCommand::SetVideoFrameDivisor(divisor) => pacer.set_frame_divisor(divisor)?,
                 WorkerCommand::RequestVideoKeyframe => encoder.request_keyframe()?,
                 WorkerCommand::StopVideoStream => return Ok(StreamExit::Continue),
                 WorkerCommand::Stop => return Ok(StreamExit::StopWorker),
@@ -804,14 +796,13 @@ fn run_video_stream(
             }
         }
 
-        let now = Instant::now();
-        if now < next_tick {
-            thread::sleep(next_tick - now);
+        let wait = pacer.wait_duration(Instant::now());
+        if !wait.is_zero() {
+            thread::sleep(wait);
         }
-        // Pace from the actual start, not an old deadline that would create catch-up bursts.
         let frame_started = Instant::now();
         let encode_started_at_micros = clock.now()?;
-        let encoded = if tick.is_multiple_of(u64::from(frame_divisor)) {
+        let encoded = if pacer.should_encode() {
             match encoder.encode_next_frame(frame_period) {
                 Ok(frame) => frame,
                 Err(error) => {
@@ -874,14 +865,8 @@ fn run_video_stream(
             )?;
             sequence = sequence.checked_add(1).ok_or("video sequence exhausted")?;
         }
-        tick = tick.wrapping_add(1);
-
-        next_tick = next_frame_tick(frame_started, frame_period, Instant::now());
+        pacer.complete_tick(frame_started, Instant::now());
     }
-}
-
-fn next_frame_tick(previous: Instant, frame_period: Duration, now: Instant) -> Instant {
-    (previous + frame_period).max(now)
 }
 
 fn wait_event(
@@ -1277,38 +1262,6 @@ mod tests {
         );
         assert!(parse_connection_token("0011").is_err());
         assert!(parse_connection_token("00112233445566778899aabbccddeefg").is_err());
-    }
-
-    #[test]
-    fn frame_pacing_does_not_skip_a_slot_for_a_small_overrun() {
-        let started = Instant::now();
-        let period = Duration::from_millis(10);
-
-        assert_eq!(
-            next_frame_tick(started, period, started + Duration::from_millis(11)),
-            started + Duration::from_millis(11)
-        );
-    }
-
-    #[test]
-    fn frame_pacing_rebases_after_a_large_stall() {
-        let started = Instant::now();
-        let period = Duration::from_millis(10);
-        let resumed = started + Duration::from_millis(60);
-
-        assert_eq!(next_frame_tick(started, period, resumed), resumed);
-    }
-
-    #[test]
-    fn frame_pacing_does_not_catch_up_after_a_stall() {
-        let started = Instant::now();
-        let period = Duration::from_millis(10);
-        let resumed = next_frame_tick(started, period, started + Duration::from_millis(24));
-        assert_eq!(resumed, started + Duration::from_millis(24));
-        let next = next_frame_tick(resumed, period, resumed + Duration::from_millis(2));
-        assert_eq!(next, resumed + period);
-        let following = next_frame_tick(next, period, next + Duration::from_millis(2));
-        assert_eq!(following, next + period);
     }
 }
 

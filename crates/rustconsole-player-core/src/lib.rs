@@ -1,13 +1,20 @@
 //! Platform-neutral player session orchestration.
 
+mod input_pipeline;
+mod playback;
 pub mod process_protocol;
+pub use input_pipeline::encode_reliable_input;
+pub use playback::{
+    AudioDecodeAction, AudioDecodePlanner, AudioPlaybackDecision, AudioPlaybackQueue,
+    AudioPlaybackQueueSnapshot, DecodedAudioEvent, DecodedAudioSamples, EncodedAudioDecodeInput,
+    LatestVideoQueue, VideoPlaybackClock,
+};
 pub use rustconsole_protocol::display::{
     AdapterId, Display, DisplayId, DisplayInventory, DisplaySelection, GraphicsAdapter,
 };
 mod stream_receiver;
 pub use stream_receiver::{AudioPlaybackEvent, AudioTransportSnapshot, StreamEnd};
 
-use rustconsole_media::{AudioSamples, VideoFormat, VideoFrame};
 use rustconsole_protocol::InputEvent;
 use rustconsole_protocol::wire::{
     Av1Capability, Av1CapabilityOffer, Av1Mode, Av1ViewerSettings, ChromaSubsampling, Envelope,
@@ -826,6 +833,38 @@ pub struct StreamTransportStatistics {
     pub assembled_payload_sha256: Option<[u8; 32]>,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct VideoStreamSample {
+    pub encoded_frame_bytes: usize,
+    pub target_bitrate_bits_per_second: u64,
+    pub estimated_capacity_bits_per_second: u64,
+    pub soft_ceiling_bits_per_second: Option<u64>,
+    pub round_trip_time: Duration,
+    pub lost_chunks: u64,
+    pub late_chunks: u64,
+    pub assembly_overflows: u64,
+    pub completed_frames: u64,
+    pub incomplete_frames: u64,
+}
+
+impl VideoStreamSample {
+    #[must_use]
+    pub fn from_frame(frame: &VideoFramePayload, transport: StreamTransportStatistics) -> Self {
+        Self {
+            encoded_frame_bytes: frame.payload.len(),
+            target_bitrate_bits_per_second: frame.target_bitrate_bits_per_second,
+            estimated_capacity_bits_per_second: frame.estimated_capacity_bits_per_second,
+            soft_ceiling_bits_per_second: frame.soft_ceiling_bits_per_second,
+            round_trip_time: transport.round_trip_time,
+            lost_chunks: transport.assembly.lost_chunks,
+            late_chunks: transport.assembly.late_chunks,
+            assembly_overflows: transport.assembly.assembly_overflows,
+            completed_frames: transport.assembly.completed_frames,
+            incomplete_frames: transport.assembly.incomplete_frames,
+        }
+    }
+}
+
 fn wire_capability(capability: DomainCapability) -> Av1Capability {
     Av1Capability {
         chroma_subsampling: match capability.mode.chroma_subsampling {
@@ -919,30 +958,6 @@ fn wire_selected(
         }),
         maximum_bitrate_bits_per_second: selected.maximum_bitrate_bits_per_second,
     }
-}
-
-pub trait VideoRenderer<Frame> {
-    type Error;
-
-    fn present(&mut self, frame: VideoFrame<Frame>) -> Result<(), Self::Error>;
-
-    fn reconfigure(&mut self, format: VideoFormat) -> Result<(), Self::Error>;
-}
-
-pub trait AudioOutput {
-    type Error;
-
-    fn play(&mut self, samples: AudioSamples) -> Result<(), Self::Error>;
-
-    fn reset(&mut self) -> Result<(), Self::Error>;
-}
-
-pub trait LocalInputSource {
-    type Error;
-
-    fn next_event(&mut self) -> Result<Option<InputEvent>, Self::Error>;
-
-    fn focused(&self) -> bool;
 }
 
 pub trait SecretStore {
@@ -1127,91 +1142,6 @@ mod tests {
             ]
         );
     }
-    use rustconsole_media::{AudioFormat, MediaTimestampMicros};
-    use rustconsole_session::{SessionLifecycle, SessionPhase};
-    use std::collections::{BTreeMap, VecDeque};
-    use std::convert::Infallible;
-
-    #[derive(Default)]
-    struct MockRenderer {
-        presented_sequences: Vec<u64>,
-        configured_format: Option<VideoFormat>,
-    }
-
-    impl VideoRenderer<Vec<u8>> for MockRenderer {
-        type Error = Infallible;
-
-        fn present(&mut self, frame: VideoFrame<Vec<u8>>) -> Result<(), Self::Error> {
-            self.presented_sequences.push(frame.sequence);
-            Ok(())
-        }
-
-        fn reconfigure(&mut self, format: VideoFormat) -> Result<(), Self::Error> {
-            self.configured_format = Some(format);
-            Ok(())
-        }
-    }
-
-    #[derive(Default)]
-    struct MockAudioOutput {
-        played_samples: usize,
-    }
-
-    impl AudioOutput for MockAudioOutput {
-        type Error = Infallible;
-
-        fn play(&mut self, samples: AudioSamples) -> Result<(), Self::Error> {
-            self.played_samples += samples.interleaved.len();
-            Ok(())
-        }
-
-        fn reset(&mut self) -> Result<(), Self::Error> {
-            self.played_samples = 0;
-            Ok(())
-        }
-    }
-
-    struct MockInputSource {
-        focused: bool,
-        events: VecDeque<InputEvent>,
-    }
-
-    impl LocalInputSource for MockInputSource {
-        type Error = Infallible;
-
-        fn next_event(&mut self) -> Result<Option<InputEvent>, Self::Error> {
-            Ok(self.events.pop_front())
-        }
-
-        fn focused(&self) -> bool {
-            self.focused
-        }
-    }
-
-    #[derive(Default)]
-    struct MockSecretStore {
-        secrets: BTreeMap<String, Vec<u8>>,
-    }
-
-    impl SecretStore for MockSecretStore {
-        type Error = Infallible;
-
-        fn load(&self, host_identity: &str) -> Result<Option<Vec<u8>>, Self::Error> {
-            Ok(self.secrets.get(host_identity).cloned())
-        }
-
-        fn store(&mut self, host_identity: &str, secret: &[u8]) -> Result<(), Self::Error> {
-            self.secrets
-                .insert(host_identity.to_owned(), secret.to_vec());
-            Ok(())
-        }
-
-        fn remove(&mut self, host_identity: &str) -> Result<(), Self::Error> {
-            self.secrets.remove(host_identity);
-            Ok(())
-        }
-    }
-
     #[test]
     fn vb_cable_wire_states_remain_distinct() {
         use rustconsole_protocol::wire::VbCableStatus;
@@ -1233,66 +1163,5 @@ mod tests {
             Ok(VbCableAvailability::CheckFailed)
         );
         assert!(vb_cable_availability(99).is_err());
-    }
-
-    #[test]
-    fn mock_viewer_components_follow_streaming_lifecycle() {
-        let format = VideoFormat {
-            width: 2560,
-            height: 1440,
-            frames_per_second: 120,
-        };
-        let mut lifecycle = SessionLifecycle::connected();
-        let mut renderer = MockRenderer::default();
-        let mut audio = MockAudioOutput::default();
-        let mut input = MockInputSource {
-            focused: true,
-            events: VecDeque::from([InputEvent::PointerMotion {
-                delta_x: 4,
-                delta_y: -2,
-            }]),
-        };
-        let mut secrets = MockSecretStore::default();
-
-        secrets.store("host-1", b"test password").unwrap();
-        lifecycle.authenticate().unwrap();
-        lifecycle.negotiate().unwrap();
-        renderer.reconfigure(format).unwrap();
-        lifecycle.start_streaming().unwrap();
-        renderer
-            .present(VideoFrame {
-                sequence: 9,
-                captured_at: MediaTimestampMicros(1_000),
-                format,
-                frame: vec![1, 2, 3],
-            })
-            .unwrap();
-        audio
-            .play(AudioSamples {
-                captured_at: MediaTimestampMicros(1_000),
-                format: AudioFormat {
-                    sample_rate: 48_000,
-                    channels: 2,
-                },
-                interleaved: vec![0.0; 8],
-            })
-            .unwrap();
-
-        assert_eq!(lifecycle.phase(), SessionPhase::Streaming);
-        assert_eq!(renderer.configured_format, Some(format));
-        assert_eq!(renderer.presented_sequences, [9]);
-        assert_eq!(audio.played_samples, 8);
-        assert!(input.focused());
-        assert_eq!(
-            input.next_event().unwrap(),
-            Some(InputEvent::PointerMotion {
-                delta_x: 4,
-                delta_y: -2,
-            })
-        );
-        assert_eq!(
-            secrets.load("host-1").unwrap(),
-            Some(b"test password".to_vec())
-        );
     }
 }

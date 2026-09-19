@@ -2,12 +2,14 @@ use backon::BackoffBuilder;
 use rustconsole_player_core::process_protocol::{
     LaunchRequest, PlayerCommand, PlayerEvent, read_command, write_event,
 };
-use rustconsole_player_core::{StreamProgress, TimedInputEvent};
+use rustconsole_player_core::{
+    AudioPlaybackDecision, AudioPlaybackQueue, DecodedAudioSamples, LatestVideoQueue,
+    StreamProgress, TimedInputEvent, VideoPlaybackClock, VideoStreamSample,
+};
 use rustconsole_player_gui::{GuiFrame, PlayerGui, PlayerGuiAction, PlayerGuiView, PointerButton};
 use rustconsole_player_linux::{
-    AudioPlaybackDecision, AudioPlaybackQueue, AudioPlaybackSnapshot, Av1ColorDescription,
-    DecodedAudioSamples, DecodedVideoFrame, DmaBufFrameFormat, NativeDmaBufFrame, SdlAudioOutput,
-    StreamCallbacks, VideoStreamSample,
+    AudioPlaybackSnapshot, Av1ColorDescription, DecodedVideoFrame, DmaBufFrameFormat,
+    NativeDmaBufFrame, SdlAudioOutput, StreamCallbacks,
 };
 use rustconsole_protocol::InputEvent;
 use rustconsole_render::{DecodedVideoColor, OverlayStatistics, PlayerVideoBackend};
@@ -18,12 +20,12 @@ use sdl3::iostream::IOStream;
 use sdl3::mouse::MouseButton;
 use sdl3::surface::Surface;
 use sdl3::video::{FullscreenType, Window};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 use std::io::{BufReader, BufWriter};
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 mod diagnostics;
@@ -250,20 +252,6 @@ struct PendingPresentation {
     correlated_input_started_at: Option<Instant>,
 }
 
-struct VideoPlaybackClock {
-    captured_at_micros: u64,
-    presented_at: Instant,
-}
-
-impl VideoPlaybackClock {
-    fn timestamp_at(&self, now: Instant) -> u64 {
-        self.captured_at_micros.saturating_add(
-            u64::try_from(now.saturating_duration_since(self.presented_at).as_micros())
-                .unwrap_or(u64::MAX),
-        )
-    }
-}
-
 struct ActiveStreamSession {
     stop: Arc<AtomicBool>,
     input: rustconsole_player_core::InputSender,
@@ -295,8 +283,7 @@ impl ActiveStreamSession {
 fn start_stream_session(
     launch: &LaunchRequest,
     events: mpsc::Sender<SessionEvent>,
-    frames: Arc<Mutex<VecDeque<QueuedVideoFrame>>>,
-    video_render_queue_drops: Arc<AtomicU64>,
+    frames: Arc<LatestVideoQueue<QueuedVideoFrame>>,
     audio: AudioPlaybackQueue,
 ) -> ActiveStreamSession {
     let stop = Arc::new(AtomicBool::new(false));
@@ -366,12 +353,7 @@ fn start_stream_session(
                     if mapped.frame_format() != Some(expected_format) {
                         return Err("decoded DMA-BUF format contradicts AV1 color metadata".into());
                     }
-                    let mut frames = frames.lock().unwrap();
-                    while frames.len() >= 2 {
-                        frames.pop_front();
-                        video_render_queue_drops.fetch_add(1, Ordering::Relaxed);
-                    }
-                    frames.push_back(QueuedVideoFrame {
+                    frames.push(QueuedVideoFrame {
                         sequence: decoded.sequence,
                         encoded_frame_bytes: decoded.encoded_frame_bytes,
                         decoded_dma_buf_bytes: decoded_dma_buf_bytes.unwrap_or(0),
@@ -463,8 +445,7 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
     let mut event_pump = sdl.event_pump()?;
     let audio_queue = AudioPlaybackQueue::default();
     let mut audio_output = SdlAudioOutput::new(&sdl);
-    let frames = Arc::new(Mutex::new(VecDeque::with_capacity(2)));
-    let video_render_queue_drops = Arc::new(AtomicU64::new(0));
+    let frames = Arc::new(LatestVideoQueue::default());
     let (command_tx, command_rx) = mpsc::sync_channel(1);
     let mut overlay = StreamOverlay::new(launch.maximum_bitrate_bits_per_second);
     std::thread::spawn(move || {
@@ -482,7 +463,6 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
         &launch,
         session_tx.clone(),
         Arc::clone(&frames),
-        Arc::clone(&video_render_queue_drops),
         audio_queue.clone(),
     );
 
@@ -540,9 +520,9 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
                     input_started.clear();
                     correlated_input_started.clear();
                     last_frame = None;
-                    frames.lock().unwrap().clear();
+                    frames.clear();
                     audio_queue
-                        .push(rustconsole_player_linux::DecodedAudioEvent::Reset { generation: 0 });
+                        .push(rustconsole_player_core::DecodedAudioEvent::Reset { generation: 0 });
                     audio_output.reset();
                     overlay = StreamOverlay::new(launch.maximum_bitrate_bits_per_second);
                     pending_video_timestamp = None;
@@ -562,7 +542,6 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
                         &launch,
                         session_tx.clone(),
                         Arc::clone(&frames),
-                        Arc::clone(&video_render_queue_drops),
                         audio_queue.clone(),
                     );
                 }
@@ -576,7 +555,6 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
                 &launch,
                 session_tx.clone(),
                 Arc::clone(&frames),
-                Arc::clone(&video_render_queue_drops),
                 audio_queue.clone(),
             );
         }
@@ -637,7 +615,7 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
                             });
                             if stopped && changed {
                                 audio_queue.push(
-                                    rustconsole_player_linux::DecodedAudioEvent::Reset {
+                                    rustconsole_player_core::DecodedAudioEvent::Reset {
                                         generation: snapshot.host.generation,
                                     },
                                 );
@@ -1348,9 +1326,9 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
                     input_started.clear();
                     correlated_input_started.clear();
                     last_frame = None;
-                    frames.lock().unwrap().clear();
+                    frames.clear();
                     audio_queue
-                        .push(rustconsole_player_linux::DecodedAudioEvent::Reset { generation: 0 });
+                        .push(rustconsole_player_core::DecodedAudioEvent::Reset { generation: 0 });
                     audio_output.reset();
                     overlay = StreamOverlay::new(launch.maximum_bitrate_bits_per_second);
                     pending_video_timestamp = None;
@@ -1396,9 +1374,9 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
                     input_started.clear();
                     correlated_input_started.clear();
                     last_frame = None;
-                    frames.lock().unwrap().clear();
+                    frames.clear();
                     audio_queue
-                        .push(rustconsole_player_linux::DecodedAudioEvent::Reset { generation: 0 });
+                        .push(rustconsole_player_core::DecodedAudioEvent::Reset { generation: 0 });
                     audio_output.reset();
                     overlay = StreamOverlay::new(launch.maximum_bitrate_bits_per_second);
                     pending_video_timestamp = None;
@@ -1418,7 +1396,6 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
                         &launch,
                         session_tx.clone(),
                         Arc::clone(&frames),
-                        Arc::clone(&video_render_queue_drops),
                         audio_queue.clone(),
                     );
                 }
@@ -1605,18 +1582,8 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
                 _ => {}
             }
         }
-        let (latest, render_queue_depth) = {
-            let mut frames = frames.lock().unwrap();
-            let render_queue_depth = frames.len();
-            let latest = frames.pop_back();
-            video_render_queue_drops.fetch_add(frames.len() as u64, Ordering::Relaxed);
-            frames.clear();
-            (latest, render_queue_depth)
-        };
-        latency_diagnostics.counter(
-            "video_render_queue_drops",
-            video_render_queue_drops.load(Ordering::Relaxed),
-        );
+        let (latest, render_queue_depth) = frames.take_latest();
+        latency_diagnostics.counter("video_render_queue_drops", frames.dropped());
         if let Some(mut frame) = latest {
             frame.capture_player_at = clock_offset.and_then(|offset| {
                 let captured_player_micros =
@@ -1909,10 +1876,7 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
                     last_diagnostic_frame = Some(frame.sequence);
                 }
                 if let Some(captured_at_micros) = pending_video_timestamp.take() {
-                    video_clock = Some(VideoPlaybackClock {
-                        captured_at_micros,
-                        presented_at: Instant::now(),
-                    });
+                    video_clock = Some(VideoPlaybackClock::new(captured_at_micros, Instant::now()));
                 }
                 if !started {
                     started = true;
@@ -2700,19 +2664,6 @@ impl StreamOverlay {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn video_clock_advances_between_presented_frames() {
-        let presented_at = Instant::now();
-        let clock = VideoPlaybackClock {
-            captured_at_micros: 1_000_000,
-            presented_at,
-        };
-        assert_eq!(
-            clock.timestamp_at(presented_at + Duration::from_millis(100)),
-            1_100_000
-        );
-    }
 
     #[test]
     fn reconnect_backoff_grows_to_its_bounded_jittered_delay() {

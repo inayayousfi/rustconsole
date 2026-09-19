@@ -1,19 +1,16 @@
-use crate::{DecodedAudioEvent, DecodedAudioSamples};
 use rustconsole_media::AudioSamples;
+use rustconsole_player_core::AudioPlaybackQueue;
 use sdl3::audio::{AudioFormat, AudioSpec, AudioStreamOwner};
-use std::collections::VecDeque;
 use std::mem::size_of;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const PACKET_FRAMES: usize = 480;
 const CHANNELS: usize = 2;
 const PREBUFFER_PACKETS: usize = 4;
-const MAX_PACKETS: usize = 8;
-const MAX_SYNC_MICROS: u64 = 40_000;
+const MAX_DEVICE_PACKETS: usize = 8;
 const PREBUFFER_BYTES: usize = PACKET_FRAMES * CHANNELS * PREBUFFER_PACKETS * size_of::<f32>();
-const MAX_SDL_BYTES: usize = PACKET_FRAMES * CHANNELS * MAX_PACKETS * size_of::<f32>();
+const MAX_SDL_BYTES: usize = PACKET_FRAMES * CHANNELS * MAX_DEVICE_PACKETS * size_of::<f32>();
 const DEVICE_RETRY: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -33,135 +30,6 @@ pub struct AudioPlaybackSnapshot {
     pub decoder_failures: u64,
     pub device_name: String,
     pub detail: String,
-}
-
-#[derive(Default)]
-struct QueueState {
-    pending: VecDeque<PendingAudio>,
-    reset: Option<u64>,
-    queue_drops: u64,
-    late_drops: u64,
-    resets: u64,
-    decoder_failures: u64,
-    detail: String,
-}
-
-struct PendingAudio {
-    decoded: DecodedAudioSamples,
-    queued_at: Option<Instant>,
-    sync_hold_started: Option<Instant>,
-}
-
-#[derive(Debug)]
-pub enum AudioPlaybackDecision {
-    Samples {
-        decoded: DecodedAudioSamples,
-        queue_duration: Option<Duration>,
-        sync_hold_duration: Option<Duration>,
-    },
-    Late {
-        sequence: u64,
-        queue_duration: Option<Duration>,
-        lateness_micros: u64,
-    },
-}
-
-#[derive(Clone, Default)]
-pub struct AudioPlaybackQueue {
-    state: Arc<Mutex<QueueState>>,
-}
-
-impl AudioPlaybackQueue {
-    pub fn push(&self, event: DecodedAudioEvent) {
-        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        match event {
-            DecodedAudioEvent::Reset { generation } => {
-                state.pending.clear();
-                state.reset = Some(generation);
-                state.resets += 1;
-                state.detail.clear();
-            }
-            DecodedAudioEvent::Samples(samples) => {
-                if state.pending.len() == MAX_PACKETS {
-                    state.pending.pop_front();
-                    state.queue_drops += 1;
-                }
-                let queued_at = samples.diagnostics.then(Instant::now);
-                state.pending.push_back(PendingAudio {
-                    decoded: samples,
-                    queued_at,
-                    sync_hold_started: None,
-                });
-            }
-            DecodedAudioEvent::Failed { detail, .. } => {
-                state.pending.clear();
-                state.decoder_failures = state.decoder_failures.saturating_add(1);
-                state.detail = detail;
-            }
-        }
-    }
-
-    pub fn take_reset(&self) -> Option<u64> {
-        self.state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .reset
-            .take()
-    }
-
-    pub fn pop_for_video(
-        &self,
-        video_timestamp_micros: Option<u64>,
-    ) -> Option<AudioPlaybackDecision> {
-        let video_timestamp_micros = video_timestamp_micros?;
-        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        let now = state
-            .pending
-            .front()
-            .is_some_and(|pending| pending.queued_at.is_some())
-            .then(Instant::now);
-        let pending = state.pending.front_mut()?;
-        let audio_timestamp = pending.decoded.samples.captured_at.0;
-        if audio_timestamp > video_timestamp_micros.saturating_add(MAX_SYNC_MICROS) {
-            if let Some(now) = now {
-                pending.sync_hold_started.get_or_insert(now);
-            }
-            return None;
-        }
-        let pending = state.pending.pop_front().unwrap();
-        let queue_duration = now
-            .zip(pending.queued_at)
-            .map(|(now, queued_at)| now.saturating_duration_since(queued_at));
-        if audio_timestamp.saturating_add(MAX_SYNC_MICROS) < video_timestamp_micros {
-            state.late_drops += 1;
-            return Some(AudioPlaybackDecision::Late {
-                sequence: pending.decoded.sequence,
-                queue_duration,
-                lateness_micros: video_timestamp_micros.saturating_sub(audio_timestamp),
-            });
-        }
-        Some(AudioPlaybackDecision::Samples {
-            decoded: pending.decoded,
-            queue_duration,
-            sync_hold_duration: pending
-                .sync_hold_started
-                .zip(now)
-                .map(|(started, now)| now.saturating_duration_since(started)),
-        })
-    }
-
-    pub fn snapshot(&self) -> AudioPlaybackSnapshot {
-        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        AudioPlaybackSnapshot {
-            pending_packets: state.pending.len(),
-            queue_drops: state.queue_drops,
-            late_drops: state.late_drops,
-            resets: state.resets,
-            decoder_failures: state.decoder_failures,
-            detail: state.detail.clone(),
-            ..AudioPlaybackSnapshot::default()
-        }
-    }
 }
 
 pub struct SdlAudioOutput {
@@ -312,16 +180,24 @@ impl SdlAudioOutput {
     }
 
     pub fn snapshot(&self, queue: &AudioPlaybackQueue) -> AudioPlaybackSnapshot {
-        let mut snapshot = queue.snapshot();
-        snapshot.queued_micros = self.queued_micros;
-        snapshot.device_drops = self.device_drops;
-        snapshot.invalid_format_drops = self.invalid_format_drops;
-        snapshot.unavailable_device_drops = self.unavailable_device_drops;
-        snapshot.device_query_failures = self.device_query_failures;
-        snapshot.software_capacity_drops = self.software_capacity_drops;
-        snapshot.device_submission_failures = self.device_submission_failures;
-        snapshot.underruns = self.underruns;
-        snapshot.device_name.clone_from(&self.device_name);
+        let queue = queue.snapshot();
+        let mut snapshot = AudioPlaybackSnapshot {
+            pending_packets: queue.pending_packets,
+            queued_micros: self.queued_micros,
+            queue_drops: queue.queue_drops,
+            late_drops: queue.late_drops,
+            device_drops: self.device_drops,
+            invalid_format_drops: self.invalid_format_drops,
+            unavailable_device_drops: self.unavailable_device_drops,
+            device_query_failures: self.device_query_failures,
+            software_capacity_drops: self.software_capacity_drops,
+            device_submission_failures: self.device_submission_failures,
+            underruns: self.underruns,
+            resets: queue.resets,
+            decoder_failures: queue.decoder_failures,
+            device_name: self.device_name.clone(),
+            detail: queue.detail,
+        };
         if !self.detail.is_empty() {
             snapshot.detail.clone_from(&self.detail);
         }
@@ -459,91 +335,6 @@ fn play_proof_packet(output: &mut SdlAudioOutput, packet: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustconsole_media::{AudioFormat as MediaAudioFormat, MediaTimestampMicros};
-
-    fn samples(timestamp: u64) -> DecodedAudioSamples {
-        DecodedAudioSamples {
-            generation: 1,
-            sequence: timestamp / 10_000,
-            diagnostics: true,
-            assembled_at: Instant::now(),
-            assembled_at_micros: timestamp,
-            decoded_at: Instant::now(),
-            decode_duration: Duration::ZERO,
-            encoded_bytes: 1,
-            concealed_packets: 0,
-            decoder_input_hash_duration: Duration::ZERO,
-            assembly_to_decoder_matched: None,
-            ordered_playout_duration: None,
-            decoder_queue_duration: None,
-            samples: AudioSamples {
-                captured_at: MediaTimestampMicros(timestamp),
-                format: MediaAudioFormat {
-                    sample_rate: 48_000,
-                    channels: 2,
-                },
-                interleaved: vec![0.0; 960],
-            },
-        }
-    }
-
-    #[test]
-    fn playback_queue_is_bounded_and_keeps_the_latest_audio() {
-        let queue = AudioPlaybackQueue::default();
-        for timestamp in (0..=80_000).step_by(10_000) {
-            queue.push(DecodedAudioEvent::Samples(samples(timestamp)));
-        }
-        let snapshot = queue.snapshot();
-        assert_eq!(snapshot.pending_packets, 8);
-        assert_eq!(snapshot.queue_drops, 1);
-        assert!(matches!(
-            queue
-                .pop_for_video(Some(10_000))
-                .unwrap(),
-            AudioPlaybackDecision::Samples { decoded, .. }
-                if decoded.samples.captured_at.0 == 10_000
-        ));
-    }
-
-    #[test]
-    fn playback_queue_holds_early_audio_and_drops_late_audio() {
-        let queue = AudioPlaybackQueue::default();
-        queue.push(DecodedAudioEvent::Samples(samples(100_001)));
-        assert!(queue.pop_for_video(Some(60_000)).is_none());
-        assert_eq!(queue.snapshot().pending_packets, 1);
-        assert!(matches!(
-            queue.pop_for_video(Some(140_002)),
-            Some(AudioPlaybackDecision::Late {
-                lateness_micros: 40_001,
-                ..
-            })
-        ));
-        assert_eq!(queue.snapshot().late_drops, 1);
-    }
-
-    #[test]
-    fn playback_queue_reports_a_completed_video_sync_hold() {
-        let queue = AudioPlaybackQueue::default();
-        queue.push(DecodedAudioEvent::Samples(samples(100_001)));
-        assert!(queue.pop_for_video(Some(60_000)).is_none());
-        assert!(matches!(
-            queue.pop_for_video(Some(60_001)),
-            Some(AudioPlaybackDecision::Samples {
-                sync_hold_duration: Some(_),
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn reset_clears_pending_audio() {
-        let queue = AudioPlaybackQueue::default();
-        queue.push(DecodedAudioEvent::Samples(samples(0)));
-        queue.push(DecodedAudioEvent::Reset { generation: 2 });
-        assert_eq!(queue.take_reset(), Some(2));
-        assert_eq!(queue.snapshot().pending_packets, 0);
-        assert_eq!(queue.snapshot().resets, 1);
-    }
 
     #[test]
     fn byte_depth_uses_stereo_float_frames() {

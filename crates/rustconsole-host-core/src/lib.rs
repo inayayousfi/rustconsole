@@ -1,6 +1,8 @@
 //! Platform-neutral host session orchestration.
 
-pub mod video_recovery;
+pub mod video_pacing;
+mod video_recovery;
+pub mod video_stream;
 
 use rustconsole_media::{AudioSamples, VideoFormat, VideoFrame};
 use rustconsole_protocol::InputEvent;

@@ -98,8 +98,10 @@ mod windows {
         ephemeral_server_config, read_envelope, write_envelope,
     };
     use rustconsole_host_core::{
-        AdaptiveBitrateController, DesktopCapture, HostSessionControlAction,
-        HostSessionControlSource, VideoDeliveryReport, VideoPathReport,
+        DesktopCapture, HostSessionControlAction, HostSessionControlSource, VideoDeliveryReport,
+        VideoPathReport,
+        video_pacing::frame_period,
+        video_stream::{HostEncodedVideoFrame, HostVideoStreamPolicy},
     };
     use rustconsole_input_windows::{HidReport, InputSession, ReportSink, VirtualInputOwner};
     use rustconsole_protocol::diagnostics::{MediaKind, PayloadDigest, STREAM_PREAMBLE};
@@ -1484,14 +1486,14 @@ mod windows {
         let _audio_recovery = AudioRecoveryGuard;
         let frames_per_second = selected.frames_per_second;
         let bitrate_bits_per_second = selected.maximum_bitrate_bits_per_second;
-        let mut controller = AdaptiveBitrateController::new(bitrate_bits_per_second);
+        let mut video_policy = HostVideoStreamPolicy::new(bitrate_bits_per_second);
         let clock = crate::clock::HostClock::new()?;
         let (_shutdown_tx, shutdown_rx) = shutdown_channel();
         let Some(mut stream) = worker
             .start_video_stream(
                 &shutdown_rx,
                 frames_per_second,
-                controller.target_bits_per_second(),
+                video_policy.target_bits_per_second(),
                 enable_audio,
                 diagnostic_tx.is_some(),
             )
@@ -1507,18 +1509,18 @@ mod windows {
         let mut audio_queued_at = 0_u64;
         let mut local_audio_drops = 0_u64;
         let mut worker_audio_drops = 0_u64;
-        let mut recovery = rustconsole_host_core::video_recovery::VideoRecovery::default();
-        let frame_period = Duration::from_nanos(1_000_000_000 / u64::from(frames_per_second));
+        let frame_period =
+            frame_period(frames_per_second).ok_or("video stream frame rate is zero")?;
         let mut observed_worker_drops = stream.dropped_events();
         loop {
             loop {
                 match controls.try_recv() {
                     Ok(WorkerVideoControl::RequestKeyframe) => {
-                        recovery.require_keyframe();
+                        video_policy.require_keyframe();
                     }
                     Ok(WorkerVideoControl::ReceiverReport(report)) => {
                         let path = connection.stats().path;
-                        let change = controller.observe(
+                        let change = video_policy.observe_receiver(
                             VideoPathReport {
                                 round_trip_time: path.rtt,
                                 congestion_window_bytes: path.cwnd,
@@ -1550,12 +1552,11 @@ mod windows {
             let worker_drops = stream.dropped_events();
             if worker_drops > observed_worker_drops {
                 observed_worker_drops = worker_drops;
-                recovery.require_keyframe();
-                if let Some(change) = controller.observe_sender_congestion() {
+                if let Some(change) = video_policy.observe_worker_queue_drop() {
                     stream.set_bitrate(change.target_bits_per_second)?;
                 }
             }
-            if recovery.request_due(Instant::now()) {
+            if video_policy.keyframe_request_due(Instant::now()) {
                 stream.request_keyframe()?;
             }
             if enable_audio
@@ -1733,13 +1734,12 @@ mod windows {
             );
             if !video_pending.is_empty() && video_started.elapsed() >= send_deadline {
                 video_pending.clear();
-                if let Some(change) = controller.observe_sender_congestion() {
+                if let Some(change) = video_policy.observe_send_deadline_expired() {
                     stream.set_bitrate(change.target_bits_per_second)?;
                 }
                 if let Some(record) = video_pending_diagnostic.take() {
                     submit_payload_digest(diagnostic_tx.as_ref(), record)?;
                 }
-                recovery.require_keyframe();
             }
             if video_pending.is_empty()
                 && let Some(event) = stream
@@ -1766,7 +1766,7 @@ mod windows {
                         ..
                     } => {
                         let service_received_at_micros = clock.now()?;
-                        if !recovery.accept(sequence, keyframe) {
+                        if !video_policy.accept_encoded_frame(sequence, keyframe) {
                             continue;
                         }
                         let Some(maximum_datagram_size) = connection.max_datagram_size() else {
@@ -1814,25 +1814,20 @@ mod windows {
                             0,
                             quality,
                         )?;
-                        let frame = rustconsole_host_core::video_transport::VideoFramePayload {
+                        let frame = HostEncodedVideoFrame {
                             sequence,
                             captured_at_micros,
                             encoded_at_micros,
                             packetized_at_micros,
                             input_sequence,
                             keyframe,
-                            target_bitrate_bits_per_second: controller.target_bits_per_second(),
-                            estimated_capacity_bits_per_second: controller
-                                .estimated_capacity_bits_per_second(),
-                            soft_ceiling_bits_per_second: controller.soft_ceiling_bits_per_second(),
                             payload,
                         };
-                        let datagrams =
-                            rustconsole_host_core::video_transport::packetize_video_frame_for_version(
-                                &frame,
-                                maximum_datagram_size,
-                                video_datagram_version,
-                            )?;
+                        let datagrams = video_policy.packetize_encoded_frame(
+                            frame,
+                            maximum_datagram_size,
+                            video_datagram_version,
+                        )?;
                         if let Some(record) = prepared_diagnostic.as_mut() {
                             record.packetization_completed_at_micros = clock.now()?;
                         }
@@ -1870,7 +1865,7 @@ mod windows {
                     Ok(false) => {}
                     Err(quinn::SendDatagramError::TooLarge) => {
                         video_pending.clear();
-                        recovery.require_keyframe();
+                        video_policy.require_keyframe();
                         if let Some(record) = video_pending_diagnostic.take() {
                             submit_payload_digest(diagnostic_tx.as_ref(), record)?;
                         }
