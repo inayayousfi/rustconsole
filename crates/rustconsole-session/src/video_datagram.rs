@@ -4,10 +4,11 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::time::{Duration, Instant};
 
-pub const VIDEO_DATAGRAM_HEADER_SIZE: usize = 68;
+pub const VIDEO_DATAGRAM_HEADER_SIZE: usize = 76;
+pub use rustconsole_protocol::{LEGACY_VIDEO_DATAGRAM_VERSION, VIDEO_DATAGRAM_VERSION};
 pub const MAX_ENCODED_FRAME_SIZE: usize = 16 * 1024 * 1024;
 const MAGIC: [u8; 2] = *b"RC";
-const VERSION: u8 = 4;
+const LEGACY_HEADER_SIZE: usize = 68;
 const KEYFRAME_FLAG: u8 = 1;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -20,6 +21,7 @@ pub struct VideoFramePayload {
     pub keyframe: bool,
     pub target_bitrate_bits_per_second: u64,
     pub estimated_capacity_bits_per_second: u64,
+    pub soft_ceiling_bits_per_second: Option<u64>,
     pub payload: Vec<u8>,
 }
 
@@ -27,11 +29,24 @@ pub fn packetize_video_frame(
     frame: &VideoFramePayload,
     maximum_datagram_size: usize,
 ) -> Result<Vec<Vec<u8>>, VideoDatagramError> {
+    packetize_video_frame_for_version(frame, maximum_datagram_size, VIDEO_DATAGRAM_VERSION)
+}
+
+pub fn packetize_video_frame_for_version(
+    frame: &VideoFramePayload,
+    maximum_datagram_size: usize,
+    version: u32,
+) -> Result<Vec<Vec<u8>>, VideoDatagramError> {
     if frame.payload.is_empty() || frame.payload.len() > MAX_ENCODED_FRAME_SIZE {
         return Err(VideoDatagramError::InvalidFrameSize(frame.payload.len()));
     }
+    let header_size = match version {
+        LEGACY_VIDEO_DATAGRAM_VERSION => LEGACY_HEADER_SIZE,
+        VIDEO_DATAGRAM_VERSION => VIDEO_DATAGRAM_HEADER_SIZE,
+        _ => return Err(VideoDatagramError::UnsupportedVersion(version)),
+    };
     let chunk_capacity = maximum_datagram_size
-        .checked_sub(VIDEO_DATAGRAM_HEADER_SIZE)
+        .checked_sub(header_size)
         .filter(|capacity| *capacity > 0)
         .ok_or(VideoDatagramError::DatagramTooSmall(maximum_datagram_size))?;
     let chunk_count = frame.payload.len().div_ceil(chunk_capacity);
@@ -44,9 +59,9 @@ pub fn packetize_video_frame(
         .chunks(chunk_capacity)
         .enumerate()
         .map(|(index, chunk)| {
-            let mut datagram = Vec::with_capacity(VIDEO_DATAGRAM_HEADER_SIZE + chunk.len());
+            let mut datagram = Vec::with_capacity(header_size + chunk.len());
             datagram.extend_from_slice(&MAGIC);
-            datagram.push(VERSION);
+            datagram.push(version as u8);
             datagram.push(if frame.keyframe { KEYFRAME_FLAG } else { 0 });
             datagram.extend_from_slice(&frame.sequence.to_be_bytes());
             datagram.extend_from_slice(&frame.captured_at_micros.to_be_bytes());
@@ -55,6 +70,14 @@ pub fn packetize_video_frame(
             datagram.extend_from_slice(&frame.input_sequence.to_be_bytes());
             datagram.extend_from_slice(&frame.target_bitrate_bits_per_second.to_be_bytes());
             datagram.extend_from_slice(&frame.estimated_capacity_bits_per_second.to_be_bytes());
+            if version == VIDEO_DATAGRAM_VERSION {
+                datagram.extend_from_slice(
+                    &frame
+                        .soft_ceiling_bits_per_second
+                        .unwrap_or(0)
+                        .to_be_bytes(),
+                );
+            }
             datagram.extend_from_slice(&frame_size.to_be_bytes());
             datagram.extend_from_slice(&(index as u16).to_be_bytes());
             datagram.extend_from_slice(&chunk_count.to_be_bytes());
@@ -73,6 +96,7 @@ struct Header {
     input_sequence: u64,
     target_bitrate_bits_per_second: u64,
     estimated_capacity_bits_per_second: u64,
+    soft_ceiling_bits_per_second: Option<u64>,
     frame_size: usize,
     chunk_index: usize,
     chunk_count: usize,
@@ -80,16 +104,37 @@ struct Header {
 }
 
 fn parse_header(datagram: &[u8]) -> Result<(Header, &[u8]), VideoDatagramError> {
-    if datagram.len() <= VIDEO_DATAGRAM_HEADER_SIZE {
+    if datagram.len() <= LEGACY_HEADER_SIZE {
         return Err(VideoDatagramError::MalformedHeader);
     }
-    if datagram[..2] != MAGIC || datagram[2] != VERSION || datagram[3] & !KEYFRAME_FLAG != 0 {
+    let version = u32::from(datagram[2]);
+    let header_size = match version {
+        LEGACY_VIDEO_DATAGRAM_VERSION => LEGACY_HEADER_SIZE,
+        VIDEO_DATAGRAM_VERSION => VIDEO_DATAGRAM_HEADER_SIZE,
+        _ => return Err(VideoDatagramError::MalformedHeader),
+    };
+    if datagram.len() <= header_size || datagram[..2] != MAGIC || datagram[3] & !KEYFRAME_FLAG != 0
+    {
         return Err(VideoDatagramError::MalformedHeader);
     }
-    let frame_size = u32::from_be_bytes(datagram[60..64].try_into().unwrap()) as usize;
-    let chunk_index = u16::from_be_bytes(datagram[64..66].try_into().unwrap()) as usize;
-    let chunk_count = u16::from_be_bytes(datagram[66..68].try_into().unwrap()) as usize;
-    let payload = &datagram[VIDEO_DATAGRAM_HEADER_SIZE..];
+    let metadata_end = if version == VIDEO_DATAGRAM_VERSION {
+        68
+    } else {
+        60
+    };
+    let frame_size =
+        u32::from_be_bytes(datagram[metadata_end..metadata_end + 4].try_into().unwrap()) as usize;
+    let chunk_index = u16::from_be_bytes(
+        datagram[metadata_end + 4..metadata_end + 6]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let chunk_count = u16::from_be_bytes(
+        datagram[metadata_end + 6..metadata_end + 8]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let payload = &datagram[header_size..];
     if frame_size == 0
         || frame_size > MAX_ENCODED_FRAME_SIZE
         || chunk_count == 0
@@ -112,6 +157,9 @@ fn parse_header(datagram: &[u8]) -> Result<(Header, &[u8]), VideoDatagramError> 
             estimated_capacity_bits_per_second: u64::from_be_bytes(
                 datagram[52..60].try_into().unwrap(),
             ),
+            soft_ceiling_bits_per_second: (version == VIDEO_DATAGRAM_VERSION)
+                .then(|| u64::from_be_bytes(datagram[60..68].try_into().unwrap()))
+                .filter(|ceiling| *ceiling != 0),
             frame_size,
             chunk_index,
             chunk_count,
@@ -141,6 +189,7 @@ pub struct FrameAssemblyProgress {
     pub budget: Duration,
     pub target_bitrate_bits_per_second: u64,
     pub estimated_capacity_bits_per_second: u64,
+    pub soft_ceiling_bits_per_second: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -251,6 +300,7 @@ impl VideoFrameAssembler {
             || existing.target_bitrate_bits_per_second != header.target_bitrate_bits_per_second
             || existing.estimated_capacity_bits_per_second
                 != header.estimated_capacity_bits_per_second
+            || existing.soft_ceiling_bits_per_second != header.soft_ceiling_bits_per_second
         {
             self.partial.remove(&header.sequence);
             return Err(VideoDatagramError::InconsistentFrameHeader);
@@ -286,6 +336,7 @@ impl VideoFrameAssembler {
             budget: partial.budget,
             target_bitrate_bits_per_second: header.target_bitrate_bits_per_second,
             estimated_capacity_bits_per_second: header.estimated_capacity_bits_per_second,
+            soft_ceiling_bits_per_second: header.soft_ceiling_bits_per_second,
         };
         if partial.chunks.iter().any(Option::is_none) {
             return Ok(AssemblyResult {
@@ -333,6 +384,7 @@ impl VideoFrameAssembler {
                 estimated_capacity_bits_per_second: partial
                     .header
                     .estimated_capacity_bits_per_second,
+                soft_ceiling_bits_per_second: partial.header.soft_ceiling_bits_per_second,
                 payload,
             }),
             dependency_lost,
@@ -398,6 +450,7 @@ pub enum VideoDatagramError {
     DatagramTooSmall(usize),
     InvalidFrameSize(usize),
     TooManyChunks,
+    UnsupportedVersion(u32),
     MalformedHeader,
     InconsistentFrameHeader,
 }
@@ -410,6 +463,9 @@ impl fmt::Display for VideoDatagramError {
             }
             Self::InvalidFrameSize(size) => write!(formatter, "invalid encoded frame size {size}"),
             Self::TooManyChunks => formatter.write_str("encoded frame requires too many chunks"),
+            Self::UnsupportedVersion(version) => {
+                write!(formatter, "unsupported video datagram version {version}")
+            }
             Self::MalformedHeader => formatter.write_str("malformed video datagram header"),
             Self::InconsistentFrameHeader => {
                 formatter.write_str("video chunks have inconsistent frame headers")
@@ -434,6 +490,7 @@ mod tests {
             keyframe: sequence == 1,
             target_bitrate_bits_per_second: 20_000_000,
             estimated_capacity_bits_per_second: 24_000_000,
+            soft_ceiling_bits_per_second: Some(22_000_000),
             payload: (0..size).map(|value| value as u8).collect(),
         }
     }
@@ -454,6 +511,26 @@ mod tests {
                 .or(assembled);
         }
         assert_eq!(assembled, Some(frame));
+    }
+
+    #[test]
+    fn legacy_packetization_omits_the_soft_ceiling() {
+        let mut expected = frame(1, 2_000);
+        let datagrams =
+            packetize_video_frame_for_version(&expected, 1_200, LEGACY_VIDEO_DATAGRAM_VERSION)
+                .unwrap();
+        expected.soft_ceiling_bits_per_second = None;
+        let now = Instant::now();
+        let mut assembler = VideoFrameAssembler::new(120);
+        let mut assembled = None;
+        for datagram in datagrams {
+            assembled = assembler
+                .push(&datagram, now, Duration::from_millis(5))
+                .unwrap()
+                .frame
+                .or(assembled);
+        }
+        assert_eq!(assembled, Some(expected));
     }
 
     #[test]

@@ -302,6 +302,7 @@ pub enum StreamProgress {
     FirstFrameAssembled {
         target_bitrate_bits_per_second: u64,
         estimated_capacity_bits_per_second: u64,
+        soft_ceiling_bits_per_second: Option<u64>,
     },
     ClockOffset(ClockOffsetEstimate),
     InputSent {
@@ -651,6 +652,8 @@ where
                     body: Some(envelope::Body::Av1CapabilityOffer(Av1CapabilityOffer {
                         display_id: display.as_ref().map(|id| id.as_str().to_owned()),
                         dedicated_input_stream: true,
+                        video_datagram_version:
+                            rustconsole_session::video_datagram::VIDEO_DATAGRAM_VERSION,
                         host_pointer_release: true,
                         full_diagnostics,
                         audio_transport: Some(
@@ -671,6 +674,7 @@ where
         let audio_transport;
         let dedicated_input_stream;
         let host_pointer_release;
+        let video_datagram_version;
         let host_offer = session_try!(
             "reading host AV1 capability offer",
             rustconsole_session::quic::read_envelope(&mut receive).await
@@ -684,6 +688,18 @@ where
                 }
                 host_pointer_release = offer.host_pointer_release;
                 dedicated_input_stream = offer.dedicated_input_stream;
+                video_datagram_version = if offer.video_datagram_version == 0 {
+                    rustconsole_session::video_datagram::LEGACY_VIDEO_DATAGRAM_VERSION
+                } else {
+                    offer.video_datagram_version
+                };
+                if video_datagram_version
+                    != rustconsole_session::video_datagram::LEGACY_VIDEO_DATAGRAM_VERSION
+                    && video_datagram_version
+                        != rustconsole_session::video_datagram::VIDEO_DATAGRAM_VERSION
+                {
+                    return Err("host selected an unsupported video datagram version".into());
+                }
                 audio_transport = offer
                     .audio_transport
                     .filter(|configuration| configuration.supported());
@@ -711,6 +727,7 @@ where
         selected_wire.full_diagnostics = full_diagnostics;
         selected_wire.host_pointer_release = host_pointer_release;
         selected_wire.dedicated_input_stream = dedicated_input_stream;
+        selected_wire.video_datagram_version = video_datagram_version;
         session_try!(
             "sending player AV1 selection",
             rustconsole_session::quic::write_envelope(
@@ -726,7 +743,17 @@ where
             rustconsole_session::quic::read_envelope(&mut receive).await
         );
         match host_selection.body {
-            Some(envelope::Body::SelectedAv1Configuration(peer)) if peer == selected_wire => {}
+            Some(envelope::Body::SelectedAv1Configuration(mut peer)) => {
+                if peer.video_datagram_version == 0 {
+                    peer.video_datagram_version =
+                        rustconsole_session::video_datagram::LEGACY_VIDEO_DATAGRAM_VERSION;
+                }
+                if peer != selected_wire {
+                    let error = "host selected a different AV1 configuration";
+                    stream_receiver::close_with_stream_error(&connection, error);
+                    return Err(error.into());
+                }
+            }
             _ => {
                 let error = "host selected a different AV1 configuration";
                 stream_receiver::close_with_stream_error(&connection, error);
@@ -879,6 +906,7 @@ fn wire_selected(
     });
     SelectedAv1Configuration {
         dedicated_input_stream: false,
+        video_datagram_version: rustconsole_session::video_datagram::LEGACY_VIDEO_DATAGRAM_VERSION,
         host_pointer_release: false,
         full_diagnostics: false,
         audio_transport: None,

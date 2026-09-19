@@ -599,6 +599,18 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
                         None,
                         "QUIC image transport round trip sampled",
                     );
+                    latency_diagnostics.counter(
+                        "video_learned_soft_ceiling_bits_per_second",
+                        statistics.soft_ceiling_bits_per_second.unwrap_or(0),
+                    );
+                    latency_diagnostics.counter(
+                        "video_encoder_target_bits_per_second",
+                        statistics.target_bitrate_bits_per_second,
+                    );
+                    latency_diagnostics.counter(
+                        "video_estimated_capacity_bits_per_second",
+                        statistics.estimated_capacity_bits_per_second,
+                    );
                     overlay.observe(statistics);
                     redraw = true;
                 }
@@ -1289,7 +1301,7 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
                                 latency_diagnostics.counter(name, value);
                             }
                             format!(
-                                "Receiving host packets\nFrame {}  {}/{} chunks  {:.1} KiB\nAssembly {:.1}/{:.1} ms\nComplete {}  Incomplete {}  Overflow {}\nDelivered rate (1s avg) {:.2} Mbit/s\nEncoder target {:.2} / Configured maximum {:.0} Mbit/s",
+                                "Receiving host packets\nFrame {}  {}/{} chunks  {:.1} KiB\nAssembly {:.1}/{:.1} ms\nComplete {}  Incomplete {}  Overflow {}\nDelivered rate (1s avg) {:.2} Mbit/s\nEncoder target {:.2} / Configured maximum {:.0} Mbit/s\nLearned soft ceiling {}",
                                 frame.sequence,
                                 frame.received_chunks,
                                 frame.expected_chunks,
@@ -1302,17 +1314,20 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
                                 frame.estimated_capacity_bits_per_second as f64 / 1_000_000.0,
                                 frame.target_bitrate_bits_per_second as f64 / 1_000_000.0,
                                 launch.maximum_bitrate_bits_per_second as f64 / 1_000_000.0,
+                                format_soft_ceiling(frame.soft_ceiling_bits_per_second),
                             )
                         }
                         StreamProgress::FirstFrameAssembled {
                             target_bitrate_bits_per_second,
                             estimated_capacity_bits_per_second,
+                            soft_ceiling_bits_per_second,
                         } => {
                             format!(
-                                "First frame assembled\nDecoding video\nDelivered rate (1s avg) {:.2} Mbit/s\nEncoder target {:.2} / Configured maximum {:.0} Mbit/s",
+                                "First frame assembled\nDecoding video\nDelivered rate (1s avg) {:.2} Mbit/s\nEncoder target {:.2} / Configured maximum {:.0} Mbit/s\nLearned soft ceiling {}",
                                 estimated_capacity_bits_per_second as f64 / 1_000_000.0,
                                 target_bitrate_bits_per_second as f64 / 1_000_000.0,
                                 launch.maximum_bitrate_bits_per_second as f64 / 1_000_000.0,
+                                format_soft_ceiling(soft_ceiling_bits_per_second),
                             )
                         }
                     };
@@ -2536,6 +2551,12 @@ fn mouse_button(button: MouseButton) -> Option<u8> {
     }
 }
 
+fn format_soft_ceiling(bits_per_second: Option<u64>) -> String {
+    bits_per_second
+        .map(|ceiling| format!("{:.2} Mbit/s", ceiling as f64 / 1_000_000.0))
+        .unwrap_or_else(|| "not established".to_owned())
+}
+
 struct StreamOverlay {
     audio: Option<rustconsole_player_core::AudioTransportSnapshot>,
     audio_playback: AudioPlaybackSnapshot,
@@ -2543,6 +2564,7 @@ struct StreamOverlay {
     maximum_megabits_per_second: f64,
     target_megabits_per_second: f64,
     delivered_megabits_per_second: f64,
+    soft_ceiling_megabits_per_second: Option<f64>,
     completed_frames: u64,
     incomplete_frames: u64,
     input_round_trip: Option<Duration>,
@@ -2560,6 +2582,7 @@ impl StreamOverlay {
             maximum_megabits_per_second: maximum_bitrate_bits_per_second as f64 / 1_000_000.0,
             target_megabits_per_second: maximum_bitrate_bits_per_second as f64 / 1_000_000.0,
             delivered_megabits_per_second: 0.0,
+            soft_ceiling_megabits_per_second: None,
             completed_frames: 0,
             incomplete_frames: 0,
             input_round_trip: None,
@@ -2584,6 +2607,9 @@ impl StreamOverlay {
             sample.target_bitrate_bits_per_second as f64 / 1_000_000.0;
         self.delivered_megabits_per_second =
             sample.estimated_capacity_bits_per_second as f64 / 1_000_000.0;
+        self.soft_ceiling_megabits_per_second = sample
+            .soft_ceiling_bits_per_second
+            .map(|ceiling| ceiling as f64 / 1_000_000.0);
         let elapsed = self.interval_started.elapsed();
         if elapsed >= Duration::from_millis(500) {
             let seconds = elapsed.as_secs_f64();
@@ -2598,12 +2624,15 @@ impl StreamOverlay {
 
     fn text(&self, state: &str) -> String {
         let video = format!(
-            "{RENDERING_BACKEND_LABEL}\n{state}\nFPS {:5.1}\nEncoded rate (0.5s) {:5.2} Mbit/s\nDelivered rate (1s avg) {:5.2} Mbit/s\nEncoder target {:5.2} Mbit/s\nConfigured maximum {:.0} Mbit/s\nImage ping {:5.1} ms\nInput ping {}\nComplete {}  Incomplete {}\nLost {}  Late {}  Overflow {}",
+            "{RENDERING_BACKEND_LABEL}\n{state}\nFPS {:5.1}\nEncoded rate (0.5s) {:5.2} Mbit/s\nDelivered rate (1s avg) {:5.2} Mbit/s\nEncoder target {:5.2} Mbit/s\nConfigured maximum {:.0} Mbit/s\nLearned soft ceiling {}\nImage ping {:5.1} ms\nInput ping {}\nComplete {}  Incomplete {}\nLost {}  Late {}  Overflow {}",
             self.statistics.frames_per_second,
             self.statistics.encoded_megabits_per_second,
             self.delivered_megabits_per_second,
             self.target_megabits_per_second,
             self.maximum_megabits_per_second,
+            self.soft_ceiling_megabits_per_second
+                .map(|ceiling| format!("{ceiling:.2} Mbit/s"))
+                .unwrap_or_else(|| "not established".to_owned()),
             self.statistics.round_trip_time.as_secs_f64() * 1_000.0,
             self.input_round_trip
                 .map(|duration| format!("{:5.1} ms", duration.as_secs_f64() * 1_000.0))
@@ -2833,6 +2862,7 @@ mod tests {
             encoded_frame_bytes: 125_000,
             target_bitrate_bits_per_second: 5_000_000,
             estimated_capacity_bits_per_second: 8_000_000,
+            soft_ceiling_bits_per_second: Some(6_000_000),
             round_trip_time: Duration::from_millis(7),
             lost_chunks: 2,
             late_chunks: 3,
@@ -2844,7 +2874,7 @@ mod tests {
         let text = overlay.text("Streaming");
         assert!(text.starts_with("Rendering backend: Vulkan\nStreaming\n"));
         assert!(text.contains(
-            "Encoded rate (0.5s)  0.00 Mbit/s\nDelivered rate (1s avg)  8.00 Mbit/s\nEncoder target  5.00 Mbit/s\nConfigured maximum 100 Mbit/s"
+            "Encoded rate (0.5s)  0.00 Mbit/s\nDelivered rate (1s avg)  8.00 Mbit/s\nEncoder target  5.00 Mbit/s\nConfigured maximum 100 Mbit/s\nLearned soft ceiling 6.00 Mbit/s"
         ));
         assert!(text.contains("Image ping   7.0 ms"));
         assert!(text.contains("Input ping  11.0 ms"));

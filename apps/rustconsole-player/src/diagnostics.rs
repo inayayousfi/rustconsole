@@ -586,6 +586,19 @@ impl WorkerState {
 
     fn refresh_overlay(&self) {
         let mut lines = vec!["Full diagnostics active".to_owned()];
+        if let Some(ceiling) = self
+            .counters
+            .get("video_learned_soft_ceiling_bits_per_second")
+        {
+            lines.push(if *ceiling == 0 {
+                "Learned soft ceiling: not established".to_owned()
+            } else {
+                format!(
+                    "Learned soft ceiling: {:.2} Mbit/s",
+                    *ceiling as f64 / 1_000_000.0
+                )
+            });
+        }
         for (name, accumulator) in &self.metrics {
             let values = accumulator.samples.sorted();
             if !values.is_empty() {

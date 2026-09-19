@@ -18,6 +18,7 @@ fn video_frame(size: usize) -> VideoFramePayload {
         input_sequence: 4,
         keyframe: false,
         target_bitrate_bits_per_second: 40_000_000,
+        soft_ceiling_bits_per_second: Some(35_000_000),
         estimated_capacity_bits_per_second: 50_000_000,
         payload: vec![42; size],
     }

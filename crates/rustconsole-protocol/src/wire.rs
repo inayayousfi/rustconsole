@@ -557,6 +557,8 @@ pub struct Av1CapabilityOffer {
     pub host_pointer_release: bool,
     #[prost(bool, tag = "7")]
     pub dedicated_input_stream: bool,
+    #[prost(uint32, tag = "9")]
+    pub video_datagram_version: u32,
 }
 
 #[derive(Clone, Copy, PartialEq, Message)]
@@ -696,6 +698,8 @@ pub struct SelectedAv1Configuration {
     pub host_pointer_release: bool,
     #[prost(bool, tag = "10")]
     pub dedicated_input_stream: bool,
+    #[prost(uint32, tag = "11")]
+    pub video_datagram_version: u32,
 }
 
 #[derive(Clone, Copy, PartialEq, Message)]
@@ -973,6 +977,7 @@ mod tests {
         };
         let selected = SelectedAv1Configuration {
             dedicated_input_stream: false,
+            video_datagram_version: 0,
             host_pointer_release: false,
             full_diagnostics: false,
             audio_transport: None,
@@ -1227,6 +1232,7 @@ fn audio_offer_has_a_fixed_fixture_and_is_optional_to_older_peers() {
     let offer = Av1CapabilityOffer {
         display_id: None,
         dedicated_input_stream: false,
+        video_datagram_version: 0,
         host_pointer_release: false,
         full_diagnostics: false,
         encoder_capabilities: Vec::new(),
@@ -1278,6 +1284,7 @@ fn host_pointer_release_is_negotiated_as_an_optional_field() {
     let offer = Av1CapabilityOffer {
         display_id: None,
         dedicated_input_stream: false,
+        video_datagram_version: 0,
         host_pointer_release: true,
         full_diagnostics: false,
         encoder_capabilities: Vec::new(),
@@ -1315,6 +1322,7 @@ fn dedicated_input_stream_is_negotiated_as_an_optional_field() {
     let offer = Av1CapabilityOffer {
         display_id: None,
         dedicated_input_stream: true,
+        video_datagram_version: 0,
         host_pointer_release: false,
         full_diagnostics: false,
         encoder_capabilities: Vec::new(),
@@ -1336,6 +1344,36 @@ fn dedicated_input_stream_is_negotiated_as_an_optional_field() {
     let old = OldOffer::decode(offer.encode_to_vec().as_slice()).unwrap();
     let decoded = Av1CapabilityOffer::decode(old.encode_to_vec().as_slice()).unwrap();
     assert!(!decoded.dedicated_input_stream);
+}
+
+#[test]
+fn video_datagram_version_is_negotiated_as_an_optional_field() {
+    let offer = Av1CapabilityOffer {
+        display_id: None,
+        dedicated_input_stream: false,
+        video_datagram_version: crate::VIDEO_DATAGRAM_VERSION,
+        host_pointer_release: false,
+        full_diagnostics: false,
+        encoder_capabilities: Vec::new(),
+        decoder_capabilities: Vec::new(),
+        viewer_settings: None,
+        audio_transport: None,
+    };
+    assert_eq!(
+        Av1CapabilityOffer::decode(offer.encode_to_vec().as_slice())
+            .unwrap()
+            .video_datagram_version,
+        crate::VIDEO_DATAGRAM_VERSION
+    );
+
+    #[derive(Clone, PartialEq, Message)]
+    struct OldOffer {
+        #[prost(message, repeated, tag = "1")]
+        encoder: Vec<Av1Capability>,
+    }
+    let old = OldOffer::decode(offer.encode_to_vec().as_slice()).unwrap();
+    let decoded = Av1CapabilityOffer::decode(old.encode_to_vec().as_slice()).unwrap();
+    assert_eq!(decoded.video_datagram_version, 0);
 }
 
 #[test]

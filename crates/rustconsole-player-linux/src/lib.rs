@@ -60,6 +60,7 @@ pub struct VideoStreamSample {
     pub encoded_frame_bytes: usize,
     pub target_bitrate_bits_per_second: u64,
     pub estimated_capacity_bits_per_second: u64,
+    pub soft_ceiling_bits_per_second: Option<u64>,
     pub round_trip_time: Duration,
     pub lost_chunks: u64,
     pub late_chunks: u64,
@@ -522,6 +523,7 @@ pub fn stream_quic_video(
                     encoded_frame_bytes: frame.payload.len(),
                     target_bitrate_bits_per_second: frame.target_bitrate_bits_per_second,
                     estimated_capacity_bits_per_second: frame.estimated_capacity_bits_per_second,
+                    soft_ceiling_bits_per_second: frame.soft_ceiling_bits_per_second,
                     round_trip_time: transport.round_trip_time,
                     lost_chunks: transport.assembly.lost_chunks,
                     late_chunks: transport.assembly.late_chunks,
@@ -715,6 +717,7 @@ pub fn run_one_frame_proof(
         body: Some(envelope::Body::Av1CapabilityOffer(Av1CapabilityOffer {
             display_id: None,
             dedicated_input_stream: false,
+            video_datagram_version: rustconsole_protocol::VIDEO_DATAGRAM_VERSION,
             host_pointer_release: false,
             full_diagnostics: false,
             audio_transport: None,
@@ -905,6 +908,7 @@ fn wire_selected(
 ) -> SelectedAv1Configuration {
     SelectedAv1Configuration {
         dedicated_input_stream: false,
+        video_datagram_version: rustconsole_protocol::VIDEO_DATAGRAM_VERSION,
         host_pointer_release: false,
         full_diagnostics: false,
         audio_transport: None,

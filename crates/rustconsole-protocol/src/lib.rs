@@ -29,6 +29,8 @@ pub enum InputEvent {
 
 /// The protocol version implemented by this build.
 pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(2, 1);
+pub const LEGACY_VIDEO_DATAGRAM_VERSION: u32 = 4;
+pub const VIDEO_DATAGRAM_VERSION: u32 = 5;
 
 /// A protocol version whose major number marks breaking changes.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]

@@ -1182,6 +1182,7 @@ where
                 progress(StreamProgress::FirstFrameAssembled {
                     target_bitrate_bits_per_second: frame.target_bitrate_bits_per_second,
                     estimated_capacity_bits_per_second: frame.estimated_capacity_bits_per_second,
+                    soft_ceiling_bits_per_second: frame.soft_ceiling_bits_per_second,
                 });
                 first = false;
             }
@@ -1290,6 +1291,7 @@ mod tests {
             input_sequence: 0,
             keyframe: sequence == 0,
             target_bitrate_bits_per_second: 1_000_000,
+            soft_ceiling_bits_per_second: None,
             estimated_capacity_bits_per_second: 2_000_000,
             payload: vec![42; 100],
         }

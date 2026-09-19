@@ -591,18 +591,36 @@ mod windows {
             }
             return Ok(());
         }
-        let (audio_configuration, dedicated_input_stream, full_diagnostics, host_pointer_release) =
-            match &request.body {
-                Some(envelope::Body::Av1CapabilityOffer(offer)) => (
-                    offer
-                        .audio_transport
-                        .filter(|configuration| configuration.supported()),
-                    offer.dedicated_input_stream,
-                    offer.full_diagnostics,
-                    offer.host_pointer_release,
-                ),
-                _ => (None, false, false, false),
-            };
+        let (
+            audio_configuration,
+            dedicated_input_stream,
+            full_diagnostics,
+            host_pointer_release,
+            video_datagram_version,
+        ) = match &request.body {
+            Some(envelope::Body::Av1CapabilityOffer(offer)) => (
+                offer
+                    .audio_transport
+                    .filter(|configuration| configuration.supported()),
+                offer.dedicated_input_stream,
+                offer.full_diagnostics,
+                offer.host_pointer_release,
+                if offer.video_datagram_version
+                    >= rustconsole_host_core::video_transport::VIDEO_DATAGRAM_VERSION
+                {
+                    rustconsole_host_core::video_transport::VIDEO_DATAGRAM_VERSION
+                } else {
+                    rustconsole_host_core::video_transport::LEGACY_VIDEO_DATAGRAM_VERSION
+                },
+            ),
+            _ => (
+                None,
+                false,
+                false,
+                false,
+                rustconsole_host_core::video_transport::LEGACY_VIDEO_DATAGRAM_VERSION,
+            ),
+        };
         let display_id = match &request.body {
             Some(envelope::Body::Av1CapabilityOffer(offer)) => offer
                 .display_id
@@ -693,6 +711,7 @@ mod windows {
                     body: Some(envelope::Body::Av1CapabilityOffer(Av1CapabilityOffer {
                         display_id: display_id.map(|id| id.as_str().to_owned()),
                         dedicated_input_stream,
+                        video_datagram_version,
                         host_pointer_release,
                         full_diagnostics,
                         audio_transport: audio_configuration,
@@ -709,12 +728,21 @@ mod windows {
         selected_wire.full_diagnostics = full_diagnostics;
         selected_wire.host_pointer_release = host_pointer_release;
         selected_wire.dedicated_input_stream = dedicated_input_stream;
+        selected_wire.video_datagram_version = video_datagram_version;
         let player_selection = session_try!(
             "reading player AV1 selection",
             read_envelope(&mut receive).await
         );
         match player_selection.body {
-            Some(envelope::Body::SelectedAv1Configuration(peer)) if peer == selected_wire => {}
+            Some(envelope::Body::SelectedAv1Configuration(mut peer)) => {
+                if peer.video_datagram_version == 0 {
+                    peer.video_datagram_version =
+                        rustconsole_host_core::video_transport::LEGACY_VIDEO_DATAGRAM_VERSION;
+                }
+                if peer != selected_wire {
+                    return Err("viewer selected a different AV1 configuration".into());
+                }
+            }
             _ => return Err("viewer selected a different AV1 configuration".into()),
         }
         session_try!(
@@ -798,6 +826,7 @@ mod windows {
                 runtime,
                 worker,
                 selected,
+                video_datagram_version,
                 control_rx,
                 audio_configuration.is_some(),
                 audio_state_tx,
@@ -1445,6 +1474,7 @@ mod windows {
         runtime: tokio::runtime::Handle,
         worker: crate::worker::MediaWorker,
         selected: rustconsole_protocol::NegotiatedAv1Configuration,
+        video_datagram_version: u32,
         controls: std::sync::mpsc::Receiver<WorkerVideoControl>,
         enable_audio: bool,
         audio_state: tokio::sync::watch::Sender<wire::AudioStreamState>,
@@ -1794,12 +1824,14 @@ mod windows {
                             target_bitrate_bits_per_second: controller.target_bits_per_second(),
                             estimated_capacity_bits_per_second: controller
                                 .estimated_capacity_bits_per_second(),
+                            soft_ceiling_bits_per_second: controller.soft_ceiling_bits_per_second(),
                             payload,
                         };
                         let datagrams =
-                            rustconsole_host_core::video_transport::packetize_video_frame(
+                            rustconsole_host_core::video_transport::packetize_video_frame_for_version(
                                 &frame,
                                 maximum_datagram_size,
+                                video_datagram_version,
                             )?;
                         if let Some(record) = prepared_diagnostic.as_mut() {
                             record.packetization_completed_at_micros = clock.now()?;
@@ -1941,6 +1973,8 @@ mod windows {
     ) -> SelectedAv1Configuration {
         SelectedAv1Configuration {
             dedicated_input_stream: false,
+            video_datagram_version:
+                rustconsole_host_core::video_transport::LEGACY_VIDEO_DATAGRAM_VERSION,
             host_pointer_release: false,
             full_diagnostics: false,
             audio_transport: None,
