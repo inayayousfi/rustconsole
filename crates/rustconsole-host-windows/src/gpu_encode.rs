@@ -43,6 +43,7 @@ unsafe extern "C" {
         cross_adapter_copy_micros: *mut u64,
         color_conversion_micros: *mut u64,
     ) -> i32;
+    fn rustconsole_gpu_bridge_restart_capture(bridge: *mut c_void) -> i32;
     fn rustconsole_gpu_bridge_open_external(
         bridge: *mut *mut c_void,
         encoder_device: *mut *mut c_void,
@@ -185,6 +186,7 @@ pub struct VideoQualitySample {
     pub readback_bytes: u64,
     pub luma_psnr_millidecibels: u64,
     pub luma_mean_absolute_error_ppm: u64,
+    pub source_luma_change_ppm: u64,
 }
 
 struct FrameMetadata {
@@ -219,6 +221,14 @@ struct Av1QualityDiagnostics {
     decoder: Av1D3d11Decoder,
     next_sample: Instant,
     sources: BTreeMap<i64, QualitySource>,
+    previous_source: Option<PreviousLuma>,
+}
+
+struct PreviousLuma {
+    width: u32,
+    height: u32,
+    bit_depth: u16,
+    samples: Vec<u16>,
 }
 
 impl GpuVideoPipeline {
@@ -325,6 +335,7 @@ where
             decoder,
             next_sample: Instant::now(),
             sources: BTreeMap::new(),
+            previous_source: None,
         });
         Ok(())
     }
@@ -424,6 +435,12 @@ impl GpuCapture {
             cross_adapter_copy_micros,
             color_conversion_micros,
         }))
+    }
+
+    pub fn restart(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        self.bridge.restart_capture()?;
+        self.cached_metadata = None;
+        Ok(())
     }
 }
 
@@ -534,6 +551,16 @@ where
             .map_err(|error| format!("video keyframe request failed: {error}").into())
     }
 
+    pub fn restart_capture(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        self.capture.restart()?;
+        self.pending_metadata.clear();
+        if let Some(quality) = self.quality.as_mut() {
+            quality.sources.clear();
+            quality.previous_source = None;
+        }
+        Ok(())
+    }
+
     fn rebuild_encoder(
         &mut self,
         bitrate_bits_per_second: u64,
@@ -610,28 +637,50 @@ impl Av1QualityDiagnostics {
             10.0 * (maximum * maximum / mean_squared_error).log10()
         };
         let mean_absolute_error = absolute_error as f64 / sample_count;
+        let source_luma_change_ppm = self.previous_source.as_ref().map_or(0, |previous| {
+            if previous.width != source.width
+                || previous.height != source.height
+                || previous.bit_depth != source.bit_depth
+                || previous.samples.len() != source.samples.len()
+            {
+                return 0;
+            }
+            let absolute_change = previous.samples.iter().zip(&source.samples).fold(
+                0_u128,
+                |total, (&previous, &current)| {
+                    total.saturating_add(u128::from(previous.abs_diff(current)))
+                },
+            );
+            let mean_change = absolute_change as f64 / sample_count;
+            (mean_change * 1_000_000.0 / maximum)
+                .round()
+                .clamp(0.0, u64::MAX as f64) as u64
+        });
         let scoring_micros = scoring_started.elapsed().as_micros() as u64;
         let decoded_readback_bytes = u64::from(decoded.width)
             * u64::from(decoded.height)
             * if decoded.bit_depth == 8 { 3 } else { 6 }
             / 2;
-        Ok((
+        let sample = VideoQualitySample {
+            presentation_timestamp,
+            source_readback_micros: source.readback_micros,
             mirror_decode_micros,
-            Some(VideoQualitySample {
-                presentation_timestamp,
-                source_readback_micros: source.readback_micros,
-                mirror_decode_micros,
-                decoded_readback_micros,
-                scoring_micros,
-                readback_bytes: source.readback_bytes.saturating_add(decoded_readback_bytes),
-                luma_psnr_millidecibels: (psnr * 1_000.0).round().clamp(0.0, u64::MAX as f64)
-                    as u64,
-                luma_mean_absolute_error_ppm: (mean_absolute_error * 1_000_000.0 / maximum)
-                    .round()
-                    .clamp(0.0, u64::MAX as f64)
-                    as u64,
-            }),
-        ))
+            decoded_readback_micros,
+            scoring_micros,
+            readback_bytes: source.readback_bytes.saturating_add(decoded_readback_bytes),
+            luma_psnr_millidecibels: (psnr * 1_000.0).round().clamp(0.0, u64::MAX as f64) as u64,
+            luma_mean_absolute_error_ppm: (mean_absolute_error * 1_000_000.0 / maximum)
+                .round()
+                .clamp(0.0, u64::MAX as f64) as u64,
+            source_luma_change_ppm,
+        };
+        self.previous_source = Some(PreviousLuma {
+            width: source.width,
+            height: source.height,
+            bit_depth: source.bit_depth,
+            samples: source.samples,
+        });
+        Ok((mirror_decode_micros, Some(sample)))
     }
 }
 
@@ -970,6 +1019,20 @@ impl GpuBridge {
                 *cause != rustconsole_protocol::wire::VideoReconfigurationCause::Unspecified
             })
             .unwrap_or(rustconsole_protocol::wire::VideoReconfigurationCause::CaptureEngine)
+    }
+
+    fn restart_capture(&mut self) -> Result<(), BridgeError> {
+        if let Some(helper) = self.helper.as_mut() {
+            helper.restart_capture().map_err(|error| BridgeError {
+                code: 0x8000_4005_u32 as i32,
+                stage: error.to_string(),
+            })?;
+            self.pending_helper_frame = None;
+            return Ok(());
+        }
+        // SAFETY: the bridge is live and the native function retains no pointers.
+        let result = unsafe { rustconsole_gpu_bridge_restart_capture(self.raw.as_ptr()) };
+        check_bridge_hresult(result)
     }
 }
 

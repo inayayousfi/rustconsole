@@ -39,6 +39,9 @@ extern "C" HRESULT rustconsole_gpu_bridge_capture_external(
     uint64_t* cross_adapter_copy_micros,
     uint64_t* color_conversion_micros);
 
+extern "C" HRESULT rustconsole_gpu_bridge_restart_capture(
+    RustConsoleGpuBridge* bridge);
+
 extern "C" uintptr_t rustconsole_gpu_bridge_output_handle(
     RustConsoleGpuBridge* bridge);
 

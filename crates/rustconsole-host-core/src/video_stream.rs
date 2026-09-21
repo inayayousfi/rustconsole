@@ -112,7 +112,7 @@ mod tests {
         let now = Instant::now();
         let mut policy = HostVideoStreamPolicy::new(100_000_000);
         let change = policy.observe_worker_queue_drop().unwrap();
-        assert_eq!(change.target_bits_per_second, 75_000_000);
+        assert_eq!(change.target_bits_per_second, 37_500_000);
         assert!(policy.keyframe_request_due(now));
         assert!(!policy.accept_encoded_frame(0, false));
         assert!(policy.accept_encoded_frame(1, true));
@@ -152,6 +152,6 @@ mod tests {
         assert_eq!(assembled.sequence, 7);
         assert_eq!(assembled.input_sequence, 4);
         assert_eq!(assembled.payload, payload);
-        assert_eq!(assembled.target_bitrate_bits_per_second, 40_000_000);
+        assert_eq!(assembled.target_bitrate_bits_per_second, 20_000_000);
     }
 }

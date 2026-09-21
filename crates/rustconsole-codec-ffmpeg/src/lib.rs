@@ -1153,7 +1153,9 @@ impl Av1NvencEncoder {
                 }
             }
             (*raw).max_b_frames = 0;
-            (*raw).gop_size = i32::from(configuration.frames_per_second) * 2;
+            // Recovery requests explicitly force an IDR. Keep automatic GOP rollover out of
+            // live sessions so periodic keyframes cannot create a visible quality pulse.
+            (*raw).gop_size = i32::MAX;
             (*raw).flags |= ffi::AV_CODEC_FLAG_LOW_DELAY as i32;
             (*raw).hw_frames_ctx = frames.as_ptr();
         }

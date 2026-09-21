@@ -1,7 +1,18 @@
 //! Fixed-size records carried on the optional diagnostics QUIC stream.
 
-pub const STREAM_PREAMBLE: [u8; 6] = *b"RCDG\0\x02";
-pub const RECORD_SIZE: usize = 322;
+pub const STREAM_PREAMBLE: [u8; 6] = *b"RCDG\0\x03";
+pub const RECORD_SIZE: usize = 394;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u64)]
+pub enum VideoBitrateChangeCause {
+    Startup = 1,
+    HealthyDelivery = 2,
+    MildDegradation = 3,
+    SevereReceiverLoss = 4,
+    SeverePathPressure = 5,
+    SenderCongestion = 6,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -49,6 +60,15 @@ pub struct PayloadDigest {
     pub readback_bytes: u64,
     pub luma_psnr_millidecibels: u64,
     pub luma_mean_absolute_error_ppm: u64,
+    pub source_luma_change_ppm: u64,
+    pub video_target_bitrate_bits_per_second: u64,
+    pub video_delivered_goodput_bits_per_second: u64,
+    pub video_soft_ceiling_bits_per_second: u64,
+    pub video_bitrate_change_sequence: u64,
+    pub video_bitrate_change_cause: u64,
+    pub video_path_round_trip_micros: u64,
+    pub video_path_congestion_window_bytes: u64,
+    pub video_path_lost_packets: u64,
     pub packetization_completed_at_micros: u64,
     pub first_send_attempt_at_micros: u64,
     pub last_send_completed_at_micros: u64,
@@ -114,6 +134,15 @@ impl PayloadDigest {
             (298, self.audio_capture_queue_depth),
             (306, self.audio_capture_queue_capacity),
             (314, self.audio_capture_queue_drops),
+            (322, self.source_luma_change_ppm),
+            (330, self.video_target_bitrate_bits_per_second),
+            (338, self.video_delivered_goodput_bits_per_second),
+            (346, self.video_soft_ceiling_bits_per_second),
+            (354, self.video_bitrate_change_sequence),
+            (362, self.video_bitrate_change_cause),
+            (370, self.video_path_round_trip_micros),
+            (378, self.video_path_congestion_window_bytes),
+            (386, self.video_path_lost_packets),
         ] {
             bytes[offset..offset + 8].copy_from_slice(&value.to_be_bytes());
         }
@@ -170,6 +199,15 @@ impl PayloadDigest {
             audio_capture_queue_depth: word(298),
             audio_capture_queue_capacity: word(306),
             audio_capture_queue_drops: word(314),
+            source_luma_change_ppm: word(322),
+            video_target_bitrate_bits_per_second: word(330),
+            video_delivered_goodput_bits_per_second: word(338),
+            video_soft_ceiling_bits_per_second: word(346),
+            video_bitrate_change_sequence: word(354),
+            video_bitrate_change_cause: word(362),
+            video_path_round_trip_micros: word(370),
+            video_path_congestion_window_bytes: word(378),
+            video_path_lost_packets: word(386),
         })
     }
 }
@@ -206,6 +244,15 @@ mod tests {
             readback_bytes: 19,
             luma_psnr_millidecibels: 20,
             luma_mean_absolute_error_ppm: 21,
+            source_luma_change_ppm: 37,
+            video_target_bitrate_bits_per_second: 38,
+            video_delivered_goodput_bits_per_second: 39,
+            video_soft_ceiling_bits_per_second: 40,
+            video_bitrate_change_sequence: 41,
+            video_bitrate_change_cause: VideoBitrateChangeCause::MildDegradation as u64,
+            video_path_round_trip_micros: 43,
+            video_path_congestion_window_bytes: 44,
+            video_path_lost_packets: 45,
             packetization_completed_at_micros: 22,
             first_send_attempt_at_micros: 23,
             last_send_completed_at_micros: 24,

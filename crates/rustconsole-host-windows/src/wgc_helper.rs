@@ -18,6 +18,8 @@ use windows::Win32::System::Threading::{
 
 const HELLO_MAGIC: u32 = 0x4847_4352;
 const FRAME_MAGIC: u32 = 0x4647_4352;
+const PROTOCOL_VERSION: u32 = 3;
+const COMMAND_RESTART_CAPTURE: u8 = 1;
 const HELLO_SIZE: usize = 252;
 const FRAME_SIZE: usize = 244;
 const HELPER_BYTES: &[u8] = include_bytes!(env!("RUSTCONSOLE_WGC_HELPER"));
@@ -56,7 +58,7 @@ impl WgcHelper {
             return Err("display identity exceeds helper bound".into());
         }
         let mut request = vec![0_u8; 268];
-        request[..4].copy_from_slice(&2_u32.to_le_bytes());
+        request[..4].copy_from_slice(&PROTOCOL_VERSION.to_le_bytes());
         request[4..12].copy_from_slice(&processing_adapter.0.to_le_bytes());
         for (index, value) in name.into_iter().enumerate() {
             request[12 + index * 2..14 + index * 2].copy_from_slice(&value.to_le_bytes());
@@ -73,7 +75,7 @@ impl WgcHelper {
             }
             format!("WGC helper hello failed: {error}; exit code {exit_code:#010x}")
         })?;
-        if u32_at(&hello, 0) != HELLO_MAGIC || u32_at(&hello, 4) != 2 {
+        if u32_at(&hello, 0) != HELLO_MAGIC || u32_at(&hello, 4) != PROTOCOL_VERSION {
             return Err("WGC helper returned an invalid protocol header".into());
         }
         if hello[8..24] != connection.connection_token {
@@ -171,6 +173,11 @@ impl WgcHelper {
             cross_adapter_copy_micros: u64_at(&frame, 36),
             color_conversion_micros: u64_at(&frame, 44),
         }))
+    }
+
+    pub fn restart_capture(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        (&self.connection.channel).write_all(&[COMMAND_RESTART_CAPTURE])?;
+        Ok(())
     }
 }
 

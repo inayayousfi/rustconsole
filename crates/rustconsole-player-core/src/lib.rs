@@ -391,6 +391,15 @@ pub struct PayloadIntegritySample {
     pub readback_bytes: u64,
     pub luma_psnr_millidecibels: u64,
     pub luma_mean_absolute_error_ppm: u64,
+    pub source_luma_change_ppm: u64,
+    pub video_target_bitrate_bits_per_second: u64,
+    pub video_delivered_goodput_bits_per_second: u64,
+    pub video_soft_ceiling_bits_per_second: u64,
+    pub video_bitrate_change_sequence: u64,
+    pub video_bitrate_change_cause: u64,
+    pub video_path_round_trip_micros: u64,
+    pub video_path_congestion_window_bytes: u64,
+    pub video_path_lost_packets: u64,
     pub packetization_completed_at_micros: u64,
     pub first_send_attempt_at_micros: u64,
     pub last_send_completed_at_micros: u64,
@@ -835,11 +844,14 @@ pub struct StreamTransportStatistics {
 
 #[derive(Clone, Copy, Debug)]
 pub struct VideoStreamSample {
+    pub sequence: u64,
+    pub keyframe: bool,
     pub encoded_frame_bytes: usize,
     pub target_bitrate_bits_per_second: u64,
     pub estimated_capacity_bits_per_second: u64,
     pub soft_ceiling_bits_per_second: Option<u64>,
     pub round_trip_time: Duration,
+    pub received_chunks: u64,
     pub lost_chunks: u64,
     pub late_chunks: u64,
     pub assembly_overflows: u64,
@@ -851,11 +863,14 @@ impl VideoStreamSample {
     #[must_use]
     pub fn from_frame(frame: &VideoFramePayload, transport: StreamTransportStatistics) -> Self {
         Self {
+            sequence: frame.sequence,
+            keyframe: frame.keyframe,
             encoded_frame_bytes: frame.payload.len(),
             target_bitrate_bits_per_second: frame.target_bitrate_bits_per_second,
             estimated_capacity_bits_per_second: frame.estimated_capacity_bits_per_second,
             soft_ceiling_bits_per_second: frame.soft_ceiling_bits_per_second,
             round_trip_time: transport.round_trip_time,
+            received_chunks: transport.assembly.received_chunks,
             lost_chunks: transport.assembly.lost_chunks,
             late_chunks: transport.assembly.late_chunks,
             assembly_overflows: transport.assembly.assembly_overflows,

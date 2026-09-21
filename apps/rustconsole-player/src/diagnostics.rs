@@ -4,15 +4,16 @@ use serde_json::json;
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const TRACE_QUEUE_CAPACITY: usize = 4_096;
-const TRACE_BYTE_LIMIT: u64 = 16 * 1024 * 1024;
-const RETAINED_SESSIONS: usize = 10;
+const TRACE_SCHEMA_VERSION: u32 = 2;
+const TRACE_CHUNK_MICROS: u64 = 60_000_000;
+const TRACE_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_ANOMALY_ARTIFACTS: u64 = 3;
 const MAX_ANOMALY_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_DISTRIBUTION_SAMPLES: usize = 65_536;
@@ -43,6 +44,8 @@ impl BoundedSamples {
 
 #[derive(Serialize)]
 struct TraceEvent {
+    record_type: &'static str,
+    schema_version: u32,
     elapsed_micros: u64,
     metric: &'static str,
     value: u64,
@@ -54,21 +57,114 @@ struct TraceEvent {
     includes: Option<&'static str>,
 }
 
+#[derive(Clone, Copy)]
+pub struct VideoFrameTrace {
+    pub sequence: u64,
+    pub keyframe: bool,
+    pub encoded_frame_bytes: u64,
+    pub target_bitrate_bits_per_second: u64,
+    pub delivered_goodput_bits_per_second: u64,
+    pub soft_ceiling_bits_per_second: Option<u64>,
+    pub round_trip_time_micros: u64,
+    pub received_chunks: u64,
+    pub lost_chunks: u64,
+    pub late_chunks: u64,
+    pub assembly_overflows: u64,
+    pub completed_frames: u64,
+    pub incomplete_frames: u64,
+}
+
+#[derive(Clone, Copy)]
+pub struct HostBitrateTrace {
+    pub media_sequence: u64,
+    pub change_sequence: u64,
+    pub cause: u64,
+    pub target_bits_per_second: u64,
+    pub delivered_goodput_bits_per_second: u64,
+    pub soft_ceiling_bits_per_second: u64,
+    pub path_round_trip_micros: u64,
+    pub path_congestion_window_bytes: u64,
+    pub path_lost_packets: u64,
+}
+
+#[derive(Serialize)]
+struct VideoFrameTraceRecord {
+    record_type: &'static str,
+    schema_version: u32,
+    elapsed_micros: u64,
+    sequence: u64,
+    keyframe: bool,
+    encoded_frame_bytes: u64,
+    target_bitrate_bits_per_second: u64,
+    delivered_goodput_bits_per_second: u64,
+    soft_ceiling_bits_per_second: Option<u64>,
+    round_trip_time_micros: u64,
+    received_chunks: u64,
+    lost_chunks: u64,
+    late_chunks: u64,
+    assembly_overflows: u64,
+    completed_frames: u64,
+    incomplete_frames: u64,
+}
+
+#[derive(Serialize)]
+struct CounterTraceRecord {
+    record_type: &'static str,
+    schema_version: u32,
+    elapsed_micros: u64,
+    name: &'static str,
+    value: u64,
+}
+
+#[derive(Serialize)]
+struct BitrateChangeTraceRecord {
+    record_type: &'static str,
+    schema_version: u32,
+    elapsed_micros: u64,
+    sequence: u64,
+    previous_target_bits_per_second: Option<u64>,
+    target_bits_per_second: u64,
+    reason: &'static str,
+}
+
+#[derive(Serialize)]
+struct HostBitrateTraceRecord {
+    record_type: &'static str,
+    schema_version: u32,
+    elapsed_micros: u64,
+    media_sequence: u64,
+    change_sequence: u64,
+    cause: &'static str,
+    cause_code: u64,
+    target_bits_per_second: u64,
+    delivered_goodput_bits_per_second: u64,
+    soft_ceiling_bits_per_second: u64,
+    path_round_trip_micros: u64,
+    path_congestion_window_bytes: u64,
+    path_lost_packets: u64,
+}
+
 enum WorkerMessage {
     Observation(TraceEvent),
     Counter {
+        elapsed_micros: u64,
         name: &'static str,
         value: u64,
     },
     IncrementCounter {
+        elapsed_micros: u64,
         name: &'static str,
     },
     AddCounter {
+        elapsed_micros: u64,
         name: &'static str,
         value: u64,
     },
+    VideoFrame(VideoFrameTraceRecord),
+    HostBitrate(HostBitrateTraceRecord),
     ClockOffset(ClockOffsetEstimate),
     Anomaly {
+        elapsed_micros: u64,
         kind: &'static str,
         media_sequence: Option<u64>,
         values: Vec<(&'static str, u64)>,
@@ -115,6 +211,8 @@ struct DiagnosticSummary {
     trace_sampling_discarded_events: u64,
     trace_bytes: u64,
     trace_byte_limit: u64,
+    trace_manifest: String,
+    trace_chunks: Vec<TraceChunkSummary>,
     aggregation_worker_processing_micros: u64,
     aggregation_worker_events: u64,
     aggregation_worker_worst_event_micros: u64,
@@ -131,6 +229,24 @@ struct DiagnosticSummary {
     notes: &'static [&'static str],
 }
 
+#[derive(Clone, Serialize)]
+struct TraceChunkSummary {
+    index: u64,
+    path: String,
+    start_elapsed_micros: u64,
+    end_elapsed_micros: u64,
+    records: u64,
+    bytes: u64,
+}
+
+#[derive(Serialize)]
+struct TraceManifest {
+    schema_version: u32,
+    session_id: String,
+    chunk_duration_micros: u64,
+    chunks: Vec<TraceChunkSummary>,
+}
+
 struct WorkerOutput {
     summary_path: PathBuf,
 }
@@ -140,13 +256,20 @@ struct WorkerState {
     started: Instant,
     artifact_stem: PathBuf,
     summary_path: PathBuf,
-    trace: BufWriter<File>,
+    trace: Option<BufWriter<File>>,
+    trace_chunk: Option<TraceChunkSummary>,
+    trace_chunks: Vec<TraceChunkSummary>,
+    trace_manifest_path: PathBuf,
+    trace_last_flushed: Instant,
     trace_bytes: u64,
     trace_serialization_failures: u64,
     trace_write_failures: u64,
     trace_byte_cap_discarded_events: u64,
     trace_sampling_discarded_events: u64,
     trace_metric_last_elapsed: BTreeMap<&'static str, u64>,
+    last_video_target_bits_per_second: Option<u64>,
+    last_video_sequence: Option<u64>,
+    last_host_bitrate_change_sequence: Option<u64>,
     metrics: BTreeMap<&'static str, MetricAccumulator>,
     counters: BTreeMap<&'static str, u64>,
     clock_offset: Option<ClockOffsetEstimate>,
@@ -263,6 +386,8 @@ impl LatencyDiagnostics {
         includes: Option<&'static str>,
     ) {
         self.submit(WorkerMessage::Observation(TraceEvent {
+            record_type: "observation",
+            schema_version: TRACE_SCHEMA_VERSION,
             elapsed_micros: elapsed_micros(self.started),
             metric,
             value: micros,
@@ -295,6 +420,8 @@ impl LatencyDiagnostics {
         includes: Option<&'static str>,
     ) {
         self.submit(WorkerMessage::Observation(TraceEvent {
+            record_type: "observation",
+            schema_version: TRACE_SCHEMA_VERSION,
             elapsed_micros: elapsed_micros(self.started),
             metric,
             value,
@@ -308,11 +435,57 @@ impl LatencyDiagnostics {
     }
 
     pub fn counter(&mut self, name: &'static str, value: u64) {
-        self.submit(WorkerMessage::Counter { name, value });
+        self.submit(WorkerMessage::Counter {
+            elapsed_micros: elapsed_micros(self.started),
+            name,
+            value,
+        });
+    }
+
+    pub fn video_frame(&mut self, sample: VideoFrameTrace) {
+        self.submit(WorkerMessage::VideoFrame(VideoFrameTraceRecord {
+            record_type: "video_frame",
+            schema_version: TRACE_SCHEMA_VERSION,
+            elapsed_micros: elapsed_micros(self.started),
+            sequence: sample.sequence,
+            keyframe: sample.keyframe,
+            encoded_frame_bytes: sample.encoded_frame_bytes,
+            target_bitrate_bits_per_second: sample.target_bitrate_bits_per_second,
+            delivered_goodput_bits_per_second: sample.delivered_goodput_bits_per_second,
+            soft_ceiling_bits_per_second: sample.soft_ceiling_bits_per_second,
+            round_trip_time_micros: sample.round_trip_time_micros,
+            received_chunks: sample.received_chunks,
+            lost_chunks: sample.lost_chunks,
+            late_chunks: sample.late_chunks,
+            assembly_overflows: sample.assembly_overflows,
+            completed_frames: sample.completed_frames,
+            incomplete_frames: sample.incomplete_frames,
+        }));
+    }
+
+    pub fn host_bitrate(&mut self, sample: HostBitrateTrace) {
+        self.submit(WorkerMessage::HostBitrate(HostBitrateTraceRecord {
+            record_type: "host_bitrate_change",
+            schema_version: TRACE_SCHEMA_VERSION,
+            elapsed_micros: elapsed_micros(self.started),
+            media_sequence: sample.media_sequence,
+            change_sequence: sample.change_sequence,
+            cause: bitrate_change_cause_name(sample.cause),
+            cause_code: sample.cause,
+            target_bits_per_second: sample.target_bits_per_second,
+            delivered_goodput_bits_per_second: sample.delivered_goodput_bits_per_second,
+            soft_ceiling_bits_per_second: sample.soft_ceiling_bits_per_second,
+            path_round_trip_micros: sample.path_round_trip_micros,
+            path_congestion_window_bytes: sample.path_congestion_window_bytes,
+            path_lost_packets: sample.path_lost_packets,
+        }));
     }
 
     pub fn increment_counter(&mut self, name: &'static str) {
-        self.submit(WorkerMessage::IncrementCounter { name });
+        self.submit(WorkerMessage::IncrementCounter {
+            elapsed_micros: elapsed_micros(self.started),
+            name,
+        });
     }
 
     pub fn observe_full_frame_copy(&mut self, duration_micros: u64, bytes: u64, sequence: u64) {
@@ -325,6 +498,7 @@ impl LatencyDiagnostics {
         );
         self.increment_counter("player_full_frame_copy_count");
         self.submit(WorkerMessage::AddCounter {
+            elapsed_micros: elapsed_micros(self.started),
             name: "player_full_frame_copy_bytes",
             value: bytes,
         });
@@ -338,6 +512,7 @@ impl LatencyDiagnostics {
         values: &[(&'static str, u64)],
     ) {
         self.submit(WorkerMessage::Anomaly {
+            elapsed_micros: elapsed_micros(self.started),
             kind,
             media_sequence,
             values: values.to_vec(),
@@ -382,23 +557,29 @@ fn run_worker(
     receiver: mpsc::Receiver<WorkerMessage>,
 ) -> io::Result<WorkerOutput> {
     fs::create_dir_all(&directory)?;
-    retain_recent_sessions(&directory)?;
     let artifact_stem = directory.join(format!("session-{session_id}"));
     let summary_path = artifact_stem.with_extension("json");
-    let trace_path = artifact_stem.with_extension("jsonl");
-    let trace = BufWriter::new(File::create(trace_path)?);
+    let trace_manifest_path =
+        PathBuf::from(format!("{}-trace-manifest.json", artifact_stem.display()));
     let mut state = WorkerState {
         session_id,
         started,
         artifact_stem,
         summary_path: summary_path.clone(),
-        trace,
+        trace: None,
+        trace_chunk: None,
+        trace_chunks: Vec::new(),
+        trace_manifest_path,
+        trace_last_flushed: Instant::now(),
         trace_bytes: 0,
         trace_serialization_failures: 0,
         trace_write_failures: 0,
         trace_byte_cap_discarded_events: 0,
         trace_sampling_discarded_events: 0,
         trace_metric_last_elapsed: BTreeMap::new(),
+        last_video_target_bits_per_second: None,
+        last_video_sequence: None,
+        last_host_bitrate_change_sequence: None,
         metrics: BTreeMap::new(),
         counters: BTreeMap::new(),
         clock_offset: None,
@@ -415,13 +596,22 @@ fn run_worker(
         overlay,
         overlay_updated_at: Instant::now() - Duration::from_secs(1),
     };
-    while let Ok(message) = receiver.recv() {
-        let event_started = Instant::now();
-        state.process(message);
-        let cost = u64::try_from(event_started.elapsed().as_micros()).unwrap_or(u64::MAX);
-        state.processing_micros = state.processing_micros.saturating_add(cost);
-        state.processed_events = state.processed_events.saturating_add(1);
-        state.worst_processing_micros = state.worst_processing_micros.max(cost);
+    loop {
+        match receiver.recv_timeout(TRACE_FLUSH_INTERVAL) {
+            Ok(message) => {
+                let event_started = Instant::now();
+                state.process(message);
+                let cost = u64::try_from(event_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+                state.processing_micros = state.processing_micros.saturating_add(cost);
+                state.processed_events = state.processed_events.saturating_add(1);
+                state.worst_processing_micros = state.worst_processing_micros.max(cost);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => state.flush_trace(),
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+        if state.trace_last_flushed.elapsed() >= TRACE_FLUSH_INTERVAL {
+            state.flush_trace();
+        }
     }
     state.finish(queue_rejected_events.load(Ordering::Relaxed))?;
     Ok(WorkerOutput { summary_path })
@@ -437,31 +627,85 @@ impl WorkerState {
                 accumulator.samples.observe(event.value);
                 self.write_trace(&event);
             }
-            WorkerMessage::Counter { name, value } => self.set_counter(name, value),
-            WorkerMessage::IncrementCounter { name } => {
+            WorkerMessage::Counter {
+                elapsed_micros,
+                name,
+                value,
+            } => self.set_counter(elapsed_micros, name, value),
+            WorkerMessage::IncrementCounter {
+                elapsed_micros,
+                name,
+            } => {
                 let value = self
                     .counters
                     .get(name)
                     .copied()
                     .unwrap_or(0)
                     .saturating_add(1);
-                self.set_counter(name, value);
+                self.set_counter(elapsed_micros, name, value);
             }
-            WorkerMessage::AddCounter { name, value } => {
+            WorkerMessage::AddCounter {
+                elapsed_micros,
+                name,
+                value,
+            } => {
                 let value = self
                     .counters
                     .get(name)
                     .copied()
                     .unwrap_or(0)
                     .saturating_add(value);
-                self.set_counter(name, value);
+                self.set_counter(elapsed_micros, name, value);
+            }
+            WorkerMessage::VideoFrame(record) => {
+                let restarted = self
+                    .last_video_sequence
+                    .is_some_and(|sequence| record.sequence <= sequence);
+                self.last_video_sequence = Some(record.sequence);
+                let previous = if restarted {
+                    self.last_video_target_bits_per_second =
+                        Some(record.target_bitrate_bits_per_second);
+                    None
+                } else {
+                    self.last_video_target_bits_per_second
+                        .replace(record.target_bitrate_bits_per_second)
+                };
+                if previous != Some(record.target_bitrate_bits_per_second) {
+                    let reason = previous.map_or("startup", |previous| {
+                        if record.target_bitrate_bits_per_second < previous {
+                            "congestion"
+                        } else {
+                            "healthy_delivery"
+                        }
+                    });
+                    self.write_trace_record(
+                        record.elapsed_micros,
+                        &BitrateChangeTraceRecord {
+                            record_type: "bitrate_change",
+                            schema_version: TRACE_SCHEMA_VERSION,
+                            elapsed_micros: record.elapsed_micros,
+                            sequence: record.sequence,
+                            previous_target_bits_per_second: previous,
+                            target_bits_per_second: record.target_bitrate_bits_per_second,
+                            reason,
+                        },
+                    );
+                }
+                self.write_trace_record(record.elapsed_micros, &record);
+            }
+            WorkerMessage::HostBitrate(record) => {
+                if self.last_host_bitrate_change_sequence != Some(record.change_sequence) {
+                    self.last_host_bitrate_change_sequence = Some(record.change_sequence);
+                    self.write_trace_record(record.elapsed_micros, &record);
+                }
             }
             WorkerMessage::ClockOffset(estimate) => self.clock_offset = Some(estimate),
             WorkerMessage::Anomaly {
+                elapsed_micros,
                 kind,
                 media_sequence,
                 values,
-            } => self.write_anomaly(kind, media_sequence, &values),
+            } => self.write_anomaly(elapsed_micros, kind, media_sequence, &values),
         }
         if self.overlay_updated_at.elapsed() >= Duration::from_millis(500) {
             self.refresh_overlay();
@@ -469,8 +713,20 @@ impl WorkerState {
         }
     }
 
-    fn set_counter(&mut self, name: &'static str, value: u64) {
+    fn set_counter(&mut self, elapsed: u64, name: &'static str, value: u64) {
         let previous = self.counters.insert(name, value).unwrap_or(0);
+        if value != previous {
+            self.write_trace_record(
+                elapsed,
+                &CounterTraceRecord {
+                    record_type: "counter",
+                    schema_version: TRACE_SCHEMA_VERSION,
+                    elapsed_micros: elapsed,
+                    name,
+                    value,
+                },
+            );
+        }
         if value > previous
             && matches!(
                 name,
@@ -500,7 +756,12 @@ impl WorkerState {
                     | "input_pointer_mode_rejections"
             )
         {
-            self.write_anomaly(name, None, &[("previous", previous), ("current", value)]);
+            self.write_anomaly(
+                elapsed,
+                name,
+                None,
+                &[("previous", previous), ("current", value)],
+            );
         }
     }
 
@@ -516,27 +777,88 @@ impl WorkerState {
         }
         self.trace_metric_last_elapsed
             .insert(event.metric, event.elapsed_micros);
+        self.write_trace_record(event.elapsed_micros, event);
+    }
+
+    fn write_trace_record<T: Serialize>(&mut self, elapsed: u64, record: &T) {
         let mut bytes = Vec::with_capacity(256);
-        if serde_json::to_writer(&mut bytes, event).is_err() {
+        if serde_json::to_writer(&mut bytes, record).is_err() {
             self.trace_serialization_failures = self.trace_serialization_failures.saturating_add(1);
             return;
         }
         bytes.push(b'\n');
         let length = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-        if self.trace_bytes.saturating_add(length) > TRACE_BYTE_LIMIT {
-            self.trace_byte_cap_discarded_events =
-                self.trace_byte_cap_discarded_events.saturating_add(1);
+        if self.ensure_trace_chunk(elapsed).is_err() {
+            self.trace_write_failures = self.trace_write_failures.saturating_add(1);
             return;
         }
-        if self.trace.write_all(&bytes).is_err() {
+        let Some(trace) = self.trace.as_mut() else {
+            self.trace_write_failures = self.trace_write_failures.saturating_add(1);
+            return;
+        };
+        if trace.write_all(&bytes).is_err() {
             self.trace_write_failures = self.trace_write_failures.saturating_add(1);
             return;
         }
         self.trace_bytes = self.trace_bytes.saturating_add(length);
+        if let Some(chunk) = self.trace_chunk.as_mut() {
+            chunk.end_elapsed_micros = elapsed;
+            chunk.records = chunk.records.saturating_add(1);
+            chunk.bytes = chunk.bytes.saturating_add(length);
+        }
+    }
+
+    fn ensure_trace_chunk(&mut self, elapsed: u64) -> io::Result<()> {
+        let index = elapsed / TRACE_CHUNK_MICROS;
+        if let Some(chunk) = self.trace_chunk.as_ref()
+            && chunk.index >= index
+        {
+            return Ok(());
+        }
+        self.finish_trace_chunk()?;
+        let path = PathBuf::from(format!(
+            "{}-trace-{index:05}.jsonl",
+            self.artifact_stem.display()
+        ));
+        self.trace = Some(BufWriter::new(File::create(&path)?));
+        self.trace_chunk = Some(TraceChunkSummary {
+            index,
+            path: path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default()
+                .to_owned(),
+            start_elapsed_micros: elapsed,
+            end_elapsed_micros: elapsed,
+            records: 0,
+            bytes: 0,
+        });
+        self.trace_last_flushed = Instant::now();
+        Ok(())
+    }
+
+    fn flush_trace(&mut self) {
+        if let Some(trace) = self.trace.as_mut()
+            && trace.flush().is_err()
+        {
+            self.trace_write_failures = self.trace_write_failures.saturating_add(1);
+        }
+        self.trace_last_flushed = Instant::now();
+    }
+
+    fn finish_trace_chunk(&mut self) -> io::Result<()> {
+        if let Some(mut trace) = self.trace.take() {
+            trace.flush()?;
+        }
+        if let Some(chunk) = self.trace_chunk.take() {
+            self.trace_chunks.push(chunk);
+        }
+        Ok(())
     }
 
     fn write_anomaly(
         &mut self,
+        elapsed: u64,
         kind: &'static str,
         media_sequence: Option<u64>,
         values: &[(&'static str, u64)],
@@ -553,7 +875,7 @@ impl WorkerState {
         let artifact = json!({
             "kind": kind,
             "media_sequence": media_sequence,
-            "elapsed_micros": elapsed_micros(self.started),
+            "elapsed_micros": elapsed,
             "values": values.iter().copied().collect::<BTreeMap<_, _>>(),
             "content": "numeric diagnostics only; no frame or audio payload",
         });
@@ -623,7 +945,16 @@ impl WorkerState {
     }
 
     fn finish(&mut self, queue_rejected_events: u64) -> io::Result<()> {
-        self.trace.flush()?;
+        self.finish_trace_chunk()?;
+        let manifest = TraceManifest {
+            schema_version: TRACE_SCHEMA_VERSION,
+            session_id: self.session_id.clone(),
+            chunk_duration_micros: TRACE_CHUNK_MICROS,
+            chunks: self.trace_chunks.clone(),
+        };
+        let mut manifest_writer = BufWriter::new(File::create(&self.trace_manifest_path)?);
+        serde_json::to_writer_pretty(&mut manifest_writer, &manifest)?;
+        manifest_writer.flush()?;
         let metrics = self
             .metrics
             .iter()
@@ -653,7 +984,14 @@ impl WorkerState {
             trace_byte_cap_discarded_events: self.trace_byte_cap_discarded_events,
             trace_sampling_discarded_events: self.trace_sampling_discarded_events,
             trace_bytes: self.trace_bytes,
-            trace_byte_limit: TRACE_BYTE_LIMIT,
+            trace_byte_limit: 0,
+            trace_manifest: self
+                .trace_manifest_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default()
+                .to_owned(),
+            trace_chunks: self.trace_chunks.clone(),
             aggregation_worker_processing_micros: self.processing_micros,
             aggregation_worker_events: self.processed_events,
             aggregation_worker_worst_event_micros: self.worst_processing_micros,
@@ -748,32 +1086,25 @@ fn diagnostic_directory() -> PathBuf {
     )
 }
 
-fn retain_recent_sessions(directory: &Path) -> io::Result<()> {
-    let mut summaries = fs::read_dir(directory)?
-        .filter_map(Result::ok)
-        .filter_map(|entry| {
-            let name = entry.file_name();
-            let name = name.to_str()?;
-            (name.starts_with("session-") && name.ends_with(".json")).then(|| entry.path())
-        })
-        .collect::<Vec<_>>();
-    summaries.sort_unstable();
-    let remove_count = summaries.len().saturating_sub(RETAINED_SESSIONS - 1);
-    for summary in summaries.into_iter().take(remove_count) {
-        let stem = summary.with_extension("");
-        let _ = fs::remove_file(&summary);
-        let _ = fs::remove_file(stem.with_extension("jsonl"));
-        if let Some(stem) = stem.to_str() {
-            for number in 1..=MAX_ANOMALY_ARTIFACTS {
-                let _ = fs::remove_file(format!("{stem}-anomaly-{number}.anomaly"));
-            }
-        }
-    }
-    Ok(())
-}
-
 fn elapsed_micros(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
+}
+
+fn bitrate_change_cause_name(cause: u64) -> &'static str {
+    use rustconsole_protocol::diagnostics::VideoBitrateChangeCause;
+    match cause {
+        value if value == VideoBitrateChangeCause::Startup as u64 => "startup",
+        value if value == VideoBitrateChangeCause::HealthyDelivery as u64 => "healthy_delivery",
+        value if value == VideoBitrateChangeCause::MildDegradation as u64 => "mild_degradation",
+        value if value == VideoBitrateChangeCause::SevereReceiverLoss as u64 => {
+            "severe_receiver_loss"
+        }
+        value if value == VideoBitrateChangeCause::SeverePathPressure as u64 => {
+            "severe_path_pressure"
+        }
+        value if value == VideoBitrateChangeCause::SenderCongestion as u64 => "sender_congestion",
+        _ => "unknown",
+    }
 }
 
 #[cfg(test)]
@@ -806,6 +1137,17 @@ mod tests {
         assert_eq!(summary.p95_micros, Some(5));
         assert_eq!(summary.p99_micros, Some(1));
         assert_eq!(summary.worst_micros, Some(1));
+    }
+
+    #[test]
+    fn bitrate_change_causes_have_readable_trace_names() {
+        use rustconsole_protocol::diagnostics::VideoBitrateChangeCause;
+
+        assert_eq!(
+            bitrate_change_cause_name(VideoBitrateChangeCause::MildDegradation as u64),
+            "mild_degradation"
+        );
+        assert_eq!(bitrate_change_cause_name(u64::MAX), "unknown");
     }
 
     #[test]
@@ -844,6 +1186,7 @@ mod tests {
         for (kind, value) in [("first", 1), ("first", 2), ("second", 3)] {
             sender
                 .send(WorkerMessage::Anomaly {
+                    elapsed_micros: value,
                     kind,
                     media_sequence: None,
                     values: vec![("value", value)],
@@ -860,6 +1203,81 @@ mod tests {
         assert_eq!(summary["anomaly_artifacts_deduplicated"], 1);
         assert!(directory.join("session-test-anomaly-1.anomaly").is_file());
         assert!(directory.join("session-test-anomaly-2.anomaly").is_file());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn worker_rotates_readable_unbounded_trace_chunks_by_elapsed_minute() {
+        let directory = std::env::temp_dir().join(format!(
+            "rustconsole-diagnostic-chunk-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let overlay = Arc::new(Mutex::new(String::new()));
+        let rejected = Arc::new(AtomicU64::new(0));
+        let (sender, receiver) = mpsc::sync_channel(8);
+        let worker = thread::spawn({
+            let directory = directory.clone();
+            move || {
+                run_worker(
+                    directory,
+                    "chunks".into(),
+                    Instant::now(),
+                    overlay,
+                    rejected,
+                    receiver,
+                )
+            }
+        });
+        for (elapsed, sequence) in [(1, 1), (TRACE_CHUNK_MICROS + 1, 2)] {
+            sender
+                .send(WorkerMessage::VideoFrame(VideoFrameTraceRecord {
+                    record_type: "video_frame",
+                    schema_version: TRACE_SCHEMA_VERSION,
+                    elapsed_micros: elapsed,
+                    sequence,
+                    keyframe: false,
+                    encoded_frame_bytes: 1_000,
+                    target_bitrate_bits_per_second: 10_000_000,
+                    delivered_goodput_bits_per_second: 9_000_000,
+                    soft_ceiling_bits_per_second: None,
+                    round_trip_time_micros: 8_000,
+                    received_chunks: sequence,
+                    lost_chunks: 0,
+                    late_chunks: 0,
+                    assembly_overflows: 0,
+                    completed_frames: sequence,
+                    incomplete_frames: 0,
+                }))
+                .unwrap();
+        }
+        drop(sender);
+        worker.join().unwrap().unwrap();
+
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &fs::read(directory.join("session-chunks-trace-manifest.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest["schema_version"], TRACE_SCHEMA_VERSION);
+        assert_eq!(manifest["chunks"].as_array().unwrap().len(), 2);
+        for index in 0..=1 {
+            let path = directory.join(format!("session-chunks-trace-{index:05}.jsonl"));
+            let trace = fs::read_to_string(path).unwrap();
+            let record: serde_json::Value = trace
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .find(|record: &serde_json::Value| record["record_type"] == "video_frame")
+                .unwrap();
+            assert_eq!(record["sequence"], index + 1);
+        }
+        let summary: serde_json::Value =
+            serde_json::from_slice(&fs::read(directory.join("session-chunks.json")).unwrap())
+                .unwrap();
+        assert_eq!(summary["trace_byte_limit"], 0);
+        assert_eq!(summary["trace_byte_cap_discarded_events"], 0);
         fs::remove_dir_all(directory).unwrap();
     }
 }

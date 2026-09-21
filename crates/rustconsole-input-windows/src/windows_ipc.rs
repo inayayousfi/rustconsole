@@ -3,6 +3,8 @@ use crate::{
 };
 use core::mem::size_of;
 use core::ptr::null_mut;
+use std::thread;
+use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{
     CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HLOCAL, INVALID_HANDLE_VALUE,
     LocalFree, WAIT_OBJECT_0,
@@ -18,6 +20,8 @@ use windows::core::{BOOL, Error, HSTRING, PCWSTR};
 
 const SDDL_REVISION_1: u32 = 1;
 const IPC_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;LS)";
+const REPORT_RING_BACKPRESSURE_LIMIT: Duration = Duration::from_millis(100);
+const REPORT_RING_RETRY_INTERVAL: Duration = Duration::from_millis(1);
 
 pub struct WindowsRingPair {
     mouse: NamedRing,
@@ -189,7 +193,16 @@ impl NamedRing {
     fn publish(&mut self, report: &[u8]) -> Result<(), WindowsRingError> {
         // SAFETY: this object uniquely owns the producer view for its lifetime.
         let ring = unsafe { &mut *self.view.Value.cast::<SharedReportRing>() };
-        ring.publish(report).map_err(WindowsRingError::Ring)?;
+        let deadline = Instant::now() + REPORT_RING_BACKPRESSURE_LIMIT;
+        loop {
+            match ring.publish(report) {
+                Ok(_) => break,
+                Err(RingError::Full) if Instant::now() < deadline => {
+                    thread::sleep(REPORT_RING_RETRY_INTERVAL);
+                }
+                Err(error) => return Err(WindowsRingError::Ring(error)),
+            }
+        }
         // SAFETY: event is live until this NamedRing is dropped.
         unsafe { SetEvent(self.event) }.map_err(WindowsRingError::Windows)
     }

@@ -411,6 +411,14 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
         return Err("first player command must launch a session".into());
     };
     let mut latency_diagnostics = LatencyDiagnostics::open(launch.latency_diagnostics)?;
+    latency_diagnostics.counter(
+        "video_configured_maximum_bitrate_bits_per_second",
+        launch.maximum_bitrate_bits_per_second,
+    );
+    latency_diagnostics.counter(
+        "video_configured_frames_per_second",
+        u64::from(launch.frames_per_second),
+    );
     for (name, capacity) in [
         ("video_render_queue_capacity", 2),
         ("audio_playback_queue_capacity", 8),
@@ -570,6 +578,25 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
                     redraw = true;
                 }
                 SessionEvent::Statistics(statistics) => {
+                    latency_diagnostics.video_frame(diagnostics::VideoFrameTrace {
+                        sequence: statistics.sequence,
+                        keyframe: statistics.keyframe,
+                        encoded_frame_bytes: statistics.encoded_frame_bytes as u64,
+                        target_bitrate_bits_per_second: statistics.target_bitrate_bits_per_second,
+                        delivered_goodput_bits_per_second: statistics
+                            .estimated_capacity_bits_per_second,
+                        soft_ceiling_bits_per_second: statistics.soft_ceiling_bits_per_second,
+                        round_trip_time_micros: u64::try_from(
+                            statistics.round_trip_time.as_micros(),
+                        )
+                        .unwrap_or(u64::MAX),
+                        received_chunks: statistics.received_chunks,
+                        lost_chunks: statistics.lost_chunks,
+                        late_chunks: statistics.late_chunks,
+                        assembly_overflows: statistics.assembly_overflows,
+                        completed_frames: statistics.completed_frames,
+                        incomplete_frames: statistics.incomplete_frames,
+                    });
                     latency_diagnostics.observe(
                         "image_transport_round_trip",
                         u64::try_from(statistics.round_trip_time.as_micros()).unwrap_or(u64::MAX),
@@ -587,6 +614,10 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
                     );
                     latency_diagnostics.counter(
                         "video_estimated_capacity_bits_per_second",
+                        statistics.estimated_capacity_bits_per_second,
+                    );
+                    latency_diagnostics.counter(
+                        "video_delivered_goodput_bits_per_second",
                         statistics.estimated_capacity_bits_per_second,
                     );
                     overlay.observe(statistics);
@@ -1014,6 +1045,21 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
                             if sample.kind == rustconsole_protocol::diagnostics::MediaKind::Video {
+                                latency_diagnostics.host_bitrate(diagnostics::HostBitrateTrace {
+                                    media_sequence: sample.sequence,
+                                    change_sequence: sample.video_bitrate_change_sequence,
+                                    cause: sample.video_bitrate_change_cause,
+                                    target_bits_per_second: sample
+                                        .video_target_bitrate_bits_per_second,
+                                    delivered_goodput_bits_per_second: sample
+                                        .video_delivered_goodput_bits_per_second,
+                                    soft_ceiling_bits_per_second: sample
+                                        .video_soft_ceiling_bits_per_second,
+                                    path_round_trip_micros: sample.video_path_round_trip_micros,
+                                    path_congestion_window_bytes: sample
+                                        .video_path_congestion_window_bytes,
+                                    path_lost_packets: sample.video_path_lost_packets,
+                                });
                                 for (metric, duration, endpoint) in [
                                     (
                                         "video_capture_wait_and_acquisition",
@@ -1050,6 +1096,59 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
                                         Some("host worker critical path while full diagnostics is enabled"),
                                     );
                                 }
+                                for (name, value, unit) in [
+                                    (
+                                        "video_host_path_round_trip",
+                                        sample.video_path_round_trip_micros,
+                                        "microseconds",
+                                    ),
+                                    (
+                                        "video_host_path_congestion_window",
+                                        sample.video_path_congestion_window_bytes,
+                                        "bytes",
+                                    ),
+                                    (
+                                        "video_host_path_lost_packets",
+                                        sample.video_path_lost_packets,
+                                        "packets",
+                                    ),
+                                    (
+                                        "video_host_target_bitrate",
+                                        sample.video_target_bitrate_bits_per_second,
+                                        "bits-per-second",
+                                    ),
+                                    (
+                                        "video_host_delivered_goodput",
+                                        sample.video_delivered_goodput_bits_per_second,
+                                        "bits-per-second",
+                                    ),
+                                    (
+                                        "video_host_soft_ceiling",
+                                        sample.video_soft_ceiling_bits_per_second,
+                                        "bits-per-second",
+                                    ),
+                                    (
+                                        "video_bitrate_change_sequence_sample",
+                                        sample.video_bitrate_change_sequence,
+                                        "changes",
+                                    ),
+                                    (
+                                        "video_bitrate_change_cause_sample",
+                                        sample.video_bitrate_change_cause,
+                                        "enum",
+                                    ),
+                                ] {
+                                    latency_diagnostics
+                                        .observe_measurement(name, value, unit, sequence);
+                                }
+                                latency_diagnostics.counter(
+                                    "video_bitrate_change_sequence",
+                                    sample.video_bitrate_change_sequence,
+                                );
+                                latency_diagnostics.counter(
+                                    "video_bitrate_change_cause",
+                                    sample.video_bitrate_change_cause,
+                                );
                             }
                             if sample.kind == rustconsole_protocol::diagnostics::MediaKind::Audio {
                                 latency_diagnostics.observe_measurement(
@@ -1088,8 +1187,14 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
                             if sample.quality_present {
-                                let quality_sequence =
-                                    u64::try_from(sample.quality_presentation_timestamp).ok();
+                                let quality_sequence = sequence;
+                                latency_diagnostics.observe_measurement(
+                                    "video_quality_presentation_timestamp",
+                                    u64::try_from(sample.quality_presentation_timestamp)
+                                        .unwrap_or(u64::MAX),
+                                    "frames",
+                                    quality_sequence,
+                                );
                                 latency_diagnostics.observe_classified(
                                     "video_quality_source_readback",
                                     sample.source_readback_micros,
@@ -1138,6 +1243,14 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
                                     quality_sequence,
                                     "derived",
                                     Some("host source and D3D11VA mirror-decoded luma at 5 Hz"),
+                                );
+                                latency_diagnostics.observe_measurement_classified(
+                                    "video_source_luma_change",
+                                    sample.source_luma_change_ppm,
+                                    "parts-per-million-of-range",
+                                    quality_sequence,
+                                    "derived",
+                                    Some("mean absolute luma change between consecutive 5 Hz source samples"),
                                 );
                             }
                             latency_diagnostics.observe_measurement(
@@ -2810,11 +2923,14 @@ mod tests {
     fn overlay_includes_all_transport_counters() {
         let mut overlay = StreamOverlay::new(100_000_000);
         overlay.observe(VideoStreamSample {
+            sequence: 1,
+            keyframe: false,
             encoded_frame_bytes: 125_000,
             target_bitrate_bits_per_second: 5_000_000,
             estimated_capacity_bits_per_second: 8_000_000,
             soft_ceiling_bits_per_second: Some(6_000_000),
             round_trip_time: Duration::from_millis(7),
+            received_chunks: 100,
             lost_chunks: 2,
             late_chunks: 3,
             assembly_overflows: 4,

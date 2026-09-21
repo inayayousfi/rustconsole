@@ -454,8 +454,10 @@ impl MediaWorker {
 
     fn worker_error(&self, stage: &str, error: &dyn std::fmt::Display) -> String {
         let mut exit_code = u32::MAX;
-        // SAFETY: the worker process handle remains owned by this supervisor.
+        // SAFETY: the worker process handle remains owned by this supervisor. A broken pipe can
+        // become visible just before process termination, so allow the exit status to settle.
         let exit = unsafe {
+            windows::Win32::System::Threading::WaitForSingleObject(self._process.get(), 100);
             windows::Win32::System::Threading::GetExitCodeProcess(
                 self._process.get(),
                 &mut exit_code,
@@ -503,7 +505,9 @@ fn worker_hello_is_valid(
 #[expect(dead_code, reason = "consumed by the QUIC media integration")]
 impl MediaWorkerStream {
     pub fn next_audio_event(&self) -> Option<io::Result<AudioWorkerEvent>> {
-        self.audio.pop_timeout(Duration::ZERO)
+        self.audio
+            .pop_timeout(Duration::ZERO)
+            .map(|event| event.map_err(|error| self.worker.event_read_error("audio event", error)))
     }
     pub fn audio_dropped(&self) -> u64 {
         self.audio_dropped.load(Ordering::Relaxed)
@@ -522,7 +526,7 @@ impl MediaWorkerStream {
         self.events
             .pop_timeout(timeout)
             .transpose()
-            .map_err(Into::into)
+            .map_err(|error| self.worker.event_read_error("video event", error).into())
     }
 
     pub fn set_bitrate(&mut self, bitrate_bits_per_second: u64) -> io::Result<()> {
@@ -544,6 +548,10 @@ impl MediaWorkerStream {
             &mut self.worker.command,
             WorkerCommand::RequestVideoKeyframe,
         )
+    }
+
+    pub fn restart_capture(&mut self) -> io::Result<()> {
+        write_command(&mut self.worker.command, WorkerCommand::RestartVideoCapture)
     }
 
     #[must_use]
@@ -707,6 +715,7 @@ fn run_files(
             WorkerCommand::SetVideoBitrate(_)
             | WorkerCommand::SetVideoFrameDivisor(_)
             | WorkerCommand::RequestVideoKeyframe
+            | WorkerCommand::RestartVideoCapture
             | WorkerCommand::StopVideoStream => {
                 write_event(
                     &mut events,
@@ -790,6 +799,10 @@ fn run_video_stream(
                 WorkerCommand::SetVideoBitrate(bitrate) => encoder.set_bitrate(bitrate)?,
                 WorkerCommand::SetVideoFrameDivisor(divisor) => pacer.set_frame_divisor(divisor)?,
                 WorkerCommand::RequestVideoKeyframe => encoder.request_keyframe()?,
+                WorkerCommand::RestartVideoCapture => {
+                    encoder.restart_capture()?;
+                    encoder.request_keyframe()?;
+                }
                 WorkerCommand::StopVideoStream => return Ok(StreamExit::Continue),
                 WorkerCommand::Stop => return Ok(StreamExit::StopWorker),
                 _ => return Err("invalid command received while video stream is active".into()),
@@ -850,7 +863,7 @@ fn run_video_stream(
                     color_conversion_micros: frame.color_conversion_micros,
                     encoder_call_micros: frame.encoder_call_micros,
                     quality: frame.quality.map(|quality| {
-                        crate::worker_protocol::WorkerVideoQuality {
+                        Box::new(crate::worker_protocol::WorkerVideoQuality {
                             presentation_timestamp: quality.presentation_timestamp,
                             source_readback_micros: quality.source_readback_micros,
                             decoded_readback_micros: quality.decoded_readback_micros,
@@ -858,7 +871,8 @@ fn run_video_stream(
                             readback_bytes: quality.readback_bytes,
                             luma_psnr_millidecibels: quality.luma_psnr_millidecibels,
                             luma_mean_absolute_error_ppm: quality.luma_mean_absolute_error_ppm,
-                        }
+                            source_luma_change_ppm: quality.source_luma_change_ppm,
+                        })
                     }),
                     payload: frame.packet.data,
                 },

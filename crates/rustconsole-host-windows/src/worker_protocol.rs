@@ -1,6 +1,6 @@
 use std::io::{self, Read, Write};
 
-pub const VERSION: u16 = 16;
+pub const VERSION: u16 = 17;
 const MAX_PAYLOAD: usize = 16 * 1024 * 1024;
 const COMMAND_STOP: u8 = 2;
 const COMMAND_START_VIDEO_STREAM: u8 = 7;
@@ -10,6 +10,7 @@ const COMMAND_STOP_VIDEO_STREAM: u8 = 10;
 const COMMAND_SET_VIDEO_FRAME_DIVISOR: u8 = 11;
 const COMMAND_PREPARE_VIDEO_STREAM: u8 = 14;
 const COMMAND_DISCOVER_DISPLAYS: u8 = 15;
+const COMMAND_RESTART_VIDEO_CAPTURE: u8 = 16;
 const EVENT_DISPLAY_CATALOG: u8 = 10;
 const EVENT_HELLO: u8 = 1;
 const EVENT_FAILURE: u8 = 5;
@@ -45,6 +46,7 @@ pub enum WorkerCommand {
     SetVideoBitrate(u64),
     SetVideoFrameDivisor(u8),
     RequestVideoKeyframe,
+    RestartVideoCapture,
     StopVideoStream,
     Stop,
 }
@@ -76,7 +78,7 @@ pub enum WorkerEvent {
         cross_adapter_copy_micros: u64,
         color_conversion_micros: u64,
         encoder_call_micros: u64,
-        quality: Option<WorkerVideoQuality>,
+        quality: Option<Box<WorkerVideoQuality>>,
         payload: Vec<u8>,
     },
     VideoConfiguration(WorkerVideoConfiguration),
@@ -94,6 +96,7 @@ pub struct WorkerVideoQuality {
     pub readback_bytes: u64,
     pub luma_psnr_millidecibels: u64,
     pub luma_mean_absolute_error_ppm: u64,
+    pub source_luma_change_ppm: u64,
 }
 
 pub fn write_command(writer: &mut impl Write, command: WorkerCommand) -> io::Result<()> {
@@ -130,6 +133,7 @@ pub fn write_command(writer: &mut impl Write, command: WorkerCommand) -> io::Res
             vec![COMMAND_SET_VIDEO_FRAME_DIVISOR, divisor]
         }
         WorkerCommand::RequestVideoKeyframe => vec![COMMAND_REQUEST_VIDEO_KEYFRAME],
+        WorkerCommand::RestartVideoCapture => vec![COMMAND_RESTART_VIDEO_CAPTURE],
         WorkerCommand::StopVideoStream => vec![COMMAND_STOP_VIDEO_STREAM],
         WorkerCommand::Stop => vec![COMMAND_STOP],
     };
@@ -171,6 +175,7 @@ pub fn read_command(reader: &mut impl Read) -> io::Result<WorkerCommand> {
             Ok(WorkerCommand::SetVideoFrameDivisor(*divisor))
         }
         [COMMAND_REQUEST_VIDEO_KEYFRAME] => Ok(WorkerCommand::RequestVideoKeyframe),
+        [COMMAND_RESTART_VIDEO_CAPTURE] => Ok(WorkerCommand::RestartVideoCapture),
         [COMMAND_STOP_VIDEO_STREAM] => Ok(WorkerCommand::StopVideoStream),
         [COMMAND_STOP] => Ok(WorkerCommand::Stop),
         _ => Err(invalid_data("unknown worker command")),
@@ -247,6 +252,7 @@ pub fn write_event(writer: &mut impl Write, event: &WorkerEvent) -> io::Result<(
                 payload.extend_from_slice(&quality.readback_bytes.to_be_bytes());
                 payload.extend_from_slice(&quality.luma_psnr_millidecibels.to_be_bytes());
                 payload.extend_from_slice(&quality.luma_mean_absolute_error_ppm.to_be_bytes());
+                payload.extend_from_slice(&quality.source_luma_change_ppm.to_be_bytes());
             }
             if let Some(digest) = payload_sha256 {
                 payload.extend_from_slice(digest);
@@ -340,7 +346,7 @@ pub fn read_event(reader: &mut impl Read) -> io::Result<WorkerEvent> {
         Some(EVENT_ENCODED_VIDEO_FRAME) if payload.len() >= 105 => {
             let quality_end = match payload[32] {
                 0 => 105,
-                1 if payload.len() >= 161 => 161,
+                1 if payload.len() >= 169 => 169,
                 _ => return Err(invalid_data("invalid video quality flag")),
             };
             let digest_end = match payload[31] {
@@ -374,24 +380,29 @@ pub fn read_event(reader: &mut impl Read) -> io::Result<WorkerEvent> {
                 cross_adapter_copy_micros: u64::from_be_bytes(payload[81..89].try_into().unwrap()),
                 color_conversion_micros: u64::from_be_bytes(payload[89..97].try_into().unwrap()),
                 encoder_call_micros: u64::from_be_bytes(payload[97..105].try_into().unwrap()),
-                quality: (payload[32] == 1).then(|| WorkerVideoQuality {
-                    presentation_timestamp: i64::from_be_bytes(
-                        payload[105..113].try_into().unwrap(),
-                    ),
-                    source_readback_micros: u64::from_be_bytes(
-                        payload[113..121].try_into().unwrap(),
-                    ),
-                    decoded_readback_micros: u64::from_be_bytes(
-                        payload[121..129].try_into().unwrap(),
-                    ),
-                    scoring_micros: u64::from_be_bytes(payload[129..137].try_into().unwrap()),
-                    readback_bytes: u64::from_be_bytes(payload[137..145].try_into().unwrap()),
-                    luma_psnr_millidecibels: u64::from_be_bytes(
-                        payload[145..153].try_into().unwrap(),
-                    ),
-                    luma_mean_absolute_error_ppm: u64::from_be_bytes(
-                        payload[153..161].try_into().unwrap(),
-                    ),
+                quality: (payload[32] == 1).then(|| {
+                    Box::new(WorkerVideoQuality {
+                        presentation_timestamp: i64::from_be_bytes(
+                            payload[105..113].try_into().unwrap(),
+                        ),
+                        source_readback_micros: u64::from_be_bytes(
+                            payload[113..121].try_into().unwrap(),
+                        ),
+                        decoded_readback_micros: u64::from_be_bytes(
+                            payload[121..129].try_into().unwrap(),
+                        ),
+                        scoring_micros: u64::from_be_bytes(payload[129..137].try_into().unwrap()),
+                        readback_bytes: u64::from_be_bytes(payload[137..145].try_into().unwrap()),
+                        luma_psnr_millidecibels: u64::from_be_bytes(
+                            payload[145..153].try_into().unwrap(),
+                        ),
+                        luma_mean_absolute_error_ppm: u64::from_be_bytes(
+                            payload[153..161].try_into().unwrap(),
+                        ),
+                        source_luma_change_ppm: u64::from_be_bytes(
+                            payload[161..169].try_into().unwrap(),
+                        ),
+                    })
                 }),
                 payload: payload[digest_end..].to_vec(),
             })
@@ -658,6 +669,7 @@ mod tests {
             WorkerCommand::SetVideoBitrate(16_000_000),
             WorkerCommand::SetVideoFrameDivisor(2),
             WorkerCommand::RequestVideoKeyframe,
+            WorkerCommand::RestartVideoCapture,
             WorkerCommand::StopVideoStream,
             WorkerCommand::Stop,
         ] {
@@ -744,7 +756,7 @@ mod tests {
             cross_adapter_copy_micros: 18,
             color_conversion_micros: 19,
             encoder_call_micros: 20,
-            quality: Some(WorkerVideoQuality {
+            quality: Some(Box::new(WorkerVideoQuality {
                 presentation_timestamp: 7,
                 source_readback_micros: 11,
                 decoded_readback_micros: 12,
@@ -752,7 +764,8 @@ mod tests {
                 readback_bytes: 14,
                 luma_psnr_millidecibels: 15,
                 luma_mean_absolute_error_ppm: 16,
-            }),
+                source_luma_change_ppm: 17,
+            })),
             payload: vec![1, 2, 3],
         };
         let mut bytes = Vec::new();

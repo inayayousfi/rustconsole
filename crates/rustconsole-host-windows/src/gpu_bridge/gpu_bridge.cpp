@@ -53,6 +53,8 @@ struct RustConsoleGpuBridge {
     uint32_t reconfiguration_cause = RECONFIGURE_NONE;
     ComPtr<IDXGIOutput6> output;
     ComPtr<IDXGIOutputDuplication> duplication;
+    winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice wgc_device{nullptr};
+    winrt::Windows::Graphics::Capture::GraphicsCaptureItem capture_item{nullptr};
     winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool frame_pool{nullptr};
     winrt::Windows::Graphics::Capture::GraphicsCaptureSession capture_session{nullptr};
     ComPtr<ID3D11Device> capture_device;
@@ -115,6 +117,8 @@ struct RustConsoleGpuBridge {
         // Release WinRT objects before their apartment is uninitialized, including failed setup.
         capture_session = nullptr;
         frame_pool = nullptr;
+        capture_item = nullptr;
+        wgc_device = nullptr;
         if (encoder_texture_outstanding && encoder_mutex) {
             encoder_mutex->ReleaseSync(0);
         }
@@ -125,6 +129,27 @@ struct RustConsoleGpuBridge {
         if (ro_initialized) RoUninitialize();
     }
 };
+
+static HRESULT restart_wgc_capture(RustConsoleGpuBridge* bridge) {
+    if (!bridge || !bridge->normal_desktop || !bridge->wgc_device || !bridge->capture_item)
+        return E_INVALIDARG;
+    failure_stage = "close the previous Windows.Graphics.Capture session";
+    if (bridge->capture_session) bridge->capture_session.Close();
+    if (bridge->frame_pool) bridge->frame_pool.Close();
+    bridge->capture_session = nullptr;
+    bridge->frame_pool = nullptr;
+    failure_stage = "recreate the Windows.Graphics.Capture frame pool";
+    bridge->frame_pool = winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool::CreateFreeThreaded(
+        bridge->wgc_device,
+        winrt::Windows::Graphics::DirectX::DirectXPixelFormat::R16G16B16A16Float,
+        2, bridge->capture_item.Size());
+    failure_stage = "recreate the Windows.Graphics.Capture session";
+    bridge->capture_session = bridge->frame_pool.CreateCaptureSession(bridge->capture_item);
+    failure_stage = "restart the Windows.Graphics.Capture session";
+    bridge->capture_session.StartCapture();
+    failure_stage = nullptr;
+    return S_OK;
+}
 
 static HRESULT input_desktop_is_normal(bool* normal) {
     HDESK desktop = OpenInputDesktop(0, FALSE, DESKTOP_READOBJECTS);
@@ -448,25 +473,17 @@ static HRESULT initialize_bridge(
         failure_stage = "create the Windows Runtime Direct3D capture device";
         if (FAILED(result = CreateDirect3D11DeviceFromDXGIDevice(
                        dxgi_device.Get(), inspectable_device.put()))) return result;
-        auto direct3d_device = inspectable_device.as<
+        bridge->wgc_device = inspectable_device.as<
             winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice>();
         failure_stage = "activate Windows.Graphics.Capture interop";
         auto interop = winrt::get_activation_factory<
             winrt::Windows::Graphics::Capture::GraphicsCaptureItem,
             IGraphicsCaptureItemInterop>();
-        winrt::Windows::Graphics::Capture::GraphicsCaptureItem item{nullptr};
         failure_stage = "create the Windows.Graphics.Capture monitor item";
         if (FAILED(result = interop->CreateForMonitor(
                        basic_output_description.Monitor,
                        winrt::guid_of<winrt::Windows::Graphics::Capture::GraphicsCaptureItem>(),
-                       winrt::put_abi(item)))) return result;
-        failure_stage = "create the Windows.Graphics.Capture frame pool";
-        bridge->frame_pool = winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool::CreateFreeThreaded(
-            direct3d_device,
-            winrt::Windows::Graphics::DirectX::DirectXPixelFormat::R16G16B16A16Float,
-            2, item.Size());
-        failure_stage = "create the Windows.Graphics.Capture session";
-        bridge->capture_session = bridge->frame_pool.CreateCaptureSession(item);
+                       winrt::put_abi(bridge->capture_item)))) return result;
     } else {
         failure_stage = "create Desktop Duplication for secure desktop";
         ComPtr<IDXGIOutput1> output1;
@@ -670,8 +687,7 @@ static HRESULT initialize_bridge(
     }
 
     if (normal_desktop) {
-        failure_stage = "start the Windows.Graphics.Capture session";
-        bridge->capture_session.StartCapture();
+        if (FAILED(result = restart_wgc_capture(bridge))) return result;
     }
 
     bridge->encoder_device.CopyTo(encoder_device);
@@ -962,6 +978,16 @@ extern "C" HRESULT rustconsole_gpu_bridge_capture_external(
             bridge, timeout_millis, nullptr, last_present_time,
             accumulated_frames, protected_content_masked, capture_acquisition_micros,
             cross_adapter_copy_micros, color_conversion_micros, true);
+    } catch (...) {
+        return winrt::to_hresult();
+    }
+}
+
+extern "C" HRESULT rustconsole_gpu_bridge_restart_capture(
+    RustConsoleGpuBridge* bridge) {
+    if (!bridge) return E_POINTER;
+    try {
+        return restart_wgc_capture(bridge);
     } catch (...) {
         return winrt::to_hresult();
     }

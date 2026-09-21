@@ -88,6 +88,59 @@ fn shutdown_channel() -> (SyncSender<()>, Receiver<()>) {
     sync_channel(1)
 }
 
+#[cfg(any(windows, test))]
+const CAPTURE_STALL_LIMIT: std::time::Duration = std::time::Duration::from_secs(1);
+#[cfg(any(windows, test))]
+const POINTER_ACTIVITY_RECENCY: std::time::Duration = std::time::Duration::from_millis(250);
+
+#[cfg(any(windows, test))]
+struct CaptureFreshnessMonitor {
+    last_present_time: Option<i64>,
+    last_fresh_frame_at: std::time::Instant,
+    pointer_sequence_at_last_fresh_frame: u64,
+}
+
+#[cfg(any(windows, test))]
+impl CaptureFreshnessMonitor {
+    fn new(now: std::time::Instant) -> Self {
+        Self {
+            last_present_time: None,
+            last_fresh_frame_at: now,
+            pointer_sequence_at_last_fresh_frame: 0,
+        }
+    }
+
+    fn observe(
+        &mut self,
+        present_time: i64,
+        pointer_sequence: u64,
+        pointer_activity_at: Option<std::time::Instant>,
+        now: std::time::Instant,
+    ) -> Option<std::time::Duration> {
+        if self.last_present_time != Some(present_time) {
+            self.last_present_time = Some(present_time);
+            self.last_fresh_frame_at = now;
+            self.pointer_sequence_at_last_fresh_frame = pointer_sequence;
+            return None;
+        }
+
+        let stale_for = now.saturating_duration_since(self.last_fresh_frame_at);
+        let recent_pointer_activity = pointer_activity_at.is_some_and(|activity| {
+            activity >= self.last_fresh_frame_at
+                && now.saturating_duration_since(activity) <= POINTER_ACTIVITY_RECENCY
+        });
+        if stale_for < CAPTURE_STALL_LIMIT
+            || pointer_sequence <= self.pointer_sequence_at_last_fresh_frame
+            || !recent_pointer_activity
+        {
+            return None;
+        }
+        self.last_fresh_frame_at = now;
+        self.pointer_sequence_at_last_fresh_frame = pointer_sequence;
+        Some(stale_for)
+    }
+}
+
 #[cfg(windows)]
 mod windows {
     use super::*;
@@ -806,7 +859,12 @@ mod windows {
         };
 
         let (control_tx, control_rx) = std::sync::mpsc::sync_channel(16);
-        let latest_input = Arc::new(Mutex::new((0_u64, 0_u64)));
+        let latest_input = Arc::new(Mutex::new(LatestInput {
+            sequence: 0,
+            submitted_at_micros: 0,
+            pointer_sequence: 0,
+            pointer_activity_at: None,
+        }));
         let (audio_state_tx, mut audio_state_rx) =
             tokio::sync::watch::channel(wire::AudioStreamState::new(
                 0,
@@ -993,7 +1051,16 @@ mod windows {
                         .transpose()?
                         .unwrap_or(0);
                     let mut last_ack = None;
+                    let mut latest_pointer_sequence = None;
                     for transition in pack.transitions {
+                        let pointer_sequence = matches!(
+                            transition.action,
+                            Some(
+                                wire::input_transition::Action::PointerMotion(_)
+                                    | wire::input_transition::Action::PointerPosition(_)
+                            )
+                        )
+                        .then_some(transition.sequence);
                         if full_diagnostics {
                             reliable_transitions_received =
                                 reliable_transitions_received.saturating_add(1);
@@ -1051,6 +1118,9 @@ mod windows {
                             reliable_transitions_applied =
                                 reliable_transitions_applied.saturating_add(1);
                         }
+                        if pointer_sequence.is_some() {
+                            latest_pointer_sequence = pointer_sequence;
+                        }
                         last_ack = Some(ack);
                     }
                     let mut ack =
@@ -1080,10 +1150,16 @@ mod windows {
                         ack.pointer_mode_rejections = pointer_mode_rejections;
                         ack.pointer_relative_baselines = pointer_relative_baselines;
                     }
-                    *latest_input
+                    let mut latest_input = latest_input
                         .lock()
-                        .unwrap_or_else(|error| error.into_inner()) =
-                        (ack.through_sequence, ack.host_submitted_at_micros);
+                        .unwrap_or_else(|error| error.into_inner());
+                    latest_input.sequence = ack.through_sequence;
+                    latest_input.submitted_at_micros = ack.host_submitted_at_micros;
+                    if let Some(sequence) = latest_pointer_sequence {
+                        latest_input.pointer_sequence = sequence;
+                        latest_input.pointer_activity_at = Some(Instant::now());
+                    }
+                    drop(latest_input);
                     if let Err(error) = response_tx.try_send(Envelope {
                         body: Some(envelope::Body::InputAck(ack)),
                     }) {
@@ -1331,6 +1407,14 @@ mod windows {
         ReconfigurationRequired(wire::VideoReconfigurationCause),
     }
 
+    #[derive(Clone, Copy)]
+    struct LatestInput {
+        sequence: u64,
+        submitted_at_micros: u64,
+        pointer_sequence: u64,
+        pointer_activity_at: Option<Instant>,
+    }
+
     struct DiagnosticReportSink<'a, S> {
         inner: &'a mut S,
         mouse_reports: u64,
@@ -1432,6 +1516,15 @@ mod windows {
             luma_psnr_millidecibels: quality.map_or(0, |quality| quality.luma_psnr_millidecibels),
             luma_mean_absolute_error_ppm: quality
                 .map_or(0, |quality| quality.luma_mean_absolute_error_ppm),
+            source_luma_change_ppm: quality.map_or(0, |quality| quality.source_luma_change_ppm),
+            video_target_bitrate_bits_per_second: 0,
+            video_delivered_goodput_bits_per_second: 0,
+            video_soft_ceiling_bits_per_second: 0,
+            video_bitrate_change_sequence: 0,
+            video_bitrate_change_cause: 0,
+            video_path_round_trip_micros: 0,
+            video_path_congestion_window_bytes: 0,
+            video_path_lost_packets: 0,
             packetization_completed_at_micros: 0,
             first_send_attempt_at_micros: 0,
             last_send_completed_at_micros: 0,
@@ -1480,13 +1573,15 @@ mod windows {
         controls: std::sync::mpsc::Receiver<WorkerVideoControl>,
         enable_audio: bool,
         audio_state: tokio::sync::watch::Sender<wire::AudioStreamState>,
-        latest_input: Arc<Mutex<(u64, u64)>>,
+        latest_input: Arc<Mutex<LatestInput>>,
         diagnostic_tx: Option<DiagnosticSender>,
     ) -> Result<WorkerVideoExit, Box<dyn std::error::Error + Send + Sync>> {
         let _audio_recovery = AudioRecoveryGuard;
         let frames_per_second = selected.frames_per_second;
         let bitrate_bits_per_second = selected.maximum_bitrate_bits_per_second;
         let mut video_policy = HostVideoStreamPolicy::new(bitrate_bits_per_second);
+        let mut bitrate_change_sequence = 0_u64;
+        let mut bitrate_change_cause = rustconsole_host_core::VideoBitrateChangeCause::Startup;
         let clock = crate::clock::HostClock::new()?;
         let (_shutdown_tx, shutdown_rx) = shutdown_channel();
         let Some(mut stream) = worker
@@ -1512,6 +1607,7 @@ mod windows {
         let frame_period =
             frame_period(frames_per_second).ok_or("video stream frame rate is zero")?;
         let mut observed_worker_drops = stream.dropped_events();
+        let mut capture_freshness = CaptureFreshnessMonitor::new(Instant::now());
         loop {
             loop {
                 match controls.try_recv() {
@@ -1527,6 +1623,7 @@ mod windows {
                                 lost_packets: path.lost_packets,
                             },
                             VideoDeliveryReport {
+                                received_chunks: report.received_chunks,
                                 completed_payload_bytes: report.completed_payload_bytes,
                                 measurement_interval_micros: report.measurement_interval_micros,
                                 lost_chunks: report.lost_chunks,
@@ -1536,6 +1633,8 @@ mod windows {
                             },
                         );
                         if let Some(change) = change {
+                            bitrate_change_sequence = bitrate_change_sequence.saturating_add(1);
+                            bitrate_change_cause = change.cause;
                             stream.set_bitrate(change.target_bits_per_second)?;
                         }
                     }
@@ -1553,6 +1652,8 @@ mod windows {
             if worker_drops > observed_worker_drops {
                 observed_worker_drops = worker_drops;
                 if let Some(change) = video_policy.observe_worker_queue_drop() {
+                    bitrate_change_sequence = bitrate_change_sequence.saturating_add(1);
+                    bitrate_change_cause = change.cause;
                     stream.set_bitrate(change.target_bits_per_second)?;
                 }
             }
@@ -1735,6 +1836,8 @@ mod windows {
             if !video_pending.is_empty() && video_started.elapsed() >= send_deadline {
                 video_pending.clear();
                 if let Some(change) = video_policy.observe_send_deadline_expired() {
+                    bitrate_change_sequence = bitrate_change_sequence.saturating_add(1);
+                    bitrate_change_cause = change.cause;
                     stream.set_bitrate(change.target_bits_per_second)?;
                 }
                 if let Some(record) = video_pending_diagnostic.take() {
@@ -1766,6 +1869,23 @@ mod windows {
                         ..
                     } => {
                         let service_received_at_micros = clock.now()?;
+                        let latest_input = *latest_input
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner());
+                        if let Some(stale_for) = capture_freshness.observe(
+                            last_present_time,
+                            latest_input.pointer_sequence,
+                            latest_input.pointer_activity_at,
+                            Instant::now(),
+                        ) {
+                            eprintln!(
+                                "restarting stale capture in place: stale_micros={} pointer_sequence={}",
+                                stale_for.as_micros(),
+                                latest_input.pointer_sequence,
+                            );
+                            stream.restart_capture()?;
+                            continue;
+                        }
                         if !video_policy.accept_encoded_frame(sequence, keyframe) {
                             continue;
                         }
@@ -1773,13 +1893,10 @@ mod windows {
                             return Err("QUIC peer does not support datagrams".into());
                         };
                         let captured_at_micros = clock.ticks_to_micros(last_present_time)?;
-                        let (input_sequence, input_submitted_at_micros) = *latest_input
-                            .lock()
-                            .unwrap_or_else(|error| error.into_inner());
-                        let input_sequence = if input_submitted_at_micros != 0
-                            && captured_at_micros >= input_submitted_at_micros
+                        let input_sequence = if latest_input.submitted_at_micros != 0
+                            && captured_at_micros >= latest_input.submitted_at_micros
                         {
-                            input_sequence
+                            latest_input.sequence
                         } else {
                             0
                         };
@@ -1812,7 +1929,7 @@ mod windows {
                             0,
                             0,
                             0,
-                            quality,
+                            quality.map(|quality| *quality),
                         )?;
                         let frame = HostEncodedVideoFrame {
                             sequence,
@@ -1829,6 +1946,19 @@ mod windows {
                             video_datagram_version,
                         )?;
                         if let Some(record) = prepared_diagnostic.as_mut() {
+                            let path = connection.stats().path;
+                            record.video_target_bitrate_bits_per_second =
+                                video_policy.target_bits_per_second();
+                            record.video_delivered_goodput_bits_per_second =
+                                video_policy.estimated_capacity_bits_per_second();
+                            record.video_soft_ceiling_bits_per_second =
+                                video_policy.soft_ceiling_bits_per_second().unwrap_or(0);
+                            record.video_bitrate_change_sequence = bitrate_change_sequence;
+                            record.video_bitrate_change_cause = bitrate_change_cause as u64;
+                            record.video_path_round_trip_micros =
+                                u64::try_from(path.rtt.as_micros()).unwrap_or(u64::MAX);
+                            record.video_path_congestion_window_bytes = path.cwnd;
+                            record.video_path_lost_packets = path.lost_packets;
                             record.packetization_completed_at_micros = clock.now()?;
                         }
                         video_pending = datagrams.into_iter().map(bytes::Bytes::from).collect();
@@ -2080,6 +2210,71 @@ fn bgra_bmp(width: u32, height: u32, pixels: &[u8]) -> std::io::Result<Vec<u8>> 
 mod tests {
     use super::*;
     use std::sync::mpsc::TrySendError;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn static_capture_without_pointer_activity_does_not_restart() {
+        let started = Instant::now();
+        let mut freshness = CaptureFreshnessMonitor::new(started);
+
+        assert_eq!(freshness.observe(7, 0, None, started), None);
+        assert_eq!(
+            freshness.observe(7, 0, None, started + Duration::from_secs(2)),
+            None
+        );
+    }
+
+    #[test]
+    fn recent_pointer_activity_restarts_stale_capture_in_place() {
+        let started = Instant::now();
+        let mut freshness = CaptureFreshnessMonitor::new(started);
+
+        assert_eq!(freshness.observe(7, 10, None, started), None);
+        assert_eq!(
+            freshness.observe(
+                7,
+                11,
+                Some(started + Duration::from_millis(950)),
+                started + Duration::from_millis(1_050),
+            ),
+            Some(Duration::from_millis(1_050))
+        );
+        assert_eq!(
+            freshness.observe(
+                7,
+                11,
+                Some(started + Duration::from_millis(950)),
+                started + Duration::from_millis(1_100),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn fresh_capture_resets_the_stall_window_and_input_baseline() {
+        let started = Instant::now();
+        let mut freshness = CaptureFreshnessMonitor::new(started);
+
+        assert_eq!(freshness.observe(7, 10, None, started), None);
+        assert_eq!(
+            freshness.observe(
+                8,
+                11,
+                Some(started + Duration::from_secs(1)),
+                started + Duration::from_secs(1),
+            ),
+            None
+        );
+        assert_eq!(
+            freshness.observe(
+                8,
+                11,
+                Some(started + Duration::from_secs(1)),
+                started + Duration::from_secs(2),
+            ),
+            None
+        );
+    }
 
     #[test]
     fn duplicate_shutdown_signal_never_blocks_the_control_handler() {

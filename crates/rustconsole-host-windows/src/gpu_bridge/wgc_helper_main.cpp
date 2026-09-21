@@ -51,6 +51,8 @@ static_assert(sizeof(HelperFrame) == 244);
 
 static constexpr uint32_t HELLO_MAGIC = 0x48474352;
 static constexpr uint32_t FRAME_MAGIC = 0x46474352;
+static constexpr uint32_t PROTOCOL_VERSION = 3;
+static constexpr uint8_t COMMAND_RESTART_CAPTURE = 1;
 
 static bool decode_token(const wchar_t* text, std::array<uint8_t, 16>* token) {
     if (!text || wcslen(text) != 32) return false;
@@ -111,7 +113,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     }
 
     HelperRequest request{};
-    if (!read_all(pipe, &request, sizeof(request)) || request.version != 2 ||
+    if (!read_all(pipe, &request, sizeof(request)) || request.version != PROTOCOL_VERSION ||
         !request.display_id[0] || request.display_id[127] != 0) {
         CloseHandle(pipe);
         return 5;
@@ -120,7 +122,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     ID3D11Device* device = nullptr;
     HelperHello hello{};
     hello.magic = HELLO_MAGIC;
-    hello.version = 2;
+    hello.version = PROTOCOL_VERSION;
     hello.token = token;
     hello.result = rustconsole_gpu_bridge_create(
         &bridge, &device, TRUE, request.display_id, request.processing_adapter, &hello.width, &hello.height,
@@ -142,6 +144,23 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         return 5;
     }
     for (;;) {
+        DWORD available = 0;
+        if (!PeekNamedPipe(pipe, nullptr, 0, nullptr, &available, nullptr)) break;
+        if (available != 0) {
+            uint8_t command = 0;
+            if (!read_all(pipe, &command, sizeof(command)) || command != COMMAND_RESTART_CAPTURE)
+                break;
+            HelperFrame restarted{};
+            restarted.magic = FRAME_MAGIC;
+            restarted.result = rustconsole_gpu_bridge_restart_capture(bridge);
+            if (FAILED(restarted.result)) {
+                restarted.reconfiguration_cause = rustconsole_gpu_bridge_reconfiguration_cause(bridge);
+                copy_stage(restarted.failure_stage);
+                write_all(pipe, &restarted, sizeof(restarted));
+                break;
+            }
+            continue;
+        }
         HelperFrame frame{};
         frame.magic = FRAME_MAGIC;
         frame.result = rustconsole_gpu_bridge_capture_external(
