@@ -32,6 +32,7 @@ pub struct PlayerGui {
     input: egui::RawInput,
     diagnostics_visible: bool,
     control_rects: [Option<egui::Rect>; 3],
+    diagnostics_rect: Option<egui::Rect>,
 }
 
 impl PlayerGui {
@@ -106,6 +107,9 @@ impl PlayerGui {
             .iter()
             .flatten()
             .any(|rectangle| rectangle.contains(position))
+            || self
+                .diagnostics_rect
+                .is_some_and(|rectangle| rectangle.contains(position))
     }
 
     pub fn reset_renderer(&mut self) {
@@ -116,6 +120,7 @@ impl PlayerGui {
         if view.pointer_captured {
             self.input.events.clear();
             self.control_rects = [None; 3];
+            self.diagnostics_rect = None;
             return (
                 GuiFrame {
                     pixels_per_point: self.context.pixels_per_point(),
@@ -128,42 +133,49 @@ impl PlayerGui {
         let mut action = None;
         let mut diagnostics_visible = self.diagnostics_visible;
         let mut control_rects = self.control_rects;
+        let mut diagnostics_rect = None;
         let context = self.context.clone();
         let output = context.run(std::mem::take(&mut self.input), |context| {
-            egui::TopBottomPanel::top("player-controls")
-                .frame(
-                    egui::Frame::side_top_panel(&context.style())
-                        .fill(egui::Color32::from_black_alpha(210)),
-                )
+            let screen = context.content_rect();
+            let controls_top = 24.0_f32.min((screen.height() - 48.0).max(0.0));
+            let details_top = controls_top + 44.0;
+            egui::Area::new("player-controls".into())
+                .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, controls_top))
+                .default_size(egui::vec2(124.0, 36.0))
+                .movable(false)
                 .show(context, |ui| {
-                    ui.horizontal(|ui| {
-                        let controls_width = 96.0 + 2.0 * ui.spacing().item_spacing.x;
-                        ui.add_space(((ui.available_width() - controls_width) / 2.0).max(0.0));
-                        let (clicked, rectangle) = fullscreen_button(ui, view.fullscreen);
-                        control_rects[0] = Some(rectangle);
-                        if clicked {
-                            action = Some(PlayerGuiAction::ToggleFullscreen);
-                        }
-                        let (clicked, rectangle) = pointer_capture_button(
-                            ui,
-                            view.pointer_capture_available,
-                            view.pointer_captured,
-                        );
-                        control_rects[1] = Some(rectangle);
-                        if clicked {
-                            action = Some(PlayerGuiAction::CapturePointer);
-                        }
-                        let (clicked, rectangle) = diagnostics_button(ui, diagnostics_visible);
-                        control_rects[2] = Some(rectangle);
-                        if clicked {
-                            diagnostics_visible = !diagnostics_visible;
-                        }
-                    });
+                    egui::Frame::popup(ui.style())
+                        .fill(egui::Color32::from_black_alpha(210))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                let (clicked, rectangle) = fullscreen_button(ui, view.fullscreen);
+                                control_rects[0] = Some(rectangle);
+                                if clicked {
+                                    action = Some(PlayerGuiAction::ToggleFullscreen);
+                                }
+                                let (clicked, rectangle) = pointer_capture_button(
+                                    ui,
+                                    view.pointer_capture_available,
+                                    view.pointer_captured,
+                                );
+                                control_rects[1] = Some(rectangle);
+                                if clicked {
+                                    action = Some(PlayerGuiAction::CapturePointer);
+                                }
+                                let (clicked, rectangle) =
+                                    diagnostics_button(ui, diagnostics_visible);
+                                control_rects[2] = Some(rectangle);
+                                if clicked {
+                                    diagnostics_visible = !diagnostics_visible;
+                                }
+                            });
+                        });
                 });
 
             if let Some(status) = view.status {
                 egui::Area::new("player-status".into())
-                    .anchor(egui::Align2::LEFT_TOP, egui::vec2(12.0, 52.0))
+                    .anchor(egui::Align2::LEFT_TOP, egui::vec2(12.0, details_top))
+                    .movable(false)
                     .show(context, |ui| {
                         egui::Frame::popup(ui.style()).show(ui, |ui| {
                             ui.label(egui::RichText::new(status).monospace());
@@ -172,20 +184,41 @@ impl PlayerGui {
             }
 
             if diagnostics_visible {
-                egui::Area::new("player-diagnostics".into())
-                    .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-12.0, 52.0))
+                let panel_size = egui::vec2(
+                    (screen.width() - 48.0).clamp(1.0, 600.0),
+                    (screen.height() - details_top - 32.0).max(1.0),
+                );
+                let panel = egui::Area::new("player-diagnostics".into())
+                    .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-12.0, details_top))
+                    .default_size(panel_size + egui::vec2(12.0, 12.0))
+                    .movable(false)
                     .show(context, |ui| {
                         egui::Frame::popup(ui.style()).show(ui, |ui| {
-                            ui.add(
-                                egui::Label::new(egui::RichText::new(view.diagnostics).monospace())
-                                    .wrap_mode(egui::TextWrapMode::Extend),
-                            );
+                            // Reserve the viewport before laying out scrollable content
+                            // so the automatically sized area cannot collapse around it.
+                            ui.set_min_size(panel_size);
+                            ui.set_max_size(panel_size);
+                            egui::ScrollArea::both()
+                                .id_salt("diagnostics-scroll")
+                                .auto_shrink([false, false])
+                                .max_width(panel_size.x)
+                                .max_height(panel_size.y)
+                                .show(ui, |ui| {
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(view.diagnostics).monospace(),
+                                        )
+                                        .wrap_mode(egui::TextWrapMode::Extend),
+                                    );
+                                });
                         });
                     });
+                diagnostics_rect = Some(panel.response.rect);
             }
         });
         self.diagnostics_visible = diagnostics_visible;
         self.control_rects = control_rects;
+        self.diagnostics_rect = diagnostics_rect;
         (output, action)
     }
 }
@@ -373,6 +406,10 @@ mod tests {
         let right = gui.control_rects[2].unwrap();
         let center = (left.left() + right.right()) / 2.0;
         assert!((center - 640.0).abs() < 0.5, "control center was {center}");
+        assert!(
+            left.top() >= 24.0 && left.top() < 40.0,
+            "buttons must have the selected top gap"
+        );
     }
 
     #[test]
@@ -384,11 +421,75 @@ mod tests {
         assert!(!gui.captures_pointer_at(500.0, 10.0));
     }
 
+    #[test]
+    fn long_diagnostics_stay_on_screen_scroll_and_capture_pointer_input() {
+        let mut gui = prepared_gui();
+        click_center(&mut gui, 2);
+        let text = (0..100)
+            .map(|line| format!("Diagnostic line {line}\n"))
+            .collect::<String>();
+        let view = PlayerGuiView {
+            diagnostics: &text,
+            ..view()
+        };
+        let _ = gui.frame(view);
+        gui.update_viewport(1280.0, 720.0, 1.0, 0.3);
+        let (before, _) = gui.frame(view);
+        let panel = gui.diagnostics_rect.unwrap();
+        assert!(panel.top() >= 68.0 && panel.top() < 80.0);
+        assert!(panel.bottom() <= 720.0);
+        assert!(
+            panel.width() >= 600.0,
+            "diagnostics must not collapse horizontally"
+        );
+        assert!(
+            panel.height() >= 600.0,
+            "long diagnostics need a usable scroll viewport"
+        );
+        let center = panel.center();
+        assert!(gui.captures_pointer_at(center.x, center.y));
+        assert!(!gui.captures_pointer_at(100.0, 360.0));
+        let text_y = |frame: &GuiFrame| {
+            frame
+                .shapes
+                .iter()
+                .find_map(|shape| {
+                    if let egui::epaint::Shape::Text(text) = &shape.shape
+                        && text.galley.job.text.starts_with("Diagnostic line 0")
+                    {
+                        return Some(text.pos.y);
+                    }
+                    None
+                })
+                .expect("diagnostics must produce text")
+        };
+        gui.pointer_moved(center.x, center.y);
+        gui.update_viewport(1280.0, 720.0, 1.0, 0.35);
+        let _ = gui.frame(view);
+        gui.mouse_wheel(0.0, -5.0);
+        gui.update_viewport(1280.0, 720.0, 1.0, 0.4);
+        let _ = gui.frame(view);
+        gui.update_viewport(1280.0, 720.0, 1.0, 0.45);
+        let (after, _) = gui.frame(view);
+        assert!(
+            text_y(&after) < text_y(&before),
+            "wheel input must scroll the diagnostics"
+        );
+        click_center(&mut gui, 2);
+        let _ = gui.frame(view);
+        assert!(
+            !gui.captures_pointer_at(center.x, center.y),
+            "hidden diagnostics must not block game input"
+        );
+    }
+
     fn prepared_gui() -> PlayerGui {
         let mut gui = PlayerGui::default();
         gui.update_viewport(1280.0, 720.0, 1.0, 0.0);
         let _ = gui.frame(view());
         gui.update_viewport(1280.0, 720.0, 1.0, 0.1);
+        let _ = gui.frame(view());
+        gui.update_viewport(1280.0, 720.0, 1.0, 0.2);
         gui
     }
 

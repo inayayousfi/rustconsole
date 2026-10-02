@@ -1969,7 +1969,7 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
             let diagnostics = if gui.diagnostics_visible() {
                 let mut text = overlay.text("Streaming");
                 if latency_diagnostics.enabled() {
-                    text.push('\n');
+                    text.push_str("\n\n");
                     text.push_str(&latency_diagnostics.overlay_text());
                 }
                 text
@@ -2910,9 +2910,12 @@ impl StreamOverlay {
             .host_link
             .filter(|(_, at)| at.elapsed() < Duration::from_secs(5))
             .map_or(PhysicalLinkKind::Unknown, |(link, _)| link);
-        let video = format!(
-            "{RENDERING_BACKEND_LABEL}\n{state}\nFPS {:5.1}\nEncoded rate (0.5s) {:5.2} Mbit/s\nDelivered rate (1s avg) {:5.2} Mbit/s\nEncoder target {:5.2} Mbit/s\nConfigured maximum {:.0} Mbit/s\nLearned soft ceiling {}\nVideo capture to presentation {}\nInput acknowledgement {}\nNetwork: {} | player {} | host {}{}\nComplete {}  Incomplete {}\nLost {}  Late {}  Overflow {}",
-            self.statistics.frames_per_second,
+        let stream = format!(
+            "Stream\n{RENDERING_BACKEND_LABEL}\n{state}\nFPS {:5.1}",
+            self.statistics.frames_per_second
+        );
+        let bitrates = format!(
+            "Bitrates\nEncoded rate (0.5s) {:5.2} Mbit/s\nDelivered rate (1s avg) {:5.2} Mbit/s\nEncoder target {:5.2} Mbit/s\nConfigured maximum {:.0} Mbit/s\nDelivery ceiling {}\nLatency ceiling {}{}",
             self.statistics.encoded_megabits_per_second,
             self.delivered_megabits_per_second,
             self.target_megabits_per_second,
@@ -2920,10 +2923,41 @@ impl StreamOverlay {
             self.soft_ceiling_megabits_per_second
                 .map(|ceiling| format!("{ceiling:.2} Mbit/s"))
                 .unwrap_or_else(|| "not established".to_owned()),
+            self.latency_status.map_or_else(
+                || "not established".to_owned(),
+                |status| format_soft_ceiling(status.ceiling_bits_per_second)
+            ),
+            if self.audio.is_some() {
+                "\nAudio bitrate 128 kbit/s"
+            } else {
+                ""
+            },
+        );
+        let delays = format!(
+            "Latencies\nVideo capture to presentation {}\nInput acknowledgement {}{}",
             self.video_latency_text(),
             self.input_round_trip
                 .map(|duration| format!("{:5.1} ms", duration.as_secs_f64() * 1_000.0))
                 .unwrap_or_else(|| "waiting".to_owned()),
+            if self.audio.is_some() {
+                format!(
+                    "\nAudio output queue {} ms",
+                    self.audio_playback.queued_micros / 1_000
+                )
+            } else {
+                String::new()
+            },
+        );
+        let latency_control = self.latency_status.map_or_else(|| "Latency control: calibrating".to_owned(), |status| {
+            format!("Highest delay pressure {:.0}%  Preference score {:.3}\nLatency measurements: {}{}",
+                f64::from(status.highest_pressure_ppm) / 10_000.0,
+                f64::from(status.score_ppm) / 1_000_000.0,
+                if status.measurements_ready { "ready" } else { "calibrating or unavailable" },
+                if status.uses_estimates { " (includes estimates)" } else { "" },
+            )
+        });
+        let network = format!(
+            "Network\nRoute: {} | player {} | host {}{}",
             self.network_path.kind.name(),
             link_name(self.network_path.local_link),
             link_name(host_link),
@@ -2938,22 +2972,45 @@ impl StreamOverlay {
             } else {
                 ""
             },
+        );
+        let video_delivery = format!(
+            "Video delivery\nComplete {}  Incomplete {}\nLost {}  Late {}  Overflow {}{}",
             self.completed_frames,
             self.incomplete_frames,
             self.statistics.lost_chunks,
             self.statistics.late_chunks,
             self.statistics.assembly_overflows,
+            self.audio
+                .as_ref()
+                .map_or_else(String::new, |audio| format!(
+                    "\nVideo queue drops {}",
+                    audio.video_queue_drops
+                )),
         );
-        let latency = self.latency_status.map_or_else(|| "Latency control: calibrating".to_owned(), |status| {
-            format!("Latency ceiling {}\nHighest delay pressure {:.0}%  Preference score {:.3}\nLatency measurements: {}{}",
-                format_soft_ceiling(status.ceiling_bits_per_second),
-                f64::from(status.highest_pressure_ppm) / 10_000.0,
-                f64::from(status.score_ppm) / 1_000_000.0,
-                if status.measurements_ready { "ready" } else { "calibrating or unavailable" },
-                if status.uses_estimates { " (includes estimates)" } else { "" },
-            )
-        });
-        format!("{video}\n{latency}\n{}", self.audio_text())
+        format!(
+            "{stream}\n\n{bitrates}\n\n{delays}\n{latency_control}\n\n{network}\n\n{video_delivery}\n\n{}\n\nAudio playback\n{}",
+            self.audio_delivery_text(),
+            self.audio_text()
+        )
+    }
+
+    fn audio_delivery_text(&self) -> String {
+        let Some(audio) = &self.audio else {
+            return "Audio delivery\nNegotiating".to_owned();
+        };
+        let stats = audio.receive;
+        format!(
+            "Audio delivery\nAudio packets {}  Host drops {}  Missing {}\nAudio expired {}  Network overflow {}  Late {}\nAudio duplicate {}  Invalid {}  Audio queue drops {}",
+            stats.completed_packets,
+            audio.host.dropped_packets,
+            stats.missing_packets,
+            stats.expired_packets,
+            stats.overflow_packets,
+            stats.late_fragments,
+            stats.duplicate_fragments,
+            stats.malformed_fragments,
+            audio.audio_queue_drops,
+        )
     }
 
     fn audio_text(&self) -> String {
@@ -2969,7 +3026,6 @@ impl StreamOverlay {
             5 => "stopped",
             _ => "unknown state",
         };
-        let stats = audio.receive;
         let detail = if !self.audio_playback.detail.is_empty() {
             format!("\nAudio detail: {}", self.audio_playback.detail)
         } else if audio.host.detail.is_empty() {
@@ -2985,18 +3041,7 @@ impl StreamOverlay {
             format!("SDL {}", self.audio_playback.device_name)
         };
         format!(
-            "Audio: {status}; {output}\nOpus stereo 48 kHz  10 ms  128 kbit/s  SDL queue {} ms\nAudio packets {}  Host drops {}  Missing {}\nAudio expired {}  Network overflow {}  Late {}\nAudio duplicate {}  Invalid {}  Video queue drops {}  Audio queue drops {}\nPlayback pending {}  Queue drops {}  Late drops {}  Device drops {}  Underruns {}  Resets {}{detail}",
-            self.audio_playback.queued_micros / 1_000,
-            stats.completed_packets,
-            audio.host.dropped_packets,
-            stats.missing_packets,
-            stats.expired_packets,
-            stats.overflow_packets,
-            stats.late_fragments,
-            stats.duplicate_fragments,
-            stats.malformed_fragments,
-            audio.video_queue_drops,
-            audio.audio_queue_drops,
+            "Audio: {status}; {output}\nOpus stereo 48 kHz  Packet duration 10 ms\nPlayback pending {}  Queue drops {}  Late drops {}  Device drops {}  Underruns {}  Resets {}{detail}",
             self.audio_playback.pending_packets,
             self.audio_playback.queue_drops,
             self.audio_playback.late_drops,
@@ -3172,6 +3217,49 @@ mod tests {
     }
 
     #[test]
+    fn summary_groups_rates_delays_and_delivery_without_losing_values() {
+        let mut overlay = StreamOverlay::new(20_000_000);
+        overlay.audio = Some(rustconsole_player_core::AudioTransportSnapshot::default());
+        overlay.audio_playback.queued_micros = 12_000;
+        overlay.latency_status = Some(rustconsole_protocol::latency::LatencyControlStatus {
+            ceiling_bits_per_second: Some(4_000_000),
+            measurements_ready: true,
+            ..Default::default()
+        });
+        overlay.observe_video_presentation(1, Some(Duration::from_millis(40)));
+        let text = overlay.text("Streaming");
+        let sections: Vec<_> = text.split("\n\n").collect();
+        assert_eq!(
+            sections
+                .iter()
+                .map(|section| section.lines().next().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "Stream",
+                "Bitrates",
+                "Latencies",
+                "Network",
+                "Video delivery",
+                "Audio delivery",
+                "Audio playback"
+            ]
+        );
+        assert!(sections[1].contains("Configured maximum 20 Mbit/s"));
+        assert!(sections[1].contains("Delivery ceiling not established"));
+        assert!(sections[1].contains("Latency ceiling 4.00 Mbit/s"));
+        assert!(sections[1].contains("Audio bitrate 128 kbit/s"));
+        assert!(sections[2].contains("Video capture to presentation 40.0 ms"));
+        assert!(sections[2].contains("Audio output queue 12 ms"));
+        assert!(sections[2].contains("Latency measurements: ready"));
+        assert!(sections[4].contains("Video queue drops 0"));
+        assert!(sections[5].contains("Audio packets 0"));
+        assert!(sections[5].contains("Audio queue drops 0"));
+        assert!(sections[6].contains("SDL output disabled"));
+        assert!(sections[6].contains("Packet duration 10 ms"));
+        assert!(sections[6].contains("Underruns 0  Resets 0"));
+    }
+
+    #[test]
     fn overlay_includes_all_transport_counters() {
         let mut overlay = StreamOverlay::new(100_000_000);
         overlay.observe(VideoStreamSample {
@@ -3191,9 +3279,9 @@ mod tests {
         });
         overlay.input_round_trip = Some(Duration::from_millis(11));
         let text = overlay.text("Streaming");
-        assert!(text.starts_with("Rendering backend: Vulkan\nStreaming\n"));
+        assert!(text.starts_with("Stream\nRendering backend: Vulkan\nStreaming\n"));
         assert!(text.contains(
-            "Encoded rate (0.5s)  0.00 Mbit/s\nDelivered rate (1s avg)  8.00 Mbit/s\nEncoder target  5.00 Mbit/s\nConfigured maximum 100 Mbit/s\nLearned soft ceiling 6.00 Mbit/s"
+            "Encoded rate (0.5s)  0.00 Mbit/s\nDelivered rate (1s avg)  8.00 Mbit/s\nEncoder target  5.00 Mbit/s\nConfigured maximum 100 Mbit/s\nDelivery ceiling 6.00 Mbit/s"
         ));
         assert!(text.contains("Video capture to presentation unavailable"));
         assert!(text.contains("Input acknowledgement  11.0 ms"));
@@ -3294,11 +3382,9 @@ mod tests {
             local_link: PhysicalLinkKind::Wifi,
         };
         overlay.host_link = Some((PhysicalLinkKind::Ethernet, Instant::now()));
-        assert!(
-            overlay.text("Streaming").contains(
-                "Network: Tailscale direct | player Wi-Fi | host Ethernet (internet route)"
-            )
-        );
+        assert!(overlay.text("Streaming").contains(
+            "Network\nRoute: Tailscale direct | player Wi-Fi | host Ethernet (internet route)"
+        ));
 
         overlay.host_link = Some((
             PhysicalLinkKind::Ethernet,

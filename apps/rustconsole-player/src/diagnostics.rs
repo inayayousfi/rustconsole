@@ -907,41 +907,16 @@ impl WorkerState {
     }
 
     fn refresh_overlay(&self) {
-        let mut lines = vec!["Full diagnostics active".to_owned()];
-        if let Some(ceiling) = self
-            .counters
-            .get("video_learned_soft_ceiling_bits_per_second")
-        {
-            lines.push(if *ceiling == 0 {
-                "Learned soft ceiling: not established".to_owned()
-            } else {
-                format!(
-                    "Learned soft ceiling: {:.2} Mbit/s",
-                    *ceiling as f64 / 1_000_000.0
-                )
-            });
-        }
-        for (name, accumulator) in &self.metrics {
-            let values = accumulator.samples.sorted();
-            if !values.is_empty() {
-                lines.push(format!(
-                    "{name}: p50 {} p99 {} {}",
-                    percentile(&values, 50),
-                    percentile(&values, 99),
-                    accumulator.unit.unwrap_or("units")
-                ));
-            }
-        }
-        if let Some(clock) = self.clock_offset {
-            lines.push(format!(
-                "clock: offset {} us +/-{} us",
-                clock.offset_micros, clock.uncertainty_micros
-            ));
-        }
         *self
             .overlay
             .lock()
-            .unwrap_or_else(|error| error.into_inner()) = lines.join("\n");
+            .unwrap_or_else(|error| error.into_inner()) = diagnostic_overlay_text(
+            &self.metrics,
+            self.counters
+                .get("video_learned_soft_ceiling_bits_per_second")
+                .copied(),
+            self.clock_offset,
+        );
     }
 
     fn finish(&mut self, queue_rejected_events: u64) -> io::Result<()> {
@@ -1032,6 +1007,92 @@ impl WorkerState {
         serde_json::to_writer_pretty(&mut writer, &summary)?;
         writer.flush()
     }
+}
+
+fn diagnostic_metric_group(name: &str, unit: &str) -> (u8, &'static str) {
+    if unit == "bits-per-second" || name.contains("bitrate") {
+        (0, "Bitrates")
+    } else if name.contains("quality") || name.contains("luma") {
+        (6, "Video quality")
+    } else if unit == "microseconds" {
+        if name.starts_with("audio_") {
+            (2, "Audio latencies")
+        } else if name.starts_with("input_") || name.contains("_input_") {
+            (3, "Input latencies")
+        } else if name.starts_with("video_")
+            || matches!(
+                name,
+                "decode" | "frame_assembly" | "decode_queue_to_present"
+            )
+            || name.starts_with("host_capture_")
+            || name.starts_with("host_packetization_")
+        {
+            (1, "Video latencies")
+        } else {
+            (4, "Other timings")
+        }
+    } else if name.contains("queue") || name.contains("buffer") {
+        (7, "Queues and buffering")
+    } else if name.starts_with("network_") || name.contains("_path_") {
+        (5, "Network")
+    } else if name.contains("cpu_load") {
+        (9, "Processing load")
+    } else if name.contains("integrity") || name.contains("hash") || name.contains("diagnostic") {
+        (10, "Integrity and diagnostics")
+    } else if unit == "bytes" {
+        (8, "Frame and packet sizes")
+    } else {
+        (11, "Other measurements")
+    }
+}
+
+fn diagnostic_overlay_text(
+    metrics: &BTreeMap<&'static str, MetricAccumulator>,
+    delivery_ceiling: Option<u64>,
+    clock: Option<ClockOffsetEstimate>,
+) -> String {
+    let mut groups = BTreeMap::<(u8, &'static str), Vec<String>>::new();
+    if let Some(ceiling) = delivery_ceiling {
+        groups
+            .entry((0, "Bitrates"))
+            .or_default()
+            .push(if ceiling == 0 {
+                "Delivery ceiling: not established".to_owned()
+            } else {
+                format!(
+                    "Delivery ceiling: {:.2} Mbit/s",
+                    ceiling as f64 / 1_000_000.0
+                )
+            });
+    }
+    for (name, accumulator) in metrics {
+        let values = accumulator.samples.sorted();
+        if !values.is_empty() {
+            let unit = accumulator.unit.unwrap_or("units");
+            groups
+                .entry(diagnostic_metric_group(name, unit))
+                .or_default()
+                .push(format!(
+                    "{name}: p50 {} p99 {} {unit}",
+                    percentile(&values, 50),
+                    percentile(&values, 99),
+                ));
+        }
+    }
+    if let Some(clock) = clock {
+        groups
+            .entry((12, "Clock alignment"))
+            .or_default()
+            .push(format!(
+                "clock: offset {} us +/-{} us",
+                clock.offset_micros, clock.uncertainty_micros,
+            ));
+    }
+    let mut sections = vec!["Full diagnostics active".to_owned()];
+    for ((_, heading), lines) in groups {
+        sections.push(format!("{heading}\n{}", lines.join("\n")));
+    }
+    sections.join("\n\n")
 }
 
 fn metric_summary(
@@ -1126,6 +1187,63 @@ mod tests {
         assert_eq!(summary.p95_micros, Some(95));
         assert_eq!(summary.p99_micros, Some(99));
         assert_eq!(summary.worst_micros, Some(100));
+    }
+
+    #[test]
+    fn advanced_overlay_groups_metrics_and_preserves_names_values_and_units() {
+        let observations = [
+            ("video_host_target_bitrate", "bits-per-second", "Bitrates"),
+            ("video_render_queue", "microseconds", "Video latencies"),
+            ("audio_decode", "microseconds", "Audio latencies"),
+            ("input_ack_round_trip", "microseconds", "Input latencies"),
+            ("video_host_path_congestion_window", "bytes", "Network"),
+            ("video_luma_mean_absolute_error", "ppm", "Video quality"),
+            (
+                "audio_capture_buffer_frames",
+                "frames",
+                "Queues and buffering",
+            ),
+            (
+                "video_encoded_frame_size",
+                "bytes",
+                "Frame and packet sizes",
+            ),
+            ("player_process_cpu_load", "percent", "Processing load"),
+            ("video_bitrate_change_cause_sample", "enum", "Bitrates"),
+            ("audio_concealed_packets", "packets", "Other measurements"),
+        ];
+        let metrics = observations
+            .iter()
+            .map(|(name, unit, _)| {
+                let mut accumulator = MetricAccumulator {
+                    unit: Some(*unit),
+                    ..Default::default()
+                };
+                accumulator.samples.observe(17);
+                (*name, accumulator)
+            })
+            .collect();
+        let text = diagnostic_overlay_text(
+            &metrics,
+            Some(4_000_000),
+            Some(ClockOffsetEstimate {
+                offset_micros: -10,
+                uncertainty_micros: 3,
+            }),
+        );
+        assert!(
+            text.starts_with("Full diagnostics active\n\nBitrates\nDelivery ceiling: 4.00 Mbit/s")
+        );
+        for (name, unit, heading) in observations {
+            let section = text
+                .split("\n\n")
+                .find(|section| section.lines().next() == Some(heading))
+                .unwrap();
+            let measurement = format!("{name}: p50 17 p99 17 {unit}");
+            assert!(section.lines().any(|line| line == measurement));
+            assert_eq!(text.matches(&measurement).count(), 1);
+        }
+        assert!(text.contains("Clock alignment\nclock: offset -10 us +/-3 us"));
     }
 
     #[test]
