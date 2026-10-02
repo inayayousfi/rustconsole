@@ -98,6 +98,7 @@ struct CaptureFreshnessMonitor {
     last_present_time: Option<i64>,
     last_fresh_frame_at: std::time::Instant,
     pointer_sequence_at_last_fresh_frame: u64,
+    pointer_response_started: Option<std::time::Instant>,
 }
 
 #[cfg(any(windows, test))]
@@ -107,6 +108,7 @@ impl CaptureFreshnessMonitor {
             last_present_time: None,
             last_fresh_frame_at: now,
             pointer_sequence_at_last_fresh_frame: 0,
+            pointer_response_started: None,
         }
     }
 
@@ -121,22 +123,29 @@ impl CaptureFreshnessMonitor {
             self.last_present_time = Some(present_time);
             self.last_fresh_frame_at = now;
             self.pointer_sequence_at_last_fresh_frame = pointer_sequence;
+            self.pointer_response_started = None;
             return None;
         }
 
         let stale_for = now.saturating_duration_since(self.last_fresh_frame_at);
-        let recent_pointer_activity = pointer_activity_at.is_some_and(|activity| {
-            activity >= self.last_fresh_frame_at
-                && now.saturating_duration_since(activity) <= POINTER_ACTIVITY_RECENCY
-        });
-        if stale_for < CAPTURE_STALL_LIMIT
-            || pointer_sequence <= self.pointer_sequence_at_last_fresh_frame
-            || !recent_pointer_activity
+        if self.pointer_response_started.is_none()
+            && pointer_sequence > self.pointer_sequence_at_last_fresh_frame
+            && let Some(activity) = pointer_activity_at.filter(|activity| {
+                *activity >= self.last_fresh_frame_at
+                    && now.saturating_duration_since(*activity) <= POINTER_ACTIVITY_RECENCY
+            })
         {
+            // An old image alone is not a failed response to newly resumed input.
+            // Start once, so continuing movement cannot postpone recovery forever.
+            self.pointer_response_started = Some(activity);
+        }
+        let response_started = self.pointer_response_started?;
+        if now.saturating_duration_since(response_started) < CAPTURE_STALL_LIMIT {
             return None;
         }
         self.last_fresh_frame_at = now;
         self.pointer_sequence_at_last_fresh_frame = pointer_sequence;
+        self.pointer_response_started = None;
         Some(stale_for)
     }
 }
@@ -192,6 +201,7 @@ mod windows {
     const PRODUCTION_QUIC_IPV4_ADDRESS: &str = "0.0.0.0:47999";
     const PRODUCTION_QUIC_IPV6_ADDRESS: &str = "[::]:47999";
     const IPV6_STATUS_REPORT: &str = r"C:\ProgramData\RustConsole\ipv6-status.txt";
+    const BANDWIDTH_PROBE_VERSION: u32 = rustconsole_session::bandwidth_probe::VERSION;
 
     #[derive(Clone, Copy)]
     enum ServiceMode {
@@ -652,6 +662,8 @@ mod windows {
             full_diagnostics,
             host_pointer_release,
             video_datagram_version,
+            bandwidth_probe_version,
+            network_status_version,
         ) = match &request.body {
             Some(envelope::Body::Av1CapabilityOffer(offer)) => (
                 offer
@@ -667,6 +679,8 @@ mod windows {
                 } else {
                     rustconsole_host_core::video_transport::LEGACY_VIDEO_DATAGRAM_VERSION
                 },
+                offer.bandwidth_probe_version,
+                offer.network_status_version.min(1),
             ),
             _ => (
                 None,
@@ -674,8 +688,13 @@ mod windows {
                 false,
                 false,
                 rustconsole_host_core::video_transport::LEGACY_VIDEO_DATAGRAM_VERSION,
+                0,
+                0,
             ),
         };
+        if bandwidth_probe_version != BANDWIDTH_PROBE_VERSION {
+            return Err("viewer does not support the required startup bandwidth probe".into());
+        }
         let display_id = match &request.body {
             Some(envelope::Body::Av1CapabilityOffer(offer)) => offer
                 .display_id
@@ -707,7 +726,7 @@ mod windows {
                     {
                         Ok(None)
                     }
-                    Err(error) => Err(error.to_string()),
+                    Err(error) => Err(format!("launching session controls: {error}")),
                 }
             })
             .await
@@ -767,6 +786,8 @@ mod windows {
                         display_id: display_id.map(|id| id.as_str().to_owned()),
                         dedicated_input_stream,
                         video_datagram_version,
+                        bandwidth_probe_version,
+                        network_status_version,
                         host_pointer_release,
                         full_diagnostics,
                         audio_transport: audio_configuration,
@@ -784,6 +805,8 @@ mod windows {
         selected_wire.host_pointer_release = host_pointer_release;
         selected_wire.dedicated_input_stream = dedicated_input_stream;
         selected_wire.video_datagram_version = video_datagram_version;
+        selected_wire.bandwidth_probe_version = bandwidth_probe_version;
+        selected_wire.network_status_version = network_status_version;
         let player_selection = session_try!(
             "reading player AV1 selection",
             read_envelope(&mut receive).await
@@ -807,6 +830,18 @@ mod windows {
                 Envelope {
                     body: Some(envelope::Body::SelectedAv1Configuration(selected_wire)),
                 },
+            )
+            .await
+        );
+
+        let startup_capacity_bits_per_second = session_try!(
+            "measuring startup bandwidth",
+            rustconsole_session::bandwidth_probe::send(
+                &connection,
+                &mut send,
+                &mut receive,
+                selected.maximum_bitrate_bits_per_second,
+                selected.frames_per_second,
             )
             .await
         );
@@ -887,6 +922,7 @@ mod windows {
                 worker,
                 selected,
                 video_datagram_version,
+                startup_capacity_bits_per_second,
                 control_rx,
                 audio_configuration.is_some(),
                 audio_state_tx,
@@ -926,6 +962,36 @@ mod windows {
                     .map_err(|error| error.to_string())?;
             }
             send.finish().map_err(|error| error.to_string())
+        });
+        let link_reports = response_tx.clone();
+        let peer_address = connection.remote_address().ip();
+        let link_reporter = tokio::spawn(async move {
+            if network_status_version == 0 {
+                return;
+            }
+            let mut updates = tokio::time::interval(Duration::from_secs(1));
+            updates.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                updates.tick().await;
+                let Ok(link) = tokio::task::spawn_blocking(move || {
+                    crate::network_link::host_link(peer_address)
+                })
+                .await
+                else {
+                    break;
+                };
+                if link_reports
+                    .send(Envelope {
+                        body: Some(envelope::Body::NetworkLinkReport(wire::NetworkLinkReport {
+                            host_link: link as i32,
+                        })),
+                    })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
         });
         let (incoming_tx, mut incoming) = tokio::sync::mpsc::channel(8);
         let mut readers = tokio::task::JoinSet::new();
@@ -1227,6 +1293,7 @@ mod windows {
         let _ = control_tx.try_send(WorkerVideoControl::Stop);
         drop(control_tx);
         drop(readers);
+        link_reporter.abort();
         drop(response_tx);
         while let Some(result) = response_writer.join_next().await {
             match result {
@@ -1570,6 +1637,7 @@ mod windows {
         worker: crate::worker::MediaWorker,
         selected: rustconsole_protocol::NegotiatedAv1Configuration,
         video_datagram_version: u32,
+        startup_capacity_bits_per_second: u64,
         controls: std::sync::mpsc::Receiver<WorkerVideoControl>,
         enable_audio: bool,
         audio_state: tokio::sync::watch::Sender<wire::AudioStreamState>,
@@ -1579,7 +1647,10 @@ mod windows {
         let _audio_recovery = AudioRecoveryGuard;
         let frames_per_second = selected.frames_per_second;
         let bitrate_bits_per_second = selected.maximum_bitrate_bits_per_second;
-        let mut video_policy = HostVideoStreamPolicy::new(bitrate_bits_per_second);
+        let mut video_policy = HostVideoStreamPolicy::from_startup_probe(
+            bitrate_bits_per_second,
+            startup_capacity_bits_per_second,
+        );
         let mut bitrate_change_sequence = 0_u64;
         let mut bitrate_change_cause = rustconsole_host_core::VideoBitrateChangeCause::Startup;
         let clock = crate::clock::HostClock::new()?;
@@ -1651,11 +1722,7 @@ mod windows {
             let worker_drops = stream.dropped_events();
             if worker_drops > observed_worker_drops {
                 observed_worker_drops = worker_drops;
-                if let Some(change) = video_policy.observe_worker_queue_drop() {
-                    bitrate_change_sequence = bitrate_change_sequence.saturating_add(1);
-                    bitrate_change_cause = change.cause;
-                    stream.set_bitrate(change.target_bits_per_second)?;
-                }
+                video_policy.observe_worker_queue_drop();
             }
             if video_policy.keyframe_request_due(Instant::now()) {
                 stream.request_keyframe()?;
@@ -2100,6 +2167,8 @@ mod windows {
             dedicated_input_stream: false,
             video_datagram_version:
                 rustconsole_host_core::video_transport::LEGACY_VIDEO_DATAGRAM_VERSION,
+            bandwidth_probe_version: 0,
+            network_status_version: 0,
             host_pointer_release: false,
             full_diagnostics: false,
             audio_transport: None,
@@ -2225,7 +2294,7 @@ mod tests {
     }
 
     #[test]
-    fn recent_pointer_activity_restarts_stale_capture_in_place() {
+    fn stale_capture_recovery_waits_for_a_response_to_one_pointer_update() {
         let started = Instant::now();
         let mut freshness = CaptureFreshnessMonitor::new(started);
 
@@ -2237,16 +2306,118 @@ mod tests {
                 Some(started + Duration::from_millis(950)),
                 started + Duration::from_millis(1_050),
             ),
-            Some(Duration::from_millis(1_050))
+            None
         );
         assert_eq!(
             freshness.observe(
                 7,
                 11,
                 Some(started + Duration::from_millis(950)),
-                started + Duration::from_millis(1_100),
+                started + Duration::from_millis(1_949),
             ),
             None
+        );
+        assert_eq!(
+            freshness.observe(
+                7,
+                11,
+                Some(started + Duration::from_millis(950)),
+                started + Duration::from_millis(1_950),
+            ),
+            Some(Duration::from_millis(1_950))
+        );
+        assert_eq!(
+            freshness.observe(
+                7,
+                11,
+                Some(started + Duration::from_millis(950)),
+                started + Duration::from_secs(3),
+            ),
+            None,
+            "the same input must not trigger repeated restarts"
+        );
+    }
+
+    #[test]
+    fn pointer_resumption_does_not_restart_an_old_capture_immediately() {
+        for focus_gap in [
+            Duration::from_millis(1),
+            Duration::from_secs(1),
+            Duration::from_secs(60),
+        ] {
+            let started = Instant::now();
+            let mut freshness = CaptureFreshnessMonitor::new(started);
+            freshness.observe(7, 10, None, started);
+            let resumed = started + Duration::from_secs(2) + focus_gap;
+            assert_eq!(freshness.observe(7, 10, None, resumed), None);
+            assert_eq!(freshness.observe(7, 11, Some(resumed), resumed), None);
+            assert_eq!(
+                freshness.observe(7, 11, Some(resumed), resumed + Duration::from_millis(16)),
+                None
+            );
+            assert_eq!(
+                freshness.observe(8, 11, Some(resumed), resumed + Duration::from_millis(32)),
+                None
+            );
+            assert_eq!(
+                freshness.observe(8, 11, Some(resumed), resumed + Duration::from_secs(2)),
+                None,
+                "a new source image must cancel pending recovery"
+            );
+        }
+    }
+
+    #[test]
+    fn continuing_pointer_activity_does_not_postpone_stalled_capture_recovery() {
+        let started = Instant::now();
+        let mut freshness = CaptureFreshnessMonitor::new(started);
+        freshness.observe(7, 10, None, started);
+        let first_activity = started + Duration::from_millis(100);
+        for update in 0..10 {
+            let now = first_activity + Duration::from_millis(update * 100);
+            assert_eq!(freshness.observe(7, 11 + update, Some(now), now), None);
+        }
+        let due = first_activity + Duration::from_secs(1);
+        assert_eq!(
+            freshness.observe(7, 21, Some(due), due),
+            Some(Duration::from_millis(1_100))
+        );
+    }
+
+    #[test]
+    fn new_capture_gives_later_input_its_own_response_window() {
+        let started = Instant::now();
+        let mut freshness = CaptureFreshnessMonitor::new(started);
+        freshness.observe(7, 10, None, started);
+        let first_activity = started + Duration::from_secs(2);
+        assert_eq!(
+            freshness.observe(7, 11, Some(first_activity), first_activity),
+            None
+        );
+        let new_capture = first_activity + Duration::from_millis(16);
+        assert_eq!(
+            freshness.observe(8, 11, Some(first_activity), new_capture),
+            None
+        );
+        let next_activity = first_activity + Duration::from_millis(900);
+        assert_eq!(
+            freshness.observe(8, 12, Some(next_activity), next_activity),
+            None
+        );
+        assert_eq!(
+            freshness.observe(
+                8,
+                12,
+                Some(next_activity),
+                first_activity + Duration::from_secs(1)
+            ),
+            None,
+            "recovery must not reuse the previous image's response window"
+        );
+        let due = next_activity + Duration::from_secs(1);
+        assert_eq!(
+            freshness.observe(8, 12, Some(next_activity), due),
+            Some(due.duration_since(new_capture))
         );
     }
 

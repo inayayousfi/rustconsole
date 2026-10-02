@@ -403,8 +403,25 @@ impl GpuCapture {
                 };
                 Some((metadata, 0, 0, 0))
             }
-            Err(error) if error.code == DXGI_ERROR_ACCESS_LOST.0 => None,
-            Err(error) if error.code == DXGI_ERROR_WAIT_TIMEOUT.0 => {
+            Err(error)
+                if error
+                    .downcast_ref::<VideoReconfigurationRequired>()
+                    .is_some() =>
+            {
+                return Err(error);
+            }
+            Err(error)
+                if error
+                    .downcast_ref::<BridgeError>()
+                    .is_some_and(|error| error.code == DXGI_ERROR_ACCESS_LOST.0) =>
+            {
+                None
+            }
+            Err(error)
+                if error
+                    .downcast_ref::<BridgeError>()
+                    .is_some_and(|error| error.code == DXGI_ERROR_WAIT_TIMEOUT.0) =>
+            {
                 let Some(metadata) = self.cached_metadata else {
                     return Ok(None);
                 };
@@ -437,8 +454,8 @@ impl GpuCapture {
         }))
     }
 
-    pub fn restart(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        self.bridge.restart_capture()?;
+    pub fn restart(&mut self, diagnostics: bool) -> Result<(), Box<dyn std::error::Error>> {
+        self.bridge.restart_capture(diagnostics)?;
         self.cached_metadata = None;
         Ok(())
     }
@@ -552,7 +569,7 @@ where
     }
 
     pub fn restart_capture(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        self.capture.restart()?;
+        self.capture.restart(self.quality.is_some())?;
         self.pending_metadata.clear();
         if let Some(quality) = self.quality.as_mut() {
             quality.sources.clear();
@@ -926,7 +943,7 @@ impl GpuBridge {
         &mut self,
         timeout: Duration,
         diagnostics: bool,
-    ) -> Result<EncoderTextureLease<'_>, BridgeError> {
+    ) -> Result<EncoderTextureLease<'_>, Box<dyn std::error::Error>> {
         let timeout_millis = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX);
         let mut texture = ptr::null_mut();
         let mut last_present_time = 0;
@@ -937,19 +954,13 @@ impl GpuBridge {
         let mut color_conversion_micros = 0;
         let result = if let Some(helper) = self.helper.as_mut() {
             if self.pending_helper_frame.is_none() {
-                self.pending_helper_frame =
-                    helper
-                        .next_frame(timeout, diagnostics)
-                        .map_err(|error| BridgeError {
-                            code: 0x8000_4005_u32 as i32,
-                            stage: error.to_string(),
-                        })?;
+                self.pending_helper_frame = helper.next_frame(timeout, diagnostics)?;
             }
             let Some(frame) = self.pending_helper_frame.as_ref() else {
-                return Err(BridgeError {
+                return Err(Box::new(BridgeError {
                     code: DXGI_ERROR_WAIT_TIMEOUT.0,
                     stage: "interactive WGC frame is not ready".to_owned(),
-                });
+                }));
             };
             last_present_time = frame.last_present_time;
             accumulated_frames = frame.accumulated_frames;
@@ -1021,19 +1032,42 @@ impl GpuBridge {
             .unwrap_or(rustconsole_protocol::wire::VideoReconfigurationCause::CaptureEngine)
     }
 
-    fn restart_capture(&mut self) -> Result<(), BridgeError> {
+    fn restart_capture(&mut self, diagnostics: bool) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(helper) = self.helper.as_mut() {
-            helper.restart_capture().map_err(|error| BridgeError {
-                code: 0x8000_4005_u32 as i32,
-                stage: error.to_string(),
+            let raw = self.raw;
+            helper.restart_capture(diagnostics, &mut self.pending_helper_frame, || {
+                discard_external_frame(raw)
             })?;
-            self.pending_helper_frame = None;
             return Ok(());
         }
         // SAFETY: the bridge is live and the native function retains no pointers.
         let result = unsafe { rustconsole_gpu_bridge_restart_capture(self.raw.as_ptr()) };
-        check_bridge_hresult(result)
+        if result == DXGI_ERROR_ACCESS_LOST.0 {
+            return Err(Box::new(VideoReconfigurationRequired {
+                cause: self.reconfiguration_cause(),
+            }));
+        }
+        check_bridge_hresult(result)?;
+        Ok(())
     }
+}
+
+fn discard_external_frame(raw: NonNull<c_void>) -> Result<(), Box<dyn std::error::Error>> {
+    let mut texture = ptr::null_mut();
+    // SAFETY: the caller owns the live bridge and has consumed one successful frame
+    // notification. Acquisition returns one owned COM reference and one mutex lease.
+    let result =
+        unsafe { rustconsole_gpu_bridge_acquire_external(raw.as_ptr(), 5000, &mut texture) };
+    check_bridge_hresult(result)
+        .map_err(|error| format!("acquire discarded WGC frame during capture restart: {error}"))?;
+    // SAFETY: successful acquisition transferred this COM reference.
+    let texture = unsafe { ID3D11Texture2D::from_raw(texture) };
+    // SAFETY: acquisition above holds exactly one encoder mutex lease.
+    let result = unsafe { rustconsole_gpu_bridge_release_encoder_texture(raw.as_ptr()) };
+    drop(texture);
+    check_bridge_hresult(result)
+        .map_err(|error| format!("release discarded WGC frame during capture restart: {error}"))?;
+    Ok(())
 }
 
 impl Drop for GpuBridge {

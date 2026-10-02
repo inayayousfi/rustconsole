@@ -31,6 +31,7 @@ const KEYFRAME_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 enum DiagnosticEvent {
     ReleasePointerCapture,
     Clock(crate::ClockOffsetEstimate),
+    HostNetworkLink(rustconsole_protocol::wire::PhysicalLinkKind),
     InputAck {
         sequence: u64,
         player_sent_at_micros: u64,
@@ -696,6 +697,7 @@ pub(super) struct ReceiveStreamParameters<Stop, Progress, Audio, Video> {
     pub(super) fps: u16,
     pub(super) audio_enabled: bool,
     pub(super) host_pointer_release: bool,
+    pub(super) network_status: bool,
     pub(super) diagnostic_stream: Option<quinn::RecvStream>,
     pub(super) should_stop: Stop,
     pub(super) input: crate::InputReceiver,
@@ -723,6 +725,7 @@ where
         fps,
         audio_enabled,
         host_pointer_release,
+        network_status,
         diagnostic_stream,
         should_stop,
         input: mut next_input,
@@ -889,6 +892,14 @@ where
                                         reader_diagnostics.push(DiagnosticEvent::Clock(estimate));
                                     }
                                 }
+                                Some(envelope::Body::NetworkLinkReport(report)) => {
+                                    if !network_status {
+                                        return Err("host sent an unnegotiated network status".to_owned());
+                                    }
+                                    let link = rustconsole_protocol::wire::PhysicalLinkKind::try_from(report.host_link)
+                                        .map_err(|_| "invalid host network link")?;
+                                    reader_diagnostics.push(DiagnosticEvent::HostNetworkLink(link));
+                                }
                                 Some(envelope::Body::KeyboardLeds(state)) => {
                                     let state = keyboard_leds.push(state)?;
                                     receiver.snapshot.lock().unwrap_or_else(|e| e.into_inner()).keyboard_leds = Some(state);
@@ -1045,6 +1056,9 @@ where
                     progress(StreamProgress::ReleasePointerCapture)
                 }
                 DiagnosticEvent::Clock(estimate) => progress(StreamProgress::ClockOffset(estimate)),
+                DiagnosticEvent::HostNetworkLink(link) => {
+                    progress(StreamProgress::HostNetworkLink(link))
+                }
                 DiagnosticEvent::InputAck {
                     sequence,
                     player_sent_at_micros,
@@ -1707,6 +1721,7 @@ mod tests {
             fps: 1,
             audio_enabled: true,
             host_pointer_release: true,
+            network_status: false,
             diagnostic_stream: None,
             should_stop: || started.elapsed() >= Duration::from_millis(550),
             input,

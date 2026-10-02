@@ -30,6 +30,20 @@ impl HostVideoStreamPolicy {
         }
     }
 
+    #[must_use]
+    pub fn from_startup_probe(
+        maximum_bits_per_second: u64,
+        measured_capacity_bits_per_second: u64,
+    ) -> Self {
+        Self {
+            bitrate: AdaptiveBitrateController::from_startup_probe(
+                maximum_bits_per_second,
+                measured_capacity_bits_per_second,
+            ),
+            recovery: VideoRecovery::default(),
+        }
+    }
+
     pub fn observe_receiver(
         &mut self,
         path: VideoPathReport,
@@ -38,9 +52,9 @@ impl HostVideoStreamPolicy {
         self.bitrate.observe(path, delivery)
     }
 
-    pub fn observe_worker_queue_drop(&mut self) -> Option<BitrateChange> {
+    pub fn observe_worker_queue_drop(&mut self) {
         self.recovery.require_keyframe();
-        self.bitrate.observe_sender_congestion()
+        self.bitrate.observe_sender_pressure();
     }
 
     pub fn observe_send_deadline_expired(&mut self) -> Option<BitrateChange> {
@@ -111,11 +125,51 @@ mod tests {
     fn delivery_failures_couple_congestion_response_to_keyframe_recovery() {
         let now = Instant::now();
         let mut policy = HostVideoStreamPolicy::new(100_000_000);
-        let change = policy.observe_worker_queue_drop().unwrap();
-        assert_eq!(change.target_bits_per_second, 37_500_000);
+        policy.observe_worker_queue_drop();
+        assert_eq!(policy.target_bits_per_second(), 50_000_000);
         assert!(policy.keyframe_request_due(now));
         assert!(!policy.accept_encoded_frame(0, false));
         assert!(policy.accept_encoded_frame(1, true));
+    }
+
+    #[test]
+    fn repeated_worker_queue_drops_reduce_bitrate_as_sender_pressure() {
+        let mut policy = HostVideoStreamPolicy::new(100_000_000);
+        let path = VideoPathReport {
+            round_trip_time: Duration::from_millis(10),
+            congestion_window_bytes: 250_000,
+            lost_packets: 0,
+        };
+        policy.observe_worker_queue_drop();
+        assert_eq!(
+            policy.observe_receiver(
+                path,
+                VideoDeliveryReport {
+                    completed_payload_bytes: 625_000,
+                    measurement_interval_micros: 500_000,
+                    ..VideoDeliveryReport::default()
+                }
+            ),
+            None
+        );
+        policy.observe_worker_queue_drop();
+
+        let change = policy
+            .observe_receiver(
+                path,
+                VideoDeliveryReport {
+                    completed_payload_bytes: 1_250_000,
+                    measurement_interval_micros: 500_000,
+                    ..VideoDeliveryReport::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(change.target_bits_per_second, 45_000_000);
+        assert_eq!(
+            change.cause,
+            crate::VideoBitrateChangeCause::SenderCongestion
+        );
     }
 
     #[test]

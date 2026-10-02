@@ -51,7 +51,8 @@ static_assert(sizeof(HelperFrame) == 244);
 
 static constexpr uint32_t HELLO_MAGIC = 0x48474352;
 static constexpr uint32_t FRAME_MAGIC = 0x46474352;
-static constexpr uint32_t PROTOCOL_VERSION = 3;
+static constexpr uint32_t RESTART_MAGIC = 0x52474352;
+static constexpr uint32_t PROTOCOL_VERSION = 4;
 static constexpr uint8_t COMMAND_RESTART_CAPTURE = 1;
 
 static bool decode_token(const wchar_t* text, std::array<uint8_t, 16>* token) {
@@ -151,12 +152,13 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
             if (!read_all(pipe, &command, sizeof(command)) || command != COMMAND_RESTART_CAPTURE)
                 break;
             HelperFrame restarted{};
-            restarted.magic = FRAME_MAGIC;
+            restarted.magic = RESTART_MAGIC;
             restarted.result = rustconsole_gpu_bridge_restart_capture(bridge);
             if (FAILED(restarted.result)) {
                 restarted.reconfiguration_cause = rustconsole_gpu_bridge_reconfiguration_cause(bridge);
                 copy_stage(restarted.failure_stage);
-                write_all(pipe, &restarted, sizeof(restarted));
+            }
+            if (!write_all(pipe, &restarted, sizeof(restarted)) || FAILED(restarted.result)) {
                 break;
             }
             continue;

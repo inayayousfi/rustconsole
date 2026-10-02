@@ -23,6 +23,8 @@ pub mod gpu_encode;
 mod installation;
 #[cfg(windows)]
 mod interactive_worker;
+#[cfg(windows)]
+mod network_link;
 pub mod service;
 #[cfg(windows)]
 mod session_controls;

@@ -16,14 +16,15 @@ pub const RELIABLE_FRAME_PREFIX_SIZE: usize = size_of::<u32>();
 pub struct Envelope {
     #[prost(
         oneof = "envelope::Body",
-        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23"
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27"
     )]
     pub body: Option<envelope::Body>,
 }
 
 pub mod envelope {
     use super::{
-        AuthenticationResult, Av1CapabilityOffer, HostIdentityOffer, HostIdentityRequest,
+        AuthenticationResult, Av1CapabilityOffer, BandwidthProbeFinish, BandwidthProbeReport,
+        BandwidthProbeStart, HostIdentityOffer, HostIdentityRequest, NetworkLinkReport,
         OpaqueCredentialFinalization, OpaqueCredentialRequest, OpaqueCredentialResponse,
         SelectedAv1Configuration, SessionAvailabilityProbe, SessionAvailabilityResult,
         VersionOffer, VideoControl, VideoReceiverReport,
@@ -36,6 +37,14 @@ pub mod envelope {
         DisplayCatalogRequest(super::DisplayCatalogRequest),
         #[prost(message, tag = "23")]
         DisplayCatalog(super::DisplayCatalog),
+        #[prost(message, tag = "24")]
+        BandwidthProbeStart(BandwidthProbeStart),
+        #[prost(message, tag = "25")]
+        BandwidthProbeFinish(BandwidthProbeFinish),
+        #[prost(message, tag = "26")]
+        BandwidthProbeReport(BandwidthProbeReport),
+        #[prost(message, tag = "27")]
+        NetworkLinkReport(NetworkLinkReport),
         #[prost(message, tag = "14")]
         AudioStreamState(super::AudioStreamState),
         #[prost(message, tag = "15")]
@@ -539,6 +548,59 @@ pub struct VideoReceiverReport {
     pub measurement_interval_micros: u64,
 }
 
+#[derive(Clone, Copy, PartialEq, Message)]
+pub struct BandwidthProbeStart {
+    #[prost(uint64, tag = "1")]
+    pub probe_id: u64,
+    #[prost(uint64, tag = "2")]
+    pub warmup_micros: u64,
+    #[prost(uint64, tag = "3")]
+    pub measurement_micros: u64,
+    #[prost(uint64, tag = "4")]
+    pub maximum_bits_per_second: u64,
+    #[prost(uint32, tag = "5")]
+    pub datagram_size: u32,
+}
+
+#[derive(Clone, Copy, PartialEq, Message)]
+pub struct BandwidthProbeFinish {
+    #[prost(uint64, tag = "1")]
+    pub probe_id: u64,
+    #[prost(uint64, tag = "2")]
+    pub measurement_datagrams_sent: u64,
+    #[prost(uint64, tag = "3")]
+    pub measurement_bytes_sent: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Message)]
+pub struct BandwidthProbeReport {
+    #[prost(uint64, tag = "1")]
+    pub probe_id: u64,
+    #[prost(uint64, tag = "2")]
+    pub measurement_datagrams_received: u64,
+    #[prost(uint64, tag = "3")]
+    pub measurement_bytes_received: u64,
+    #[prost(uint64, tag = "4")]
+    pub measurement_micros: u64,
+}
+
+/// The host's physical route toward the player (or its default internet route
+/// when the player is reached through a Tailscale virtual interface).
+#[derive(Clone, Copy, PartialEq, Message)]
+pub struct NetworkLinkReport {
+    #[prost(enumeration = "PhysicalLinkKind", tag = "1")]
+    pub host_link: i32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, prost::Enumeration)]
+#[repr(i32)]
+pub enum PhysicalLinkKind {
+    Unknown = 0,
+    Ethernet = 1,
+    Wifi = 2,
+    Other = 3,
+}
+
 #[derive(Clone, PartialEq, Message)]
 pub struct Av1CapabilityOffer {
     #[prost(string, optional, tag = "8")]
@@ -559,6 +621,10 @@ pub struct Av1CapabilityOffer {
     pub dedicated_input_stream: bool,
     #[prost(uint32, tag = "9")]
     pub video_datagram_version: u32,
+    #[prost(uint32, tag = "10")]
+    pub bandwidth_probe_version: u32,
+    #[prost(uint32, tag = "11")]
+    pub network_status_version: u32,
 }
 
 #[derive(Clone, Copy, PartialEq, Message)]
@@ -700,6 +766,10 @@ pub struct SelectedAv1Configuration {
     pub dedicated_input_stream: bool,
     #[prost(uint32, tag = "11")]
     pub video_datagram_version: u32,
+    #[prost(uint32, tag = "12")]
+    pub bandwidth_probe_version: u32,
+    #[prost(uint32, tag = "13")]
+    pub network_status_version: u32,
 }
 
 #[derive(Clone, Copy, PartialEq, Message)]
@@ -978,6 +1048,8 @@ mod tests {
         let selected = SelectedAv1Configuration {
             dedicated_input_stream: false,
             video_datagram_version: 0,
+            bandwidth_probe_version: 0,
+            network_status_version: 0,
             host_pointer_release: false,
             full_diagnostics: false,
             audio_transport: None,
@@ -999,6 +1071,92 @@ mod tests {
                 .unwrap(),
             selected
         );
+    }
+
+    #[test]
+    fn bandwidth_probe_messages_match_permanent_wire_fixtures() {
+        let messages = [
+            (
+                Envelope {
+                    body: Some(envelope::Body::BandwidthProbeStart(BandwidthProbeStart {
+                        probe_id: 1,
+                        warmup_micros: 1_000_000,
+                        measurement_micros: 2_000_000,
+                        maximum_bits_per_second: 100_000_000,
+                        datagram_size: 1_200,
+                    })),
+                },
+                vec![
+                    0, 0, 0, 21, 194, 1, 18, 8, 1, 16, 192, 132, 61, 24, 128, 137, 122, 32, 128,
+                    194, 215, 47, 40, 176, 9,
+                ],
+            ),
+            (
+                Envelope {
+                    body: Some(envelope::Body::BandwidthProbeFinish(BandwidthProbeFinish {
+                        probe_id: 1,
+                        measurement_datagrams_sent: 100,
+                        measurement_bytes_sent: 120_000,
+                    })),
+                },
+                vec![0, 0, 0, 11, 202, 1, 8, 8, 1, 16, 100, 24, 192, 169, 7],
+            ),
+            (
+                Envelope {
+                    body: Some(envelope::Body::BandwidthProbeReport(BandwidthProbeReport {
+                        probe_id: 1,
+                        measurement_datagrams_received: 90,
+                        measurement_bytes_received: 108_000,
+                        measurement_micros: 2_000_000,
+                    })),
+                },
+                vec![
+                    0, 0, 0, 15, 210, 1, 12, 8, 1, 16, 90, 24, 224, 203, 6, 32, 128, 137, 122,
+                ],
+            ),
+        ];
+
+        for (message, fixture) in messages {
+            assert_eq!(encode_reliable_frame(&message).unwrap(), fixture);
+            assert_eq!(decode_reliable_frame(&fixture).unwrap(), message);
+        }
+    }
+
+    #[test]
+    fn host_link_report_has_a_permanent_wire_fixture() {
+        let message = Envelope {
+            body: Some(envelope::Body::NetworkLinkReport(NetworkLinkReport {
+                host_link: PhysicalLinkKind::Wifi as i32,
+            })),
+        };
+        let fixture = [0, 0, 0, 5, 218, 1, 2, 8, 2];
+        assert_eq!(encode_reliable_frame(&message).unwrap(), fixture);
+        assert_eq!(decode_reliable_frame(&fixture).unwrap(), message);
+    }
+
+    #[test]
+    fn optional_network_status_capability_has_fixed_wire_fixtures() {
+        let offer = Envelope {
+            body: Some(envelope::Body::Av1CapabilityOffer(Av1CapabilityOffer {
+                network_status_version: 1,
+                ..Default::default()
+            })),
+        };
+        let selection = Envelope {
+            body: Some(envelope::Body::SelectedAv1Configuration(
+                SelectedAv1Configuration {
+                    network_status_version: 1,
+                    ..Default::default()
+                },
+            )),
+        };
+        for (message, fixture) in [
+            (offer, [0, 0, 0, 4, 18, 2, 88, 1]),
+            (selection, [0, 0, 0, 4, 26, 2, 104, 1]),
+        ] {
+            assert_eq!(encode_reliable_frame(&message).unwrap(), fixture);
+            assert_eq!(decode_reliable_frame(&fixture).unwrap(), message);
+        }
     }
 
     #[test]
@@ -1233,6 +1391,8 @@ fn audio_offer_has_a_fixed_fixture_and_is_optional_to_older_peers() {
         display_id: None,
         dedicated_input_stream: false,
         video_datagram_version: 0,
+        bandwidth_probe_version: 0,
+        network_status_version: 0,
         host_pointer_release: false,
         full_diagnostics: false,
         encoder_capabilities: Vec::new(),
@@ -1285,6 +1445,8 @@ fn host_pointer_release_is_negotiated_as_an_optional_field() {
         display_id: None,
         dedicated_input_stream: false,
         video_datagram_version: 0,
+        bandwidth_probe_version: 0,
+        network_status_version: 0,
         host_pointer_release: true,
         full_diagnostics: false,
         encoder_capabilities: Vec::new(),
@@ -1323,6 +1485,8 @@ fn dedicated_input_stream_is_negotiated_as_an_optional_field() {
         display_id: None,
         dedicated_input_stream: true,
         video_datagram_version: 0,
+        bandwidth_probe_version: 0,
+        network_status_version: 0,
         host_pointer_release: false,
         full_diagnostics: false,
         encoder_capabilities: Vec::new(),
@@ -1352,6 +1516,8 @@ fn video_datagram_version_is_negotiated_as_an_optional_field() {
         display_id: None,
         dedicated_input_stream: false,
         video_datagram_version: crate::VIDEO_DATAGRAM_VERSION,
+        bandwidth_probe_version: 0,
+        network_status_version: 0,
         host_pointer_release: false,
         full_diagnostics: false,
         encoder_capabilities: Vec::new(),

@@ -734,6 +734,20 @@ static_assert(keyed_mutex_result(WAIT_TIMEOUT) == DXGI_ERROR_WAIT_TIMEOUT);
 static_assert(keyed_mutex_result(WAIT_ABANDONED) == DXGI_ERROR_ACCESS_LOST);
 static_assert(keyed_mutex_result(E_FAIL) == E_FAIL);
 
+static constexpr HRESULT producer_mutex_result(HRESULT result) {
+    const HRESULT checked = keyed_mutex_result(result);
+    // No new capture is normal; an unpublished image still owned by the consumer is not.
+    // Keep producer handoff failure distinct from DXGI_ERROR_WAIT_TIMEOUT so the helper
+    // cannot silently retry it forever as though the desktop were simply unchanged.
+    return checked == DXGI_ERROR_WAIT_TIMEOUT ? HRESULT_FROM_WIN32(ERROR_TIMEOUT) : checked;
+}
+
+static_assert(producer_mutex_result(S_OK) == S_OK);
+static_assert(producer_mutex_result(WAIT_TIMEOUT) == HRESULT_FROM_WIN32(ERROR_TIMEOUT));
+static_assert(producer_mutex_result(DXGI_ERROR_WAIT_TIMEOUT) == HRESULT_FROM_WIN32(ERROR_TIMEOUT));
+static_assert(producer_mutex_result(WAIT_ABANDONED) == DXGI_ERROR_ACCESS_LOST);
+static_assert(producer_mutex_result(E_FAIL) == E_FAIL);
+
 static HRESULT capture_frame(
     RustConsoleGpuBridge* bridge,
     uint32_t timeout_millis,
@@ -859,9 +873,10 @@ static HRESULT capture_frame(
 
     const auto conversion_started =
         diagnostics ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    failure_stage = "convert processing-local capture texture to encoder format";
-    if (FAILED(result = keyed_mutex_result(bridge->processing_mutex->AcquireSync(0, 5000))))
+    failure_stage = "wait for the consumer to release the shared capture texture";
+    if (FAILED(result = producer_mutex_result(bridge->processing_mutex->AcquireSync(0, 5000))))
         return result;
+    failure_stage = "convert processing-local capture texture to encoder format";
     ID3D11Resource *wrapped[] = {bridge->processing_local_source11.Get()};
     if (bridge->cross_adapter)
         bridge->processing_interop->AcquireWrappedResources(wrapped, ARRAYSIZE(wrapped));
@@ -985,9 +1000,27 @@ extern "C" HRESULT rustconsole_gpu_bridge_capture_external(
 
 extern "C" HRESULT rustconsole_gpu_bridge_restart_capture(
     RustConsoleGpuBridge* bridge) {
+    failure_stage = "validate capture restart state";
     if (!bridge) return E_POINTER;
+    if (bridge->encoder_texture_outstanding) return DXGI_ERROR_INVALID_CALL;
     try {
-        return restart_wgc_capture(bridge);
+        if (bridge->normal_desktop) return restart_wgc_capture(bridge);
+        if (!bridge->output || !bridge->capture_device) return E_INVALIDARG;
+        failure_stage = "check Desktop Duplication configuration before restart";
+        HRESULT result = check_configuration(bridge);
+        if (FAILED(result)) return result;
+        // Drop the old duplication before creating a new one: DXGI permits only one
+        // duplication per application/output. The new capture cannot retain probe-era frames.
+        failure_stage = "release the previous Desktop Duplication capture";
+        bridge->duplication.Reset();
+        ComPtr<IDXGIOutput1> output1;
+        failure_stage = "query Desktop Duplication output for restart";
+        if (FAILED(result = bridge->output.As(&output1))) return result;
+        failure_stage = "recreate Desktop Duplication capture";
+        if (FAILED(result = output1->DuplicateOutput(
+                       bridge->capture_device.Get(), &bridge->duplication))) return result;
+        failure_stage = nullptr;
+        return S_OK;
     } catch (...) {
         return winrt::to_hresult();
     }

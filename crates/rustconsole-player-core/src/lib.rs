@@ -39,6 +39,7 @@ pub const MAX_CONCURRENT_DISCOVERY_PROBES: usize = 32;
 pub const MAX_CONCURRENT_LAN_PROBES: usize = 24;
 pub const MAX_CONCURRENT_ROUTED_PROBES: usize =
     MAX_CONCURRENT_DISCOVERY_PROBES - MAX_CONCURRENT_LAN_PROBES;
+const BANDWIDTH_PROBE_VERSION: u32 = rustconsole_session::bandwidth_probe::VERSION;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct DiscoveryProgress {
@@ -300,6 +301,7 @@ pub enum StreamProgress {
         mask: u8,
     },
     NegotiatingVideo,
+    MeasuringConnection,
     VideoNegotiated(rustconsole_protocol::NegotiatedAv1Configuration),
     WaitingForVideoPackets,
     ReceivingVideoPackets {
@@ -312,6 +314,7 @@ pub enum StreamProgress {
         soft_ceiling_bits_per_second: Option<u64>,
     },
     ClockOffset(ClockOffsetEstimate),
+    HostNetworkLink(rustconsole_protocol::wire::PhysicalLinkKind),
     InputSent {
         sequence: u64,
         occurred_at: std::time::Instant,
@@ -670,6 +673,8 @@ where
                         dedicated_input_stream: true,
                         video_datagram_version:
                             rustconsole_session::video_datagram::VIDEO_DATAGRAM_VERSION,
+                        bandwidth_probe_version: BANDWIDTH_PROBE_VERSION,
+                        network_status_version: 1,
                         host_pointer_release: true,
                         full_diagnostics,
                         audio_transport: Some(
@@ -691,6 +696,8 @@ where
         let dedicated_input_stream;
         let host_pointer_release;
         let video_datagram_version;
+        let bandwidth_probe_version;
+        let network_status_version;
         let host_offer = session_try!(
             "reading host AV1 capability offer",
             rustconsole_session::quic::read_envelope(&mut receive).await
@@ -709,6 +716,11 @@ where
                 } else {
                     offer.video_datagram_version
                 };
+                bandwidth_probe_version = offer.bandwidth_probe_version;
+                network_status_version = offer.network_status_version.min(1);
+                if bandwidth_probe_version != BANDWIDTH_PROBE_VERSION {
+                    return Err("host does not support the required startup bandwidth probe".into());
+                }
                 if video_datagram_version
                     != rustconsole_session::video_datagram::LEGACY_VIDEO_DATAGRAM_VERSION
                     && video_datagram_version
@@ -744,6 +756,8 @@ where
         selected_wire.host_pointer_release = host_pointer_release;
         selected_wire.dedicated_input_stream = dedicated_input_stream;
         selected_wire.video_datagram_version = video_datagram_version;
+        selected_wire.bandwidth_probe_version = bandwidth_probe_version;
+        selected_wire.network_status_version = network_status_version;
         session_try!(
             "sending player AV1 selection",
             rustconsole_session::quic::write_envelope(
@@ -776,6 +790,12 @@ where
                 return Err(error.into());
             }
         }
+        on_progress(StreamProgress::MeasuringConnection);
+        session_try!(
+            "measuring startup bandwidth",
+            rustconsole_session::bandwidth_probe::receive(&connection, &mut send, &mut receive)
+                .await
+        );
         on_progress(StreamProgress::PointerCaptureAvailable(
             host_pointer_release,
         ));
@@ -817,6 +837,7 @@ where
                 fps: selected.frames_per_second,
                 audio_enabled: audio_transport.is_some(),
                 host_pointer_release,
+                network_status: network_status_version != 0,
                 diagnostic_stream,
                 should_stop,
                 input,
@@ -961,6 +982,8 @@ fn wire_selected(
     SelectedAv1Configuration {
         dedicated_input_stream: false,
         video_datagram_version: rustconsole_session::video_datagram::LEGACY_VIDEO_DATAGRAM_VERSION,
+        bandwidth_probe_version: BANDWIDTH_PROBE_VERSION,
+        network_status_version: 0,
         host_pointer_release: false,
         full_diagnostics: false,
         audio_transport: None,

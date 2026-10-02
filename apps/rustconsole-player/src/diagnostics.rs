@@ -1021,6 +1021,9 @@ impl WorkerState {
                 "Audio playback timing ends at SDL queue or callback transfer, not physical sound output.",
                 "Input timing ends at Windows user-mode shared-ring publication; later endpoints are unavailable.",
                 "Derived and clock-adjusted metrics identify their classification in the event trace.",
+                "Network path kind: 0 unknown, 1 IP without Tailscale, 2 Tailscale direct, 3 Tailscale DERP relay, 4 Tailscale peer relay, 5 Tailscale path unknown.",
+                "Network player/host link: 0 unknown, 1 Ethernet, 2 Wi-Fi, 3 other or virtual; the host reports its internet route when its peer route is virtual.",
+                "Network status is sampled every second; shorter path changes can be missed. The physical internet route is context, not proof of which interface a Tailscale relay used.",
                 "The named diagnostic-writer thread owns aggregation, serialization, file output, and anomaly selection.",
             ],
         };

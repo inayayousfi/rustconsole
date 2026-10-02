@@ -54,9 +54,9 @@ impl WindowsSessionControls {
         std::thread::spawn(move || {
             let result: Result<(), String> = (|| {
                 let mut actual_token = [0; 16];
-                channel
-                    .read_exact(&mut actual_token)
-                    .map_err(|error| error.to_string())?;
+                channel.read_exact(&mut actual_token).map_err(|error| {
+                    format!("session controls authentication response: {error}")
+                })?;
                 if actual_token != expected_token {
                     return Err("session controls returned an invalid connection token".to_owned());
                 }
@@ -64,7 +64,7 @@ impl WindowsSessionControls {
                     let mut action = [0; 1];
                     channel
                         .read_exact(&mut action)
-                        .map_err(|error| error.to_string())?;
+                        .map_err(|error| format!("session controls action response: {error}"))?;
                     match action[0] {
                         1 => tx
                             .send(Ok(HostSessionControlAction::ReleasePointerCapture))

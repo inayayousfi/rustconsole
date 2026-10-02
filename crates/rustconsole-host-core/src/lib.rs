@@ -52,18 +52,25 @@ pub mod audio_transport {
 pub const VIDEO_BITRATE_BOOTSTRAP: u64 = 1_000_000;
 const CONGESTION_TARGET_PERCENT: u128 = 75;
 const MILD_CONGESTION_TARGET_PERCENT: u128 = 90;
-const ISOLATED_SENDER_CONGESTION_TARGET_PERCENT: u128 = 95;
-const SENDER_CONGESTION_PERCENT_STEP: u128 = 5;
+const REPEATED_SENDER_CONGESTION_TARGET_PERCENT: u128 = 90;
 const SAFE_PATH_PERCENT: u128 = 100;
 const RECOVERY_PROBE_PERCENT: u128 = 110;
+const RECOVERY_MINIMUM_STEP_PERCENT: u128 = 3;
+const RECOVERY_MAXIMUM_STEP_PERCENT: u128 = 25;
 const SOFT_CEILING_PROBE_PERCENT: u128 = 102;
-const SOFT_CEILING_RANGE_PERCENT: u128 = 98;
+const SOFT_CEILING_RANGE_PERCENT: u128 = 95;
 const SOFT_CEILING_PROBE_INTERVAL_MICROS: u64 = 5_000_000;
+const MAXIMUM_PROBE_BACKOFF_MICROS: u64 = 40_000_000;
 const SOFT_CEILING_EXPIRATION_MICROS: u64 = 60_000_000;
-const FAILED_PROBE_ATTRIBUTION_MICROS: u64 = 2_000_000;
+const RECOVERY_COOLDOWN_MICROS: u64 = 5_000_000;
+const FAILED_PROBE_ATTRIBUTION_MICROS: u64 = 5_000_000;
 const FAILED_PROBE_AVERAGE_SAMPLES: usize = 5;
 const HEALTHY_REPORTS_BEFORE_RECOVERY: u8 = 4;
 const DEGRADED_REPORTS_BEFORE_REDUCTION: u8 = 2;
+const RTT_PRESSURE_REPORTS_BEFORE_REDUCTION: u8 = 2;
+const MINIMUM_RTT_PRESSURE_MARGIN: Duration = Duration::from_millis(20);
+const SENDER_PRESSURE_REPORTS_BEFORE_REDUCTION: u8 = 2;
+const SEVERE_SENDER_PRESSURE_EVENTS: u8 = 3;
 const SEVERE_RECEIVER_LOSS_PERCENT: u128 = 2;
 const SEVERE_LOST_CHUNKS: u64 = 4;
 const SEVERE_INCOMPLETE_FRAMES: u64 = 2;
@@ -116,15 +123,27 @@ pub struct AdaptiveBitrateController {
     estimated_capacity_bits_per_second: u64,
     delivery_samples: VecDeque<(u64, u64)>,
     minimum_round_trip_time: Option<Duration>,
+    rtt_pressure_report_streak: u8,
     previous_delivery: VideoDeliveryReport,
     degraded_reports: u8,
     healthy_reports: u8,
     healthy_delivery_micros: u64,
     soft_ceiling_healthy_micros: u64,
+    recovery_cooldown_micros: u64,
+    provisional_ceiling_bits_per_second: Option<u64>,
     failed_probe_targets: VecDeque<u64>,
-    active_probe: Option<(u64, u64)>,
-    sender_congested_since_report: bool,
+    active_probe: Option<ActiveBitrateProbe>,
+    probe_interval_micros: u64,
+    sender_pressure_events_since_report: u8,
+    severe_sender_reduction_since_report: bool,
     sender_congested_report_streak: u8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ActiveBitrateProbe {
+    previous_target_bits_per_second: Option<u64>,
+    target_bits_per_second: u64,
+    elapsed_micros: u64,
 }
 
 impl AdaptiveBitrateController {
@@ -138,16 +157,50 @@ impl AdaptiveBitrateController {
             estimated_capacity_bits_per_second: 0,
             delivery_samples: VecDeque::with_capacity(CAPACITY_AVERAGE_REPORTS),
             minimum_round_trip_time: None,
+            rtt_pressure_report_streak: 0,
             previous_delivery: VideoDeliveryReport::default(),
             degraded_reports: 0,
             healthy_reports: 0,
             healthy_delivery_micros: 0,
             soft_ceiling_healthy_micros: 0,
+            recovery_cooldown_micros: 0,
+            provisional_ceiling_bits_per_second: None,
             failed_probe_targets: VecDeque::with_capacity(FAILED_PROBE_AVERAGE_SAMPLES),
             active_probe: None,
-            sender_congested_since_report: false,
+            probe_interval_micros: SOFT_CEILING_PROBE_INTERVAL_MICROS,
+            sender_pressure_events_since_report: 0,
+            severe_sender_reduction_since_report: false,
             sender_congested_report_streak: 0,
         }
+    }
+
+    #[must_use]
+    pub fn from_startup_probe(
+        maximum_bits_per_second: u64,
+        measured_capacity_bits_per_second: u64,
+    ) -> Self {
+        let mut controller = Self::new(maximum_bits_per_second);
+        if measured_capacity_bits_per_second == 0 {
+            controller.target_bits_per_second = VIDEO_BITRATE_BOOTSTRAP;
+            return controller;
+        }
+        let ceiling = measured_capacity_bits_per_second.min(controller.maximum_bits_per_second);
+        controller.provisional_ceiling_bits_per_second = Some(ceiling);
+        controller.estimated_capacity_bits_per_second = measured_capacity_bits_per_second;
+        controller.target_bits_per_second = u64::try_from(
+            u128::from(VIDEO_BITRATE_BOOTSTRAP)
+                .saturating_mul(u128::from(ceiling))
+                .isqrt(),
+        )
+        .unwrap_or(u64::MAX)
+        .max(VIDEO_BITRATE_BOOTSTRAP)
+        .min(controller.maximum_bits_per_second);
+        controller.active_probe = Some(ActiveBitrateProbe {
+            previous_target_bits_per_second: None,
+            target_bits_per_second: controller.target_bits_per_second,
+            elapsed_micros: 0,
+        });
+        controller
     }
 
     #[must_use]
@@ -201,8 +254,10 @@ impl AdaptiveBitrateController {
         if delivery.measurement_interval_micros == 0 {
             return None;
         }
-        let sender_congested = std::mem::take(&mut self.sender_congested_since_report);
-        if sender_congested {
+        let sender_pressure_events = std::mem::take(&mut self.sender_pressure_events_since_report);
+        let severe_sender_reduction =
+            std::mem::take(&mut self.severe_sender_reduction_since_report);
+        if sender_pressure_events != 0 {
             self.sender_congested_report_streak =
                 self.sender_congested_report_streak.saturating_add(1);
         } else {
@@ -245,6 +300,15 @@ impl AdaptiveBitrateController {
                     SAFE_PATH_PERCENT,
                 )
             };
+        let rtt_pressure = self.minimum_round_trip_time.is_some_and(|minimum| {
+            let margin = MINIMUM_RTT_PRESSURE_MARGIN.max(minimum / 2);
+            path.round_trip_time > minimum.saturating_add(margin)
+        });
+        if rtt_pressure {
+            self.rtt_pressure_report_streak = self.rtt_pressure_report_streak.saturating_add(1);
+        } else {
+            self.rtt_pressure_report_streak = 0;
+        }
 
         let severe_receiver_loss = assembly_overflows > 0
             || incomplete_frames >= SEVERE_INCOMPLETE_FRAMES
@@ -258,16 +322,20 @@ impl AdaptiveBitrateController {
             safe_path_capacity < percentage(self.target_bits_per_second, CONGESTION_TARGET_PERCENT);
         if severe_receiver_loss || severe_path_pressure {
             self.degraded_reports = 0;
-            self.record_active_probe_failure();
+            let rollback_target = self.record_active_probe_failure();
             self.reset_recovery_wait();
+            let cause = if severe_receiver_loss {
+                VideoBitrateChangeCause::SevereReceiverLoss
+            } else {
+                VideoBitrateChangeCause::SeverePathPressure
+            };
+            if severe_receiver_loss && let Some(target) = rollback_target {
+                return self.rollback_failed_probe(target, cause);
+            }
             return self.set_target(
                 percentage(self.target_bits_per_second, CONGESTION_TARGET_PERCENT),
                 BitrateChangeReason::Congestion,
-                if severe_receiver_loss {
-                    VideoBitrateChangeCause::SevereReceiverLoss
-                } else {
-                    VideoBitrateChangeCause::SeverePathPressure
-                },
+                cause,
             );
         }
 
@@ -278,7 +346,11 @@ impl AdaptiveBitrateController {
                 return None;
             }
             self.degraded_reports = 0;
-            self.record_active_probe_failure();
+            let rollback_target = self.record_active_probe_failure();
+            if let Some(target) = rollback_target {
+                return self
+                    .rollback_failed_probe(target, VideoBitrateChangeCause::MildDegradation);
+            }
             return self.set_target(
                 percentage(self.target_bits_per_second, MILD_CONGESTION_TARGET_PERCENT),
                 BitrateChangeReason::Congestion,
@@ -287,7 +359,47 @@ impl AdaptiveBitrateController {
         }
         self.degraded_reports = 0;
 
-        if sender_congested {
+        if self.rtt_pressure_report_streak != 0 {
+            self.reset_recovery_wait();
+            if self.rtt_pressure_report_streak < RTT_PRESSURE_REPORTS_BEFORE_REDUCTION {
+                return None;
+            }
+            self.rtt_pressure_report_streak = 0;
+            let rollback_target = self.record_active_probe_failure();
+            if let Some(target) = rollback_target {
+                return self
+                    .rollback_failed_probe(target, VideoBitrateChangeCause::MildDegradation);
+            }
+            return self.set_target(
+                percentage(self.target_bits_per_second, MILD_CONGESTION_TARGET_PERCENT),
+                BitrateChangeReason::Congestion,
+                VideoBitrateChangeCause::MildDegradation,
+            );
+        }
+
+        if sender_pressure_events != 0 {
+            self.reset_recovery_wait();
+            if severe_sender_reduction
+                || self.sender_congested_report_streak < SENDER_PRESSURE_REPORTS_BEFORE_REDUCTION
+            {
+                return None;
+            }
+            self.record_active_probe_failure();
+            return self.set_target(
+                percentage(
+                    self.target_bits_per_second,
+                    REPEATED_SENDER_CONGESTION_TARGET_PERCENT,
+                ),
+                BitrateChangeReason::Congestion,
+                VideoBitrateChangeCause::SenderCongestion,
+            );
+        }
+
+        let recovery_cooldown_was_active = self.recovery_cooldown_micros != 0;
+        self.recovery_cooldown_micros = self
+            .recovery_cooldown_micros
+            .saturating_sub(delivery.measurement_interval_micros);
+        if self.recovery_cooldown_micros != 0 {
             self.reset_recovery_wait();
             return None;
         }
@@ -297,11 +409,40 @@ impl AdaptiveBitrateController {
             .saturating_add(delivery.measurement_interval_micros);
         if self.healthy_delivery_micros >= SOFT_CEILING_EXPIRATION_MICROS {
             self.failed_probe_targets.clear();
+            self.provisional_ceiling_bits_per_second = None;
+            self.probe_interval_micros = SOFT_CEILING_PROBE_INTERVAL_MICROS;
         }
 
-        self.advance_active_probe(delivery.measurement_interval_micros);
+        let probe_validated = self.advance_active_probe(delivery.measurement_interval_micros);
         if self.target_bits_per_second == self.maximum_bits_per_second {
             return None;
+        }
+        if self.active_probe.is_some() {
+            self.healthy_reports = 0;
+            self.soft_ceiling_healthy_micros = 0;
+            return None;
+        }
+
+        if probe_validated {
+            self.healthy_reports = 0;
+            self.soft_ceiling_healthy_micros = 0;
+            let recovery_target = if self.near_soft_ceiling() {
+                percentage(self.target_bits_per_second, SOFT_CEILING_PROBE_PERCENT)
+            } else {
+                self.ordinary_recovery_target()
+            };
+            return self.set_recovery_target(recovery_target.min(safe_path_capacity));
+        }
+
+        if recovery_cooldown_was_active {
+            self.healthy_reports = 0;
+            self.soft_ceiling_healthy_micros = 0;
+            let recovery_target = if self.near_soft_ceiling() {
+                percentage(self.target_bits_per_second, SOFT_CEILING_PROBE_PERCENT)
+            } else {
+                self.ordinary_recovery_target()
+            };
+            return self.set_recovery_target(recovery_target.min(safe_path_capacity));
         }
 
         if self.near_soft_ceiling() {
@@ -309,7 +450,7 @@ impl AdaptiveBitrateController {
             self.soft_ceiling_healthy_micros = self
                 .soft_ceiling_healthy_micros
                 .saturating_add(delivery.measurement_interval_micros);
-            if self.soft_ceiling_healthy_micros < SOFT_CEILING_PROBE_INTERVAL_MICROS {
+            if self.soft_ceiling_healthy_micros < self.probe_interval_micros {
                 return None;
             }
             self.soft_ceiling_healthy_micros = 0;
@@ -325,75 +466,118 @@ impl AdaptiveBitrateController {
             return None;
         }
         self.healthy_reports = 0;
-        let mut recovery_target = percentage(self.target_bits_per_second, RECOVERY_PROBE_PERCENT);
-        if let Some(ceiling) = self.soft_ceiling_bits_per_second() {
-            recovery_target = recovery_target.min(percentage(ceiling, SOFT_CEILING_RANGE_PERCENT));
-        }
+        let recovery_target = self.ordinary_recovery_target();
         self.set_recovery_target(recovery_target.min(safe_path_capacity))
     }
 
     pub fn observe_sender_congestion(&mut self) -> Option<BitrateChange> {
-        self.reset_recovery_wait();
-        self.degraded_reports = 0;
-        // A brief drain between stalled frames is not evidence that congestion has cleared.
-        if self.sender_congested_since_report {
+        self.observe_sender_pressure();
+        if self.sender_pressure_events_since_report < SEVERE_SENDER_PRESSURE_EVENTS
+            || self.severe_sender_reduction_since_report
+        {
             return None;
         }
-        self.sender_congested_since_report = true;
+        self.severe_sender_reduction_since_report = true;
         self.record_active_probe_failure();
-        let target_percent = if self.estimated_capacity_bits_per_second == 0 {
-            CONGESTION_TARGET_PERCENT
-        } else {
-            ISOLATED_SENDER_CONGESTION_TARGET_PERCENT
-                .saturating_sub(
-                    u128::from(self.sender_congested_report_streak)
-                        .saturating_mul(SENDER_CONGESTION_PERCENT_STEP),
-                )
-                .max(CONGESTION_TARGET_PERCENT)
-        };
         self.set_target(
-            percentage(self.target_bits_per_second, target_percent),
+            percentage(self.target_bits_per_second, CONGESTION_TARGET_PERCENT),
             BitrateChangeReason::Congestion,
             VideoBitrateChangeCause::SenderCongestion,
         )
     }
 
+    pub fn observe_sender_pressure(&mut self) {
+        self.reset_recovery_wait();
+        self.degraded_reports = 0;
+        self.sender_pressure_events_since_report =
+            self.sender_pressure_events_since_report.saturating_add(1);
+    }
+
     fn near_soft_ceiling(&self) -> bool {
-        self.soft_ceiling_bits_per_second().is_some_and(|ceiling| {
-            self.target_bits_per_second >= percentage(ceiling, SOFT_CEILING_RANGE_PERCENT)
-        })
+        self.recovery_ceiling_bits_per_second()
+            .is_some_and(|ceiling| {
+                self.target_bits_per_second >= percentage(ceiling, SOFT_CEILING_RANGE_PERCENT)
+            })
+    }
+
+    fn recovery_ceiling_bits_per_second(&self) -> Option<u64> {
+        self.soft_ceiling_bits_per_second()
+            .or(self.provisional_ceiling_bits_per_second)
+    }
+
+    fn ordinary_recovery_target(&self) -> u64 {
+        let Some(ceiling) = self.recovery_ceiling_bits_per_second() else {
+            return percentage(self.target_bits_per_second, RECOVERY_PROBE_PERCENT);
+        };
+        let safe_ceiling = percentage(ceiling, SOFT_CEILING_RANGE_PERCENT);
+        if self.target_bits_per_second >= safe_ceiling {
+            return self.target_bits_per_second;
+        }
+        let gap = safe_ceiling - self.target_bits_per_second;
+        let half_gap = gap.div_ceil(2);
+        let minimum_step = percentage(self.target_bits_per_second, RECOVERY_MINIMUM_STEP_PERCENT);
+        let maximum_step = percentage(self.target_bits_per_second, RECOVERY_MAXIMUM_STEP_PERCENT);
+        self.target_bits_per_second
+            .saturating_add(half_gap.clamp(minimum_step, maximum_step))
+            .min(safe_ceiling)
     }
 
     fn set_recovery_target(&mut self, target_bits_per_second: u64) -> Option<BitrateChange> {
+        let previous_target_bits_per_second = self.target_bits_per_second;
         let change = self.set_target(
             target_bits_per_second,
             BitrateChangeReason::HealthyDelivery,
             VideoBitrateChangeCause::HealthyDelivery,
         );
         if let Some(change) = change {
-            self.active_probe = Some((change.target_bits_per_second, 0));
+            self.active_probe = Some(ActiveBitrateProbe {
+                previous_target_bits_per_second: Some(previous_target_bits_per_second),
+                target_bits_per_second: change.target_bits_per_second,
+                elapsed_micros: 0,
+            });
         }
         change
     }
 
-    fn advance_active_probe(&mut self, interval_micros: u64) {
-        let Some((_, elapsed_micros)) = self.active_probe.as_mut() else {
-            return;
+    fn advance_active_probe(&mut self, interval_micros: u64) -> bool {
+        let Some(probe) = self.active_probe.as_mut() else {
+            return false;
         };
-        *elapsed_micros = elapsed_micros.saturating_add(interval_micros);
-        if *elapsed_micros > FAILED_PROBE_ATTRIBUTION_MICROS {
+        probe.elapsed_micros = probe.elapsed_micros.saturating_add(interval_micros);
+        if probe.elapsed_micros >= FAILED_PROBE_ATTRIBUTION_MICROS {
             self.active_probe = None;
+            return true;
         }
+        false
     }
 
-    fn record_active_probe_failure(&mut self) {
-        let Some((target, _)) = self.active_probe.take() else {
-            return;
-        };
+    fn record_active_probe_failure(&mut self) -> Option<u64> {
+        let probe = self.active_probe.take()?;
+        self.provisional_ceiling_bits_per_second = Some(probe.target_bits_per_second);
         if self.failed_probe_targets.len() == FAILED_PROBE_AVERAGE_SAMPLES {
             self.failed_probe_targets.pop_front();
         }
-        self.failed_probe_targets.push_back(target);
+        self.failed_probe_targets
+            .push_back(probe.target_bits_per_second);
+        self.probe_interval_micros = self
+            .probe_interval_micros
+            .saturating_mul(2)
+            .min(MAXIMUM_PROBE_BACKOFF_MICROS);
+        probe.previous_target_bits_per_second
+    }
+
+    fn rollback_failed_probe(
+        &mut self,
+        target_bits_per_second: u64,
+        cause: VideoBitrateChangeCause,
+    ) -> Option<BitrateChange> {
+        let change = self.set_target(
+            target_bits_per_second,
+            BitrateChangeReason::Congestion,
+            cause,
+        );
+        self.recovery_cooldown_micros = self.probe_interval_micros;
+        change
     }
 
     fn reset_recovery_wait(&mut self) {
@@ -415,6 +599,9 @@ impl AdaptiveBitrateController {
             return None;
         }
         self.target_bits_per_second = target;
+        if reason == BitrateChangeReason::Congestion {
+            self.recovery_cooldown_micros = RECOVERY_COOLDOWN_MICROS;
+        }
         Some(BitrateChange {
             target_bits_per_second: target,
             reason,
@@ -763,6 +950,14 @@ mod tests {
         }
     }
 
+    fn path_with_rtt(round_trip_millis: u64) -> VideoPathReport {
+        VideoPathReport {
+            round_trip_time: Duration::from_millis(round_trip_millis),
+            congestion_window_bytes: 25_000_000,
+            lost_packets: 0,
+        }
+    }
+
     fn delivery(completed_payload_bytes: u64) -> VideoDeliveryReport {
         VideoDeliveryReport {
             completed_payload_bytes,
@@ -784,6 +979,133 @@ mod tests {
         let controller = AdaptiveBitrateController::new(2_500_000);
 
         assert_eq!(controller.target_bits_per_second(), 1_250_000);
+    }
+
+    #[test]
+    fn startup_probe_uses_the_multiplicative_middle_and_seeds_a_provisional_ceiling() {
+        let controller = AdaptiveBitrateController::from_startup_probe(100_000_000, 10_000_000);
+
+        assert_eq!(controller.target_bits_per_second(), 3_162_277);
+        assert_eq!(controller.estimated_capacity_bits_per_second(), 10_000_000);
+        assert_eq!(
+            controller.provisional_ceiling_bits_per_second,
+            Some(10_000_000)
+        );
+        assert_eq!(controller.soft_ceiling_bits_per_second(), None);
+        assert_eq!(
+            controller.active_probe,
+            Some(ActiveBitrateProbe {
+                previous_target_bits_per_second: None,
+                target_bits_per_second: 3_162_277,
+                elapsed_micros: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn failed_startup_target_replaces_the_provisional_ceiling() {
+        let mut controller = AdaptiveBitrateController::from_startup_probe(100_000_000, 10_000_000);
+        let mut report = delivery(1_000_000);
+        report.received_chunks = 196;
+        report.lost_chunks = 4;
+
+        controller.observe(path(200_000_000), report);
+
+        assert_eq!(controller.target_bits_per_second(), 2_371_707);
+        assert_eq!(
+            controller.provisional_ceiling_bits_per_second,
+            Some(3_162_277)
+        );
+        assert_eq!(controller.failed_probe_targets, VecDeque::from([3_162_277]));
+    }
+
+    #[test]
+    fn recovery_closes_half_the_gap_to_ninety_five_percent_of_the_ceiling() {
+        let mut controller = AdaptiveBitrateController::from_startup_probe(100_000_000, 10_000_000);
+
+        for report in 1..10_u64 {
+            assert_eq!(
+                controller.observe(path(200_000_000), delivery(report * 625_000)),
+                None
+            );
+        }
+        assert_eq!(
+            controller.observe(path(200_000_000), delivery(6_250_000)),
+            Some(BitrateChange {
+                target_bits_per_second: 3_952_846,
+                reason: BitrateChangeReason::HealthyDelivery,
+                cause: VideoBitrateChangeCause::HealthyDelivery,
+            })
+        );
+    }
+
+    #[test]
+    fn startup_probe_failure_falls_back_to_one_megabit() {
+        let controller = AdaptiveBitrateController::from_startup_probe(100_000_000, 0);
+
+        assert_eq!(controller.target_bits_per_second(), VIDEO_BITRATE_BOOTSTRAP);
+        assert_eq!(controller.provisional_ceiling_bits_per_second, None);
+    }
+
+    #[test]
+    fn isolated_rtt_pressure_holds_bitrate_without_reducing_it() {
+        let mut controller = AdaptiveBitrateController::new(20_000_000);
+        controller.observe(path_with_rtt(10), delivery(625_000));
+
+        assert_eq!(
+            controller.observe(path_with_rtt(31), delivery(1_250_000)),
+            None
+        );
+        assert_eq!(controller.target_bits_per_second(), 10_000_000);
+        assert_eq!(controller.rtt_pressure_report_streak, 1);
+        assert_eq!(
+            controller.observe(path_with_rtt(10), delivery(1_875_000)),
+            None
+        );
+        assert_eq!(controller.rtt_pressure_report_streak, 0);
+    }
+
+    #[test]
+    fn consecutive_rtt_pressure_reports_reduce_ten_percent() {
+        let mut controller = AdaptiveBitrateController::new(20_000_000);
+        controller.observe(path_with_rtt(10), delivery(625_000));
+        controller.observe(path_with_rtt(31), delivery(1_250_000));
+
+        let change = controller
+            .observe(path_with_rtt(31), delivery(1_875_000))
+            .unwrap();
+
+        assert_eq!(change.target_bits_per_second, 9_000_000);
+        assert_eq!(change.reason, BitrateChangeReason::Congestion);
+        assert_eq!(change.cause, VideoBitrateChangeCause::MildDegradation);
+        assert_eq!(controller.rtt_pressure_report_streak, 0);
+    }
+
+    #[test]
+    fn consecutive_rtt_pressure_rolls_back_an_active_increase() {
+        let mut controller = AdaptiveBitrateController::new(20_000_000);
+        controller.observe(path_with_rtt(10), delivery(625_000));
+        controller.set_recovery_target(12_000_000);
+        controller.observe(path_with_rtt(31), delivery(1_250_000));
+
+        let change = controller
+            .observe(path_with_rtt(31), delivery(1_875_000))
+            .unwrap();
+
+        assert_eq!(change.target_bits_per_second, 10_000_000);
+        assert_eq!(change.reason, BitrateChangeReason::Congestion);
+        assert_eq!(controller.probe_interval_micros, 10_000_000);
+    }
+
+    #[test]
+    fn rtt_pressure_margin_scales_with_a_slower_baseline() {
+        let mut controller = AdaptiveBitrateController::new(20_000_000);
+        controller.observe(path_with_rtt(100), delivery(625_000));
+
+        controller.observe(path_with_rtt(150), delivery(1_250_000));
+        assert_eq!(controller.rtt_pressure_report_streak, 0);
+        controller.observe(path_with_rtt(151), delivery(1_875_000));
+        assert_eq!(controller.rtt_pressure_report_streak, 1);
     }
 
     #[test]
@@ -819,7 +1141,7 @@ mod tests {
     }
 
     #[test]
-    fn transport_packet_loss_alone_does_not_prevent_cautious_recovery() {
+    fn transport_packet_loss_alone_does_not_prevent_recovery() {
         let mut controller = AdaptiveBitrateController::new(100_000_000);
         let mut completed_payload_bytes = 0;
 
@@ -846,7 +1168,7 @@ mod tests {
     }
 
     #[test]
-    fn recovery_uses_four_reports_and_a_ten_percent_step() {
+    fn recovery_without_a_ceiling_uses_four_reports_and_a_ten_percent_step() {
         let mut controller = AdaptiveBitrateController::new(20_000_000);
         let report_path = path(200_000_000);
 
@@ -905,20 +1227,103 @@ mod tests {
     }
 
     #[test]
-    fn sender_congestion_reduces_the_target_immediately() {
-        let mut controller = AdaptiveBitrateController::new(100_000_000);
+    fn severe_loss_during_a_probe_restores_the_previous_target() {
+        let mut controller = AdaptiveBitrateController::new(20_000_000);
+        assert_eq!(controller.target_bits_per_second(), 10_000_000);
+        controller.set_recovery_target(10_200_000);
+        let mut report = delivery(1_000_000);
+        report.received_chunks = 196;
+        report.lost_chunks = 4;
 
-        let change = controller.observe_sender_congestion().unwrap();
+        let change = controller.observe(path(200_000_000), report).unwrap();
 
         assert_eq!(change.reason, BitrateChangeReason::Congestion);
-        assert_eq!(change.cause, VideoBitrateChangeCause::SenderCongestion);
-        assert_eq!(change.target_bits_per_second, 37_500_000);
+        assert_eq!(change.cause, VideoBitrateChangeCause::SevereReceiverLoss);
+        assert_eq!(change.target_bits_per_second, 10_000_000);
+        assert_eq!(controller.probe_interval_micros, 10_000_000);
+        assert_eq!(controller.recovery_cooldown_micros, 10_000_000);
+    }
+
+    #[test]
+    fn persistent_severe_loss_after_a_probe_rollback_cuts_twenty_five_percent() {
+        let mut controller = AdaptiveBitrateController::new(20_000_000);
+        controller.set_recovery_target(10_200_000);
+        let mut first = delivery(1_000_000);
+        first.received_chunks = 196;
+        first.lost_chunks = 4;
+        controller.observe(path(200_000_000), first);
+        let mut second = delivery(2_000_000);
+        second.received_chunks = 392;
+        second.lost_chunks = 8;
+
+        let change = controller.observe(path(200_000_000), second).unwrap();
+
+        assert_eq!(change.target_bits_per_second, 7_500_000);
+        assert_eq!(change.cause, VideoBitrateChangeCause::SevereReceiverLoss);
+    }
+
+    #[test]
+    fn failed_probe_backoff_doubles_to_forty_seconds() {
+        let mut controller = AdaptiveBitrateController::new(20_000_000);
+
+        for expected in [10_000_000, 20_000_000, 40_000_000, 40_000_000] {
+            controller.active_probe = Some(ActiveBitrateProbe {
+                previous_target_bits_per_second: Some(10_000_000),
+                target_bits_per_second: 10_200_000,
+                elapsed_micros: 0,
+            });
+            assert_eq!(controller.record_active_probe_failure(), Some(10_000_000));
+            assert_eq!(controller.probe_interval_micros, expected);
+        }
+    }
+
+    #[test]
+    fn rollback_backoff_waits_ten_clean_seconds_before_another_probe() {
+        let mut controller = AdaptiveBitrateController::new(20_000_000);
+        controller.set_recovery_target(10_200_000);
+        let mut loss = delivery(1_000_000);
+        loss.received_chunks = 196;
+        loss.lost_chunks = 4;
+        controller.observe(path(200_000_000), loss);
+
+        for report_index in 1..20_u64 {
+            let mut clean = delivery(1_000_000 + report_index * 625_000);
+            clean.received_chunks = 196;
+            clean.lost_chunks = 4;
+            assert_eq!(controller.observe(path(200_000_000), clean), None);
+        }
+        let mut clean = delivery(13_500_000);
+        clean.received_chunks = 196;
+        clean.lost_chunks = 4;
+        assert_eq!(
+            controller.observe(path(200_000_000), clean),
+            Some(BitrateChange {
+                target_bits_per_second: 10_200_000,
+                reason: BitrateChangeReason::HealthyDelivery,
+                cause: VideoBitrateChangeCause::HealthyDelivery,
+            })
+        );
+    }
+
+    #[test]
+    fn isolated_sender_congestion_holds_the_target() {
+        let mut controller = AdaptiveBitrateController::new(100_000_000);
+
+        assert_eq!(controller.observe_sender_congestion(), None);
+        assert_eq!(controller.target_bits_per_second(), 50_000_000);
+        assert_eq!(
+            controller.observe(path(200_000_000), delivery(1_250_000)),
+            None
+        );
+        assert_eq!(controller.target_bits_per_second(), 50_000_000);
     }
 
     #[test]
     fn bitrate_does_not_fall_below_one_megabit() {
         let mut controller = AdaptiveBitrateController::new(100_000_000);
         controller.target_bits_per_second = 1_100_000;
+        assert_eq!(controller.observe_sender_congestion(), None);
+        assert_eq!(controller.observe_sender_congestion(), None);
         let change = controller.observe_sender_congestion().unwrap();
 
         assert_eq!(change.target_bits_per_second, VIDEO_BITRATE_BOOTSTRAP);
@@ -950,7 +1355,7 @@ mod tests {
     }
 
     #[test]
-    fn recovery_requires_four_clean_reports_and_uses_a_bounded_step() {
+    fn recovery_waits_five_clean_seconds_then_uses_a_bounded_step() {
         let mut controller = AdaptiveBitrateController::new(100_000_000);
         let mut report = delivery(1_250_000);
         report.received_chunks = 196;
@@ -958,18 +1363,14 @@ mod tests {
         controller.observe(path(80_000_000), report);
         assert_eq!(controller.target_bits_per_second(), 37_500_000);
 
-        assert_eq!(
-            controller.observe(path(80_000_000), delivery(2_500_000)),
-            None
-        );
-        for completed_payload_bytes in [3_750_000, 5_000_000] {
+        for completed_payload_bytes in (2..=10).map(|report| report * 1_250_000) {
             assert_eq!(
                 controller.observe(path(80_000_000), delivery(completed_payload_bytes)),
                 None
             );
         }
         assert_eq!(
-            controller.observe(path(80_000_000), delivery(6_250_000)),
+            controller.observe(path(80_000_000), delivery(13_750_000)),
             Some(BitrateChange {
                 target_bits_per_second: 41_250_000,
                 reason: BitrateChangeReason::HealthyDelivery,
@@ -993,7 +1394,7 @@ mod tests {
             lost_packets: 0,
         };
         let mut completed_payload_bytes = 1_250_000;
-        for _ in 0..44 {
+        for _ in 0..120 {
             completed_payload_bytes += 1_250_000;
             controller.observe(higher_rtt_path, delivery(completed_payload_bytes));
         }
@@ -1002,58 +1403,37 @@ mod tests {
     }
 
     #[test]
-    fn repeated_sender_stalls_cannot_collapse_bitrate_within_one_report() {
+    fn repeated_sender_stalls_cut_once_within_one_report() {
         let mut controller = AdaptiveBitrateController::new(100_000_000);
-        controller.observe_sender_congestion().unwrap();
+        assert_eq!(controller.observe_sender_congestion(), None);
+        assert_eq!(controller.observe_sender_congestion(), None);
+        assert_eq!(
+            controller
+                .observe_sender_congestion()
+                .unwrap()
+                .target_bits_per_second,
+            37_500_000
+        );
         for _ in 0..120 {
             assert_eq!(controller.observe_sender_congestion(), None);
         }
         assert_eq!(controller.target_bits_per_second(), 37_500_000);
-        assert_eq!(
-            controller.observe(path(200_000_000), delivery(5_000_000)),
-            None
-        );
-        assert_eq!(controller.target_bits_per_second(), 37_500_000);
-        assert_eq!(
-            controller
-                .observe_sender_congestion()
-                .unwrap()
-                .target_bits_per_second,
-            33_750_000
-        );
     }
 
     #[test]
-    fn sender_congestion_escalates_from_five_to_twenty_five_percent() {
-        let mut controller = AdaptiveBitrateController::new(40_000_000);
-        controller.estimated_capacity_bits_per_second = 10_000_000;
+    fn consecutive_sender_pressure_reports_reduce_ten_percent() {
+        let mut controller = AdaptiveBitrateController::new(100_000_000);
         let report_path = path(200_000_000);
-        let expected_targets = [19_000_000, 17_100_000, 14_535_000, 11_628_000, 8_721_000];
 
-        for (index, expected_target) in expected_targets.into_iter().enumerate() {
-            assert_eq!(
-                controller
-                    .observe_sender_congestion()
-                    .unwrap()
-                    .target_bits_per_second,
-                expected_target
-            );
-            assert_eq!(
-                controller.observe(
-                    report_path,
-                    delivery(u64::try_from(index + 1).unwrap() * 625_000),
-                ),
-                None
-            );
-        }
-
-        controller.observe(report_path, delivery(3_750_000));
+        assert_eq!(controller.observe_sender_congestion(), None);
+        assert_eq!(controller.observe(report_path, delivery(625_000)), None);
+        assert_eq!(controller.observe_sender_congestion(), None);
         assert_eq!(
             controller
-                .observe_sender_congestion()
+                .observe(report_path, delivery(1_250_000))
                 .unwrap()
                 .target_bits_per_second,
-            8_284_950
+            45_000_000
         );
     }
 
@@ -1061,41 +1441,51 @@ mod tests {
     fn sender_congestion_interval_cannot_count_toward_recovery() {
         let mut controller = AdaptiveBitrateController::new(100_000_000);
         controller.observe_sender_congestion();
-        for bytes in [5_000_000, 10_000_000] {
+        assert_eq!(
+            controller.observe(path(200_000_000), delivery(5_000_000)),
+            None
+        );
+        for bytes in [10_000_000, 15_000_000, 20_000_000] {
             assert_eq!(controller.observe(path(200_000_000), delivery(bytes)), None);
         }
-        for bytes in [15_000_000, 20_000_000] {
-            assert_eq!(controller.observe(path(200_000_000), delivery(bytes)), None);
-        }
-        let change = controller
-            .observe(path(200_000_000), delivery(25_000_000))
-            .unwrap();
-        assert_eq!(change.target_bits_per_second, 41_250_000);
-        assert_eq!(change.reason, BitrateChangeReason::HealthyDelivery);
+        assert_eq!(
+            controller.observe(path(200_000_000), delivery(25_000_000)),
+            Some(BitrateChange {
+                target_bits_per_second: 55_000_000,
+                reason: BitrateChangeReason::HealthyDelivery,
+                cause: VideoBitrateChangeCause::HealthyDelivery,
+            })
+        );
     }
 
     #[test]
-    fn invalid_report_does_not_rearm_sender_bitrate_cuts() {
+    fn invalid_report_does_not_clear_sender_pressure() {
         let mut controller = AdaptiveBitrateController::new(100_000_000);
-        controller.observe_sender_congestion();
+        assert_eq!(controller.observe_sender_congestion(), None);
         controller.observe(path(200_000_000), VideoDeliveryReport::default());
         assert_eq!(controller.observe_sender_congestion(), None);
+        let change = controller.observe_sender_congestion().unwrap();
+        assert_eq!(change.cause, VideoBitrateChangeCause::SenderCongestion);
         assert_eq!(controller.target_bits_per_second(), 37_500_000);
     }
 
     #[test]
     fn one_failed_recovery_probe_does_not_establish_a_soft_ceiling() {
         let mut controller = AdaptiveBitrateController::new(100_000_000);
-        controller.observe_sender_congestion();
-        for completed_payload_bytes in [5_000_000, 10_000_000, 15_000_000, 20_000_000, 25_000_000] {
+        for _ in 0..3 {
+            controller.observe_sender_congestion();
+        }
+        for completed_payload_bytes in (1..=14).map(|report| report * 625_000) {
             controller.observe(path(200_000_000), delivery(completed_payload_bytes));
         }
         assert_eq!(controller.target_bits_per_second(), 41_250_000);
 
-        controller.observe_sender_congestion();
+        for _ in 0..3 {
+            controller.observe_sender_congestion();
+        }
 
         assert_eq!(controller.soft_ceiling_bits_per_second(), None);
-        assert_eq!(controller.target_bits_per_second(), 39_187_500);
+        assert_eq!(controller.target_bits_per_second(), 30_937_500);
     }
 
     #[test]
@@ -1104,7 +1494,11 @@ mod tests {
         for target in [
             10_000_000, 20_000_000, 30_000_000, 40_000_000, 50_000_000, 60_000_000,
         ] {
-            controller.active_probe = Some((target, 0));
+            controller.active_probe = Some(ActiveBitrateProbe {
+                previous_target_bits_per_second: None,
+                target_bits_per_second: target,
+                elapsed_micros: 0,
+            });
             controller.record_active_probe_failure();
         }
 
@@ -1115,11 +1509,19 @@ mod tests {
     fn soft_ceiling_requires_five_failed_probes() {
         let mut controller = AdaptiveBitrateController::new(100_000_000);
         for target in [20_000_000, 21_000_000, 22_000_000, 23_000_000] {
-            controller.active_probe = Some((target, 0));
+            controller.active_probe = Some(ActiveBitrateProbe {
+                previous_target_bits_per_second: None,
+                target_bits_per_second: target,
+                elapsed_micros: 0,
+            });
             controller.record_active_probe_failure();
             assert_eq!(controller.soft_ceiling_bits_per_second(), None);
         }
-        controller.active_probe = Some((24_000_000, 0));
+        controller.active_probe = Some(ActiveBitrateProbe {
+            previous_target_bits_per_second: None,
+            target_bits_per_second: 24_000_000,
+            elapsed_micros: 0,
+        });
         controller.record_active_probe_failure();
 
         assert_eq!(controller.soft_ceiling_bits_per_second(), Some(22_000_000));
@@ -1162,21 +1564,21 @@ mod tests {
         assert_eq!(
             controller.observe(path(200_000_000), delivery(5_000_000)),
             Some(BitrateChange {
-                target_bits_per_second: 16_500_000,
+                target_bits_per_second: 17_000_000,
                 reason: BitrateChangeReason::HealthyDelivery,
                 cause: VideoBitrateChangeCause::HealthyDelivery,
             })
         );
-        for report in 5..8_u64 {
+        for report in 5..14_u64 {
             assert_eq!(
                 controller.observe(path(200_000_000), delivery(report * 1_250_000)),
                 None
             );
         }
         assert_eq!(
-            controller.observe(path(200_000_000), delivery(10_000_000)),
+            controller.observe(path(200_000_000), delivery(17_500_000)),
             Some(BitrateChange {
-                target_bits_per_second: 18_150_000,
+                target_bits_per_second: 18_000_000,
                 reason: BitrateChangeReason::HealthyDelivery,
                 cause: VideoBitrateChangeCause::HealthyDelivery,
             })

@@ -596,6 +596,8 @@ pub fn run_one_frame_proof(
             display_id: None,
             dedicated_input_stream: false,
             video_datagram_version: rustconsole_protocol::VIDEO_DATAGRAM_VERSION,
+            bandwidth_probe_version: 0,
+            network_status_version: 0,
             host_pointer_release: false,
             full_diagnostics: false,
             audio_transport: None,
@@ -787,6 +789,8 @@ fn wire_selected(
     SelectedAv1Configuration {
         dedicated_input_stream: false,
         video_datagram_version: rustconsole_protocol::VIDEO_DATAGRAM_VERSION,
+        bandwidth_probe_version: 0,
+        network_status_version: 0,
         host_pointer_release: false,
         full_diagnostics: false,
         audio_transport: None,

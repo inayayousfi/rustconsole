@@ -4,6 +4,7 @@ use std::fmt;
 
 pub mod audio_datagram;
 pub mod authentication;
+pub mod bandwidth_probe;
 pub mod input_datagram;
 pub mod media_queue;
 pub mod observability;

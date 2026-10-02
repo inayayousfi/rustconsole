@@ -12,6 +12,7 @@ use rustconsole_player_linux::{
     NativeDmaBufFrame, SdlAudioOutput, StreamCallbacks,
 };
 use rustconsole_protocol::InputEvent;
+use rustconsole_protocol::wire::PhysicalLinkKind;
 use rustconsole_render::{DecodedVideoColor, OverlayStatistics, PlayerVideoBackend};
 use rustconsole_render_vulkan::{VulkanOutputPreference, VulkanRenderer};
 use rustconsole_render_vulkan_linux::DmaBufFrameImporter;
@@ -29,11 +30,24 @@ use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 mod diagnostics;
+mod network_path;
 use diagnostics::LatencyDiagnostics;
+use network_path::{NetworkPath, PathKind};
 
 const RENDERING_BACKEND_LABEL: &str = "Rendering backend: Vulkan";
 const RECONNECT_STABLE_RESET: Duration = Duration::from_secs(30);
 const PRESENTATION_TRACKER_CAPACITY: usize = 512;
+const EVENT_WORK_BUDGET: Duration = Duration::from_millis(2);
+const REPEATED_FRAME_INTERVAL: Duration = Duration::from_millis(16);
+const VIDEO_PRESENTATION_STALL: Duration = Duration::from_secs(1);
+
+fn video_presentation_due(
+    last_submitted_sequence: Option<u64>,
+    sequence: u64,
+    since_last_submission: Duration,
+) -> bool {
+    last_submitted_sequence != Some(sequence) || since_last_submission >= REPEATED_FRAME_INTERVAL
+}
 
 struct ProcessCpuSampler {
     wall: Instant,
@@ -244,6 +258,7 @@ struct QueuedVideoFrame {
 #[derive(Clone, Copy)]
 struct PendingPresentation {
     frame_sequence: u64,
+    captured_at_micros: u64,
     frame_queued_at: Instant,
     capture_player_at: Option<Instant>,
     input_sequence: u64,
@@ -456,6 +471,19 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
     let frames = Arc::new(LatestVideoQueue::default());
     let (command_tx, command_rx) = mpsc::sync_channel(1);
     let mut overlay = StreamOverlay::new(launch.maximum_bitrate_bits_per_second);
+    let (network_tx, network_rx) = mpsc::sync_channel(1);
+    let network_target = launch.address.ip();
+    std::thread::spawn(move || {
+        loop {
+            if network_tx
+                .try_send(network_path::inspect(network_target))
+                .is_err_and(|error| matches!(error, mpsc::TrySendError::Disconnected(_)))
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    });
     std::thread::spawn(move || {
         loop {
             let command = read_command(&mut commands);
@@ -507,7 +535,25 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
     let mut pending_presentations = BTreeMap::<u64, PendingPresentation>::new();
     let mut presentation_tracker_drops = 0_u64;
     let mut last_diagnostic_frame = None;
+    let mut last_submitted_frame = None;
+    let mut last_video_submission = Instant::now() - REPEATED_FRAME_INTERVAL;
     'running: loop {
+        if let Ok(path) = network_rx.try_recv() {
+            overlay.network_path = path;
+            latency_diagnostics.observe_measurement(
+                "network_path_kind",
+                path.kind.code(),
+                "enum",
+                None,
+            );
+            latency_diagnostics.observe_measurement(
+                "network_player_link",
+                path.local_link as u64,
+                "enum",
+                None,
+            );
+            redraw = true;
+        }
         if let Ok(command) = command_rx.try_recv() {
             match command {
                 Ok(PlayerCommand::Stop) | Err(_) => break 'running,
@@ -525,6 +571,7 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
                     renderer = None;
                     pending_presentations.clear();
                     last_diagnostic_frame = None;
+                    last_submitted_frame = None;
                     input_started.clear();
                     correlated_input_started.clear();
                     last_frame = None;
@@ -566,7 +613,10 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
                 audio_queue.clone(),
             );
         }
-        while let Ok(event) = session_rx.try_recv() {
+        let session_work_started = Instant::now();
+        while session_work_started.elapsed() < EVENT_WORK_BUDGET
+            && let Ok(event) = session_rx.try_recv()
+        {
             match event {
                 SessionEvent::Authenticated(host_identity) => {
                     authenticated = true;
@@ -672,6 +722,17 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
                                 clock_offset = Some(estimate);
                             }
                             latency_diagnostics.set_clock_offset(estimate);
+                            continue;
+                        }
+                        StreamProgress::HostNetworkLink(link) => {
+                            overlay.host_link = Some((link, Instant::now()));
+                            latency_diagnostics.observe_measurement(
+                                "network_host_link",
+                                link as u64,
+                                "enum",
+                                None,
+                            );
+                            redraw = true;
                             continue;
                         }
                         StreamProgress::InputSent {
@@ -1354,6 +1415,9 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
                         StreamProgress::NegotiatingVideo => {
                             "Host authenticated\nNegotiating video".to_owned()
                         }
+                        StreamProgress::MeasuringConnection => {
+                            "Video negotiated\nMeasuring connection".to_owned()
+                        }
                         StreamProgress::VideoNegotiated(configuration) => {
                             output_preference = match configuration.mode.bit_depth {
                                 rustconsole_protocol::VideoBitDepth::Eight => {
@@ -1436,6 +1500,7 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
                     renderer = None;
                     pending_presentations.clear();
                     last_diagnostic_frame = None;
+                    last_submitted_frame = None;
                     input_started.clear();
                     correlated_input_started.clear();
                     last_frame = None;
@@ -1484,6 +1549,7 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
                     renderer = None;
                     pending_presentations.clear();
                     last_diagnostic_frame = None;
+                    last_submitted_frame = None;
                     input_started.clear();
                     correlated_input_started.clear();
                     last_frame = None;
@@ -1514,7 +1580,10 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        for event in event_pump.poll_iter() {
+        let sdl_work_started = Instant::now();
+        while sdl_work_started.elapsed() < EVENT_WORK_BUDGET
+            && let Some(event) = event_pump.poll_event()
+        {
             match event {
                 Event::Quit { .. } => break 'running,
                 Event::KeyDown {
@@ -1842,7 +1911,17 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
         {
             redraw = true;
         }
-        if (authenticated || recovering) && redraw {
+        if gui.diagnostics_visible() && overlay.video_is_stalled() {
+            redraw = true;
+        }
+        let video_presentation_due = last_frame.as_ref().is_none_or(|frame| {
+            video_presentation_due(
+                last_submitted_frame,
+                frame.sequence,
+                last_video_submission.elapsed(),
+            )
+        });
+        if (authenticated || recovering) && redraw && video_presentation_due {
             if renderer.is_none() {
                 gui.reset_renderer();
                 renderer = Some(Box::new(VulkanRenderer::new(
@@ -1881,7 +1960,7 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
                     status: None,
                     diagnostics: &diagnostics,
                 });
-                if latency_diagnostics.enabled() {
+                if latency_diagnostics.enabled() && diagnose_submission {
                     latency_diagnostics.observe(
                         "video_render_queue",
                         u64::try_from(frame.queued_at.elapsed().as_micros()).unwrap_or(u64::MAX),
@@ -1898,7 +1977,7 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
                     },
                     width.max(1),
                     height.max(1),
-                    latency_diagnostics.enabled(),
+                    latency_diagnostics.enabled() && diagnose_submission,
                     gui_frame,
                 )?;
                 if let Some(render) = submission.diagnostics {
@@ -1939,6 +2018,8 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 let presented_at = Instant::now();
+                last_submitted_frame = Some(frame.sequence);
+                last_video_submission = presented_at;
                 if submission.feedback_available && diagnose_submission {
                     while pending_presentations.len() >= PRESENTATION_TRACKER_CAPACITY {
                         pending_presentations.pop_first();
@@ -1948,6 +2029,7 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
                         submission.id,
                         PendingPresentation {
                             frame_sequence: frame.sequence,
+                            captured_at_micros: frame.captured_at_micros,
                             frame_queued_at: frame.queued_at,
                             capture_player_at: frame.capture_player_at,
                             input_sequence: frame.input_sequence,
@@ -1964,8 +2046,10 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
                 } else if diagnose_submission {
                     observe_presented_frame(
                         &mut latency_diagnostics,
+                        &mut overlay,
                         PendingPresentation {
                             frame_sequence: frame.sequence,
+                            captured_at_micros: frame.captured_at_micros,
                             frame_queued_at: frame.queued_at,
                             capture_player_at: frame.capture_player_at,
                             input_sequence: frame.input_sequence,
@@ -1989,7 +2073,16 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
                     last_diagnostic_frame = Some(frame.sequence);
                 }
                 if let Some(captured_at_micros) = pending_video_timestamp.take() {
-                    video_clock = Some(VideoPlaybackClock::new(captured_at_micros, Instant::now()));
+                    let presented_at = Instant::now();
+                    match video_clock.as_mut() {
+                        Some(clock) => {
+                            clock.observe_presentation(captured_at_micros, presented_at);
+                        }
+                        None => {
+                            video_clock =
+                                Some(VideoPlaybackClock::new(captured_at_micros, presented_at));
+                        }
+                    }
                 }
                 if !started {
                     started = true;
@@ -2034,6 +2127,7 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(pending) = pending_presentations.remove(&feedback.id) {
                     observe_presented_frame(
                         &mut latency_diagnostics,
+                        &mut overlay,
                         pending,
                         feedback.presented_at,
                         "VK_KHR_present_wait reported compositor presentation completion",
@@ -2435,12 +2529,14 @@ fn observe_audio_samples(
 
 fn observe_presented_frame(
     diagnostics: &mut LatencyDiagnostics,
+    overlay: &mut StreamOverlay,
     pending: PendingPresentation,
     presented_at: Instant,
     endpoint: &'static str,
-) {
+) -> Option<Duration> {
     let PendingPresentation {
         frame_sequence,
+        captured_at_micros,
         frame_queued_at,
         capture_player_at,
         input_sequence,
@@ -2448,15 +2544,14 @@ fn observe_presented_frame(
         diagnostic_marker_input_sequence,
         correlated_input_started_at,
     } = pending;
-    if let Some(captured_at) = capture_player_at {
+    let video_latency = overlay.observe_video_presentation(
+        captured_at_micros,
+        capture_player_at.map(|captured_at| presented_at.saturating_duration_since(captured_at)),
+    );
+    if let Some(duration) = video_latency {
         diagnostics.observe_classified(
             "video_source_capture_to_presentation",
-            u64::try_from(
-                presented_at
-                    .saturating_duration_since(captured_at)
-                    .as_micros(),
-            )
-            .unwrap_or(u64::MAX),
+            u64::try_from(duration.as_micros()).unwrap_or(u64::MAX),
             Some(frame_sequence),
             None,
             endpoint,
@@ -2505,6 +2600,7 @@ fn observe_presented_frame(
             Some("all input, application response, video, render, and compositor stages"),
         );
     }
+    video_latency
 }
 
 fn apply_gui_action(
@@ -2634,6 +2730,15 @@ fn format_soft_ceiling(bits_per_second: Option<u64>) -> String {
         .unwrap_or_else(|| "not established".to_owned())
 }
 
+fn link_name(link: PhysicalLinkKind) -> &'static str {
+    match link {
+        PhysicalLinkKind::Unknown => "unknown",
+        PhysicalLinkKind::Ethernet => "Ethernet",
+        PhysicalLinkKind::Wifi => "Wi-Fi",
+        PhysicalLinkKind::Other => "other/virtual",
+    }
+}
+
 struct StreamOverlay {
     audio: Option<rustconsole_player_core::AudioTransportSnapshot>,
     audio_playback: AudioPlaybackSnapshot,
@@ -2645,6 +2750,11 @@ struct StreamOverlay {
     completed_frames: u64,
     incomplete_frames: u64,
     input_round_trip: Option<Duration>,
+    video_latency: Option<Duration>,
+    last_video_capture_micros: Option<u64>,
+    last_video_presentation: Option<Instant>,
+    network_path: NetworkPath,
+    host_link: Option<(PhysicalLinkKind, Instant)>,
     interval_started: Instant,
     interval_frames: u64,
     interval_bytes: u64,
@@ -2663,6 +2773,14 @@ impl StreamOverlay {
             completed_frames: 0,
             incomplete_frames: 0,
             input_round_trip: None,
+            video_latency: None,
+            last_video_capture_micros: None,
+            last_video_presentation: None,
+            network_path: NetworkPath {
+                kind: PathKind::Unknown,
+                local_link: PhysicalLinkKind::Unknown,
+            },
+            host_link: None,
             interval_started: Instant::now(),
             interval_frames: 0,
             interval_bytes: 0,
@@ -2699,9 +2817,42 @@ impl StreamOverlay {
         }
     }
 
+    fn observe_video_presentation(
+        &mut self,
+        captured_at_micros: u64,
+        latency: Option<Duration>,
+    ) -> Option<Duration> {
+        self.last_video_presentation = Some(Instant::now());
+        if self.last_video_capture_micros == Some(captured_at_micros) {
+            return None;
+        }
+        self.last_video_capture_micros = Some(captured_at_micros);
+        self.video_latency = latency;
+        latency
+    }
+
+    fn video_is_stalled(&self) -> bool {
+        self.last_video_presentation
+            .is_some_and(|at| at.elapsed() >= VIDEO_PRESENTATION_STALL)
+    }
+
+    fn video_latency_text(&self) -> String {
+        if self.video_is_stalled() {
+            "stalled (no new frame)".to_owned()
+        } else {
+            self.video_latency
+                .map(|duration| format!("{:.1} ms", duration.as_secs_f64() * 1_000.0))
+                .unwrap_or_else(|| "unavailable".to_owned())
+        }
+    }
+
     fn text(&self, state: &str) -> String {
+        let host_link = self
+            .host_link
+            .filter(|(_, at)| at.elapsed() < Duration::from_secs(5))
+            .map_or(PhysicalLinkKind::Unknown, |(link, _)| link);
         let video = format!(
-            "{RENDERING_BACKEND_LABEL}\n{state}\nFPS {:5.1}\nEncoded rate (0.5s) {:5.2} Mbit/s\nDelivered rate (1s avg) {:5.2} Mbit/s\nEncoder target {:5.2} Mbit/s\nConfigured maximum {:.0} Mbit/s\nLearned soft ceiling {}\nImage ping {:5.1} ms\nInput ping {}\nComplete {}  Incomplete {}\nLost {}  Late {}  Overflow {}",
+            "{RENDERING_BACKEND_LABEL}\n{state}\nFPS {:5.1}\nEncoded rate (0.5s) {:5.2} Mbit/s\nDelivered rate (1s avg) {:5.2} Mbit/s\nEncoder target {:5.2} Mbit/s\nConfigured maximum {:.0} Mbit/s\nLearned soft ceiling {}\nVideo capture to presentation {}\nInput acknowledgement {}\nNetwork: {} | player {} | host {}{}\nComplete {}  Incomplete {}\nLost {}  Late {}  Overflow {}",
             self.statistics.frames_per_second,
             self.statistics.encoded_megabits_per_second,
             self.delivered_megabits_per_second,
@@ -2710,10 +2861,24 @@ impl StreamOverlay {
             self.soft_ceiling_megabits_per_second
                 .map(|ceiling| format!("{ceiling:.2} Mbit/s"))
                 .unwrap_or_else(|| "not established".to_owned()),
-            self.statistics.round_trip_time.as_secs_f64() * 1_000.0,
+            self.video_latency_text(),
             self.input_round_trip
                 .map(|duration| format!("{:5.1} ms", duration.as_secs_f64() * 1_000.0))
                 .unwrap_or_else(|| "waiting".to_owned()),
+            self.network_path.kind.name(),
+            link_name(self.network_path.local_link),
+            link_name(host_link),
+            if matches!(
+                self.network_path.kind,
+                PathKind::TailscaleDirect
+                    | PathKind::TailscaleDerp
+                    | PathKind::TailscalePeerRelay
+                    | PathKind::TailscaleUnknown
+            ) {
+                " (internet route)"
+            } else {
+                ""
+            },
             self.completed_frames,
             self.incomplete_frames,
             self.statistics.lost_chunks,
@@ -2777,6 +2942,25 @@ impl StreamOverlay {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_video_frame_is_presented_without_waiting_for_the_repeat_interval() {
+        assert!(video_presentation_due(Some(10), 11, Duration::ZERO));
+    }
+
+    #[test]
+    fn repeated_video_frame_is_limited_to_interface_refresh_rate() {
+        assert!(!video_presentation_due(
+            Some(10),
+            10,
+            REPEATED_FRAME_INTERVAL - Duration::from_millis(1)
+        ));
+        assert!(video_presentation_due(
+            Some(10),
+            10,
+            REPEATED_FRAME_INTERVAL
+        ));
+    }
 
     #[test]
     fn reconnect_backoff_grows_to_its_bounded_jittered_delay() {
@@ -2943,9 +3127,109 @@ mod tests {
         assert!(text.contains(
             "Encoded rate (0.5s)  0.00 Mbit/s\nDelivered rate (1s avg)  8.00 Mbit/s\nEncoder target  5.00 Mbit/s\nConfigured maximum 100 Mbit/s\nLearned soft ceiling 6.00 Mbit/s"
         ));
-        assert!(text.contains("Image ping   7.0 ms"));
-        assert!(text.contains("Input ping  11.0 ms"));
+        assert!(text.contains("Video capture to presentation unavailable"));
+        assert!(text.contains("Input acknowledgement  11.0 ms"));
         assert!(text.contains("Complete 8  Incomplete 1"));
         assert!(text.contains("Lost 2  Late 3  Overflow 4"));
+    }
+
+    #[test]
+    fn video_latency_reports_a_presented_frame_and_expires_when_frames_stop() {
+        let mut overlay = StreamOverlay::new(100_000_000);
+        overlay.observe_video_presentation(1, Some(Duration::from_millis(67)));
+        assert!(
+            overlay
+                .text("Streaming")
+                .contains("Video capture to presentation 67.0 ms")
+        );
+
+        overlay.last_video_presentation = Some(Instant::now() - VIDEO_PRESENTATION_STALL);
+        assert!(
+            overlay
+                .text("Streaming")
+                .contains("Video capture to presentation stalled (no new frame)")
+        );
+        assert!(!overlay.text("Streaming").contains("67.0 ms"));
+
+        overlay.observe_video_presentation(2, None);
+        assert!(
+            overlay
+                .text("Streaming")
+                .contains("Video capture to presentation unavailable")
+        );
+    }
+
+    #[test]
+    fn repeated_capture_keeps_latency_and_emits_no_new_latency_sample() {
+        let mut overlay = StreamOverlay::new(100_000_000);
+        assert_eq!(
+            overlay.observe_video_presentation(10, Some(Duration::from_millis(67))),
+            Some(Duration::from_millis(67))
+        );
+        for age in [Duration::from_secs(1), Duration::from_secs(60)] {
+            overlay.last_video_presentation = Some(Instant::now() - VIDEO_PRESENTATION_STALL);
+            assert_eq!(overlay.observe_video_presentation(10, Some(age)), None);
+            assert!(
+                overlay
+                    .text("Streaming")
+                    .contains("Video capture to presentation 67.0 ms")
+            );
+            assert!(
+                !overlay.video_is_stalled(),
+                "repeated images still prove presentation is active"
+            );
+        }
+        assert_eq!(
+            overlay.observe_video_presentation(11, Some(Duration::from_millis(42))),
+            Some(Duration::from_millis(42))
+        );
+        assert!(
+            overlay
+                .text("Streaming")
+                .contains("Video capture to presentation 42.0 ms")
+        );
+    }
+
+    #[test]
+    fn repeated_capture_does_not_clear_latency_when_clock_estimate_is_unavailable() {
+        let mut overlay = StreamOverlay::new(100_000_000);
+        overlay.observe_video_presentation(10, Some(Duration::from_millis(67)));
+        assert_eq!(overlay.observe_video_presentation(10, None), None);
+        assert!(
+            overlay
+                .text("Streaming")
+                .contains("Video capture to presentation 67.0 ms")
+        );
+        assert_eq!(overlay.observe_video_presentation(11, None), None);
+        assert!(
+            overlay
+                .text("Streaming")
+                .contains("Video capture to presentation unavailable")
+        );
+    }
+
+    #[test]
+    fn network_overlay_names_both_links_and_expires_an_old_host_report() {
+        let mut overlay = StreamOverlay::new(100_000_000);
+        overlay.network_path = NetworkPath {
+            kind: PathKind::TailscaleDirect,
+            local_link: PhysicalLinkKind::Wifi,
+        };
+        overlay.host_link = Some((PhysicalLinkKind::Ethernet, Instant::now()));
+        assert!(
+            overlay.text("Streaming").contains(
+                "Network: Tailscale direct | player Wi-Fi | host Ethernet (internet route)"
+            )
+        );
+
+        overlay.host_link = Some((
+            PhysicalLinkKind::Ethernet,
+            Instant::now() - Duration::from_secs(5),
+        ));
+        assert!(
+            overlay
+                .text("Streaming")
+                .contains("host unknown (internet route)")
+        );
     }
 }

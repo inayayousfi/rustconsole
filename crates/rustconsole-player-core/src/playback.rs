@@ -392,6 +392,14 @@ impl VideoPlaybackClock {
         }
     }
 
+    pub fn observe_presentation(&mut self, captured_at_micros: u64, presented_at: Instant) {
+        // A cached image can be encoded with new packet sequences but the same source
+        // timestamp. Re-anchoring each repeat would keep audio waiting behind that image.
+        if captured_at_micros != self.captured_at_micros {
+            *self = Self::new(captured_at_micros, presented_at);
+        }
+    }
+
     #[must_use]
     pub fn timestamp_at(self, now: Instant) -> u64 {
         self.captured_at_micros.saturating_add(
@@ -583,6 +591,39 @@ mod tests {
         assert_eq!(
             clock.timestamp_at(presented_at + Duration::from_millis(100)),
             105_000
+        );
+    }
+
+    #[test]
+    fn repeated_source_images_do_not_hold_audio_behind_an_old_capture() {
+        let presented_at = Instant::now();
+        let mut clock = VideoPlaybackClock::new(100_000, presented_at);
+        let queue = AudioPlaybackQueue::default();
+        for (sequence, elapsed) in [1, 10, 100, 1_000, 60_000].into_iter().enumerate() {
+            let now = presented_at + Duration::from_millis(elapsed);
+            clock.observe_presentation(100_000, now);
+            queue.push(DecodedAudioEvent::Samples(samples(
+                sequence as u64,
+                100_000 + elapsed * 1_000,
+            )));
+            assert!(matches!(
+                queue.pop_for_video(Some(clock.timestamp_at(now))),
+                Some(AudioPlaybackDecision::Samples { .. })
+            ));
+        }
+        assert_eq!(queue.snapshot().pending_packets, 0);
+        assert_eq!(queue.snapshot().queue_drops, 0);
+    }
+
+    #[test]
+    fn a_new_source_capture_reanchors_the_audio_clock() {
+        let presented_at = Instant::now();
+        let mut clock = VideoPlaybackClock::new(100_000, presented_at);
+        let next_presentation = presented_at + Duration::from_secs(1);
+        clock.observe_presentation(1_050_000, next_presentation);
+        assert_eq!(
+            clock.timestamp_at(next_presentation + Duration::from_millis(20)),
+            1_070_000
         );
     }
 

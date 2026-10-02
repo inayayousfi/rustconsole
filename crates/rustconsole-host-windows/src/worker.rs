@@ -748,6 +748,20 @@ enum StreamExit {
     StopWorker,
 }
 
+fn report_video_reconfiguration(
+    error: &(dyn std::error::Error + 'static),
+    events: &mut impl std::io::Write,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let Some(reconfiguration) = error.downcast_ref::<VideoReconfigurationRequired>() else {
+        return Ok(false);
+    };
+    write_event(
+        events,
+        &WorkerEvent::VideoReconfigurationRequired(reconfiguration.cause),
+    )?;
+    Ok(true)
+}
+
 fn run_video_stream(
     commands: &mut File,
     events: &mut File,
@@ -766,6 +780,13 @@ fn run_video_stream(
     if diagnostics {
         encoder.enable_av1_quality_diagnostics()?;
     }
+    if let Err(error) = encoder.restart_capture() {
+        if report_video_reconfiguration(error.as_ref(), events)? {
+            return Ok(StreamExit::Continue);
+        }
+        return Err(error);
+    }
+    encoder.request_keyframe()?;
     let clock = crate::clock::HostClock::new()?;
     let _audio = match audio_pipe {
         Some(pipe) => match pipe
@@ -800,7 +821,12 @@ fn run_video_stream(
                 WorkerCommand::SetVideoFrameDivisor(divisor) => pacer.set_frame_divisor(divisor)?,
                 WorkerCommand::RequestVideoKeyframe => encoder.request_keyframe()?,
                 WorkerCommand::RestartVideoCapture => {
-                    encoder.restart_capture()?;
+                    if let Err(error) = encoder.restart_capture() {
+                        if report_video_reconfiguration(error.as_ref(), events)? {
+                            return Ok(StreamExit::Continue);
+                        }
+                        return Err(error);
+                    }
                     encoder.request_keyframe()?;
                 }
                 WorkerCommand::StopVideoStream => return Ok(StreamExit::Continue),
@@ -819,13 +845,7 @@ fn run_video_stream(
             match encoder.encode_next_frame(frame_period) {
                 Ok(frame) => frame,
                 Err(error) => {
-                    if let Some(reconfiguration) =
-                        error.downcast_ref::<VideoReconfigurationRequired>()
-                    {
-                        write_event(
-                            events,
-                            &WorkerEvent::VideoReconfigurationRequired(reconfiguration.cause),
-                        )?;
+                    if report_video_reconfiguration(error.as_ref(), events)? {
                         return Ok(StreamExit::Continue);
                     }
                     return Err(error);
@@ -1215,6 +1235,41 @@ impl Drop for OwnedHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn video_reconfiguration_is_reported_instead_of_becoming_a_failure() {
+        let cause = rustconsole_protocol::wire::VideoReconfigurationCause::CaptureEngine;
+        let mut bytes = Vec::new();
+        assert!(
+            report_video_reconfiguration(&VideoReconfigurationRequired { cause }, &mut bytes)
+                .unwrap()
+        );
+        assert!(matches!(
+            read_event(&mut bytes.as_slice()).unwrap(),
+            WorkerEvent::VideoReconfigurationRequired(actual) if actual == cause
+        ));
+    }
+
+    #[test]
+    fn unrelated_video_errors_are_not_reported_as_reconfiguration() {
+        let mut bytes = Vec::new();
+        assert!(
+            !report_video_reconfiguration(&io::Error::other("capture failed"), &mut bytes).unwrap()
+        );
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn failure_to_report_video_reconfiguration_is_propagated() {
+        let cause = rustconsole_protocol::wire::VideoReconfigurationCause::CaptureEngine;
+        assert!(
+            report_video_reconfiguration(
+                &VideoReconfigurationRequired { cause },
+                &mut io::Cursor::new(&mut [0_u8; 0][..]),
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn only_a_missing_active_user_token_selects_the_system_worker() {
