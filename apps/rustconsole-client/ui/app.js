@@ -3,6 +3,7 @@ const { listen } = window.__TAURI__.event;
 
 const machineStorageKey = "rustconsole-recent-hosts";
 const bitrateStorageKey = "rustconsole-maximum-bitrate";
+const maximumDelayStorageKey = "rustconsole-maximum-delay-ms";
 const frameRateStorageKey = "rustconsole-frame-rate";
 const latencyDiagnosticsStorageKey = "rustconsole-latency-diagnostics";
 const defaultPort = 47999;
@@ -41,6 +42,8 @@ const elements = {
   credentialError: document.querySelector("#credential-error"),
   credentialSubmit: document.querySelector("#credential-submit"),
   bitrate: document.querySelector("#maximum-bitrate"),
+  maximumDelay: document.querySelector("#maximum-delay"),
+  maximumDelayValue: document.querySelector("#maximum-delay-value"),
   bitrateValue: document.querySelector("#maximum-bitrate-value"),
   frameRate: document.querySelector("#frame-rate"),
   frameRateValue: document.querySelector("#frame-rate-value"),
@@ -178,6 +181,16 @@ function loadBitrate() {
 function updateBitrate(value) {
   elements.bitrate.value = String(value);
   elements.bitrateValue.value = `${value} Mbit/s`;
+}
+
+function loadMaximumDelay() {
+  const value = Number(localStorage.getItem(maximumDelayStorageKey));
+  return Number.isInteger(value) && value >= 1 && value <= 4294967295 ? value : 100;
+}
+
+function updateMaximumDelay(value) {
+  elements.maximumDelay.value = String(value);
+  elements.maximumDelayValue.value = `${value} ms`;
 }
 
 function loadFrameRate() {
@@ -541,6 +554,7 @@ async function startPlayer(item, password = "", remember = false) {
         password,
         remember,
         maximumBitrateMbps: Number(elements.bitrate.value),
+        maximumDelayMs: Number(elements.maximumDelay.value),
         framesPerSecond: Number(elements.frameRate.value),
         latencyDiagnostics: elements.latencyDiagnostics.checked,
       },
@@ -784,6 +798,16 @@ elements.frameRate.addEventListener("input", () => {
   updateFrameRate(value);
 });
 
+elements.maximumDelay.addEventListener("change", () => {
+  if (!elements.maximumDelay.checkValidity()) {
+    elements.maximumDelay.reportValidity();
+    return;
+  }
+  const value = Number(elements.maximumDelay.value);
+  localStorage.setItem(maximumDelayStorageKey, String(value));
+  updateMaximumDelay(value);
+});
+
 elements.latencyDiagnostics.addEventListener("change", () => {
   localStorage.setItem(latencyDiagnosticsStorageKey, String(elements.latencyDiagnostics.checked));
 });
@@ -849,6 +873,7 @@ await listen("player-ended", ({ payload }) => {
 });
 
 updateBitrate(loadBitrate());
+updateMaximumDelay(loadMaximumDelay());
 updateFrameRate(loadFrameRate());
 elements.latencyDiagnostics.checked = localStorage.getItem(latencyDiagnosticsStorageKey) === "true";
 renderMachines();

@@ -9,6 +9,7 @@ pub mod av1;
 pub mod diagnostics;
 pub mod display;
 pub mod input;
+pub mod latency;
 pub mod wire;
 
 pub use av1::{
@@ -28,7 +29,7 @@ pub enum InputEvent {
 }
 
 /// The protocol version implemented by this build.
-pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(2, 2);
+pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(3, 0);
 pub const LEGACY_VIDEO_DATAGRAM_VERSION: u32 = 4;
 pub const VIDEO_DATAGRAM_VERSION: u32 = 5;
 

@@ -13,6 +13,7 @@ fn benchmark_launch_round_trip(criterion: &mut Criterion) {
             password: Zeroizing::new(vec![42; password_size]),
             remember_password: true,
             maximum_bitrate_bits_per_second: 100_000_000,
+            maximum_delay_micros: 100_000,
             frames_per_second: 120,
             latency_diagnostics: false,
         };

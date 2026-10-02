@@ -85,6 +85,16 @@
             </div>
             <div class="setting-item">
               <div>
+                <label for="maximum-delay">Maximum delay</label>
+                <output id="maximum-delay-value" for="maximum-delay">100 ms</output>
+                <p>Limits video, audio, and input acknowledgement delay separately. The session ends if bitrate reduction cannot meet the delay budget.</p>
+              </div>
+              <div class="setting-control">
+                <input id="maximum-delay" name="maximum-delay" type="number" value="100" min="1" max="4294967295" step="1" inputmode="numeric" />
+              </div>
+            </div>
+            <div class="setting-item">
+              <div>
                 <label for="frame-rate">Frame rate</label>
                 <output id="frame-rate-value" for="frame-rate">120 FPS</output>
               </div>

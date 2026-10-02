@@ -222,6 +222,7 @@ fn run_surface_proof(report: &Path) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 enum SessionEvent {
+    LatencyBudgetExceeded(rustconsole_protocol::latency::LatencyBudgetFailure),
     Authenticated([u8; 32]),
     Progress(StreamProgress),
     Statistics(VideoStreamSample),
@@ -230,6 +231,7 @@ enum SessionEvent {
 }
 
 struct QueuedVideoFrame {
+    target_bitrate_bits_per_second: u64,
     sequence: u64,
     encoded_frame_bytes: usize,
     decoded_dma_buf_bytes: usize,
@@ -257,6 +259,7 @@ struct QueuedVideoFrame {
 
 #[derive(Clone, Copy)]
 struct PendingPresentation {
+    target_bitrate_bits_per_second: u64,
     frame_sequence: u64,
     captured_at_micros: u64,
     frame_queued_at: Instant,
@@ -268,6 +271,7 @@ struct PendingPresentation {
 }
 
 struct ActiveStreamSession {
+    latency_measurements: rustconsole_player_core::latency::LatencyMeasurements,
     stop: Arc<AtomicBool>,
     input: rustconsole_player_core::InputSender,
     input_queue_drops: Arc<AtomicU64>,
@@ -312,6 +316,9 @@ fn start_stream_session(
     let maximum_bitrate_bits_per_second = launch.maximum_bitrate_bits_per_second;
     let frames_per_second = launch.frames_per_second;
     let latency_diagnostics = launch.latency_diagnostics;
+    let maximum_delay_micros = launch.maximum_delay_micros;
+    let latency_measurements = rustconsole_player_core::latency::LatencyMeasurements::default();
+    let stream_latency_measurements = latency_measurements.clone();
     let stream_diagnostic_probe_sequence = Arc::clone(&diagnostic_probe_sequence);
     let thread = std::thread::spawn(move || {
         let consume_stop = Arc::clone(&session_stop);
@@ -320,6 +327,8 @@ fn start_stream_session(
         let statistics_tx = events.clone();
         let result = rustconsole_player_linux::stream_quic_video(
             rustconsole_player_linux::StreamConfiguration {
+                maximum_delay_micros,
+                latency_measurements: stream_latency_measurements,
                 display: None,
                 address,
                 password,
@@ -369,6 +378,7 @@ fn start_stream_session(
                         return Err("decoded DMA-BUF format contradicts AV1 color metadata".into());
                     }
                     frames.push(QueuedVideoFrame {
+                        target_bitrate_bits_per_second: decoded.target_bitrate_bits_per_second,
                         sequence: decoded.sequence,
                         encoded_frame_bytes: decoded.encoded_frame_bytes,
                         decoded_dma_buf_bytes: decoded_dma_buf_bytes.unwrap_or(0),
@@ -405,6 +415,9 @@ fn start_stream_session(
                 rustconsole_player_core::StreamEnd::ReconfigurationRequired(cause) => {
                     let _ = events.send(SessionEvent::Reconfigure(cause));
                 }
+                rustconsole_player_core::StreamEnd::LatencyBudgetExceeded(failure) => {
+                    let _ = events.send(SessionEvent::LatencyBudgetExceeded(failure));
+                }
             },
             Err(error) => {
                 let _ = events.send(SessionEvent::Ended(Err(error.to_string())));
@@ -412,6 +425,7 @@ fn start_stream_session(
         }
     });
     ActiveStreamSession {
+        latency_measurements,
         stop,
         input,
         input_queue_drops,
@@ -716,12 +730,13 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
                             continue;
                         }
                         StreamProgress::ClockOffset(estimate) => {
-                            if clock_offset.is_none_or(|current| {
-                                estimate.uncertainty_micros < current.uncertainty_micros
-                            }) {
-                                clock_offset = Some(estimate);
-                            }
+                            clock_offset = session.latency_measurements.clock(Instant::now());
                             latency_diagnostics.set_clock_offset(estimate);
+                            continue;
+                        }
+                        StreamProgress::LatencyStatus(status) => {
+                            overlay.latency_status = Some(status);
+                            redraw = true;
                             continue;
                         }
                         StreamProgress::HostNetworkLink(link) => {
@@ -1488,6 +1503,14 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
                     };
                     redraw = true;
                 }
+                SessionEvent::LatencyBudgetExceeded(failure) => {
+                    release_pointer_capture(&sdl, &mut window, &mut pointer_captured);
+                    pointer_routing.release_all();
+                    stream_result = Some(Err(
+                        rustconsole_player_core::latency::budget_failure_message(failure),
+                    ));
+                    break 'running;
+                }
                 SessionEvent::Ended(result)
                     if should_retry_session_end(ever_streamed, result.is_err()) =>
                 {
@@ -1767,17 +1790,20 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
         let (latest, render_queue_depth) = frames.take_latest();
         latency_diagnostics.counter("video_render_queue_drops", frames.dropped());
         if let Some(mut frame) = latest {
-            frame.capture_player_at = clock_offset.and_then(|offset| {
-                let captured_player_micros =
-                    i128::from(frame.captured_at_micros) - i128::from(offset.offset_micros);
-                u64::try_from(i128::from(frame.assembled_at_micros) - captured_player_micros)
-                    .ok()
-                    .and_then(|duration| {
+            frame.capture_player_at =
+                session
+                    .latency_measurements
+                    .clock(Instant::now())
+                    .and_then(|offset| {
                         frame.assembled_at.and_then(|assembled_at| {
-                            assembled_at.checked_sub(Duration::from_micros(duration))
+                            rustconsole_player_core::latency::capture_player_at(
+                                offset,
+                                frame.captured_at_micros,
+                                frame.assembled_at_micros,
+                                assembled_at,
+                            )
                         })
-                    })
-            });
+                    });
             pending_video_timestamp = Some(frame.captured_at_micros);
             if let Some(duration) = frame.diagnostic_copy_duration {
                 latency_diagnostics.observe_full_frame_copy(
@@ -2028,6 +2054,7 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
                     pending_presentations.insert(
                         submission.id,
                         PendingPresentation {
+                            target_bitrate_bits_per_second: frame.target_bitrate_bits_per_second,
                             frame_sequence: frame.sequence,
                             captured_at_micros: frame.captured_at_micros,
                             frame_queued_at: frame.queued_at,
@@ -2047,7 +2074,10 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
                     observe_presented_frame(
                         &mut latency_diagnostics,
                         &mut overlay,
+                        &session.latency_measurements,
+                        true,
                         PendingPresentation {
+                            target_bitrate_bits_per_second: frame.target_bitrate_bits_per_second,
                             frame_sequence: frame.sequence,
                             captured_at_micros: frame.captured_at_micros,
                             frame_queued_at: frame.queued_at,
@@ -2128,6 +2158,8 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
                     observe_presented_frame(
                         &mut latency_diagnostics,
                         &mut overlay,
+                        &session.latency_measurements,
+                        false,
                         pending,
                         feedback.presented_at,
                         "VK_KHR_present_wait reported compositor presentation completion",
@@ -2168,12 +2200,21 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
                         queue_duration,
                         sync_hold_duration,
                     } => {
+                        let queued_before_play = u64::from(audio_output.queued_micros());
+                        let submitted_at = Instant::now();
                         audio_output.play(&decoded.samples);
+                        session.latency_measurements.audio_playback(
+                            decoded.samples.captured_at.0,
+                            decoded.assembled_at_micros,
+                            decoded.assembled_at,
+                            submitted_at,
+                            queued_before_play,
+                        );
                         observe_audio_samples(
                             &mut latency_diagnostics,
                             &decoded,
                             video_timestamp_micros,
-                            clock_offset,
+                            session.latency_measurements.clock(Instant::now()),
                             u64::from(audio_output.queued_micros()),
                             queue_duration,
                             sync_hold_duration,
@@ -2530,11 +2571,14 @@ fn observe_audio_samples(
 fn observe_presented_frame(
     diagnostics: &mut LatencyDiagnostics,
     overlay: &mut StreamOverlay,
+    measurements: &rustconsole_player_core::latency::LatencyMeasurements,
+    estimated: bool,
     pending: PendingPresentation,
     presented_at: Instant,
     endpoint: &'static str,
 ) -> Option<Duration> {
     let PendingPresentation {
+        target_bitrate_bits_per_second,
         frame_sequence,
         captured_at_micros,
         frame_queued_at,
@@ -2544,9 +2588,18 @@ fn observe_presented_frame(
         diagnostic_marker_input_sequence,
         correlated_input_started_at,
     } = pending;
-    let video_latency = overlay.observe_video_presentation(
+    measurements.video_presentation(
         captured_at_micros,
-        capture_player_at.map(|captured_at| presented_at.saturating_duration_since(captured_at)),
+        capture_player_at,
+        presented_at,
+        target_bitrate_bits_per_second,
+        estimated,
+    );
+    let video_latency = overlay.video_presentation.observe(
+        captured_at_micros,
+        rustconsole_player_core::latency::presentation_delay(capture_player_at, presented_at),
+        estimated,
+        presented_at,
     );
     if let Some(duration) = video_latency {
         diagnostics.observe_classified(
@@ -2740,6 +2793,7 @@ fn link_name(link: PhysicalLinkKind) -> &'static str {
 }
 
 struct StreamOverlay {
+    latency_status: Option<rustconsole_protocol::latency::LatencyControlStatus>,
     audio: Option<rustconsole_player_core::AudioTransportSnapshot>,
     audio_playback: AudioPlaybackSnapshot,
     statistics: OverlayStatistics,
@@ -2750,9 +2804,7 @@ struct StreamOverlay {
     completed_frames: u64,
     incomplete_frames: u64,
     input_round_trip: Option<Duration>,
-    video_latency: Option<Duration>,
-    last_video_capture_micros: Option<u64>,
-    last_video_presentation: Option<Instant>,
+    video_presentation: rustconsole_player_core::latency::VideoPresentationLatency,
     network_path: NetworkPath,
     host_link: Option<(PhysicalLinkKind, Instant)>,
     interval_started: Instant,
@@ -2763,6 +2815,7 @@ struct StreamOverlay {
 impl StreamOverlay {
     fn new(maximum_bitrate_bits_per_second: u64) -> Self {
         Self {
+            latency_status: None,
             audio: None,
             audio_playback: AudioPlaybackSnapshot::default(),
             statistics: OverlayStatistics::default(),
@@ -2773,9 +2826,8 @@ impl StreamOverlay {
             completed_frames: 0,
             incomplete_frames: 0,
             input_round_trip: None,
-            video_latency: None,
-            last_video_capture_micros: None,
-            last_video_presentation: None,
+            video_presentation: rustconsole_player_core::latency::VideoPresentationLatency::default(
+            ),
             network_path: NetworkPath {
                 kind: PathKind::Unknown,
                 local_link: PhysicalLinkKind::Unknown,
@@ -2817,31 +2869,38 @@ impl StreamOverlay {
         }
     }
 
+    #[cfg(test)]
     fn observe_video_presentation(
         &mut self,
         captured_at_micros: u64,
         latency: Option<Duration>,
     ) -> Option<Duration> {
-        self.last_video_presentation = Some(Instant::now());
-        if self.last_video_capture_micros == Some(captured_at_micros) {
-            return None;
-        }
-        self.last_video_capture_micros = Some(captured_at_micros);
-        self.video_latency = latency;
-        latency
+        self.video_presentation
+            .observe(captured_at_micros, latency, false, Instant::now())
     }
 
     fn video_is_stalled(&self) -> bool {
-        self.last_video_presentation
-            .is_some_and(|at| at.elapsed() >= VIDEO_PRESENTATION_STALL)
+        self.video_presentation
+            .stalled(Instant::now(), VIDEO_PRESENTATION_STALL)
     }
 
     fn video_latency_text(&self) -> String {
         if self.video_is_stalled() {
             "stalled (no new frame)".to_owned()
         } else {
-            self.video_latency
-                .map(|duration| format!("{:.1} ms", duration.as_secs_f64() * 1_000.0))
+            self.video_presentation
+                .latest()
+                .map(|duration| {
+                    format!(
+                        "{:.1} ms{}",
+                        duration.as_secs_f64() * 1_000.0,
+                        if self.video_presentation.estimated() {
+                            " (estimated presentation)"
+                        } else {
+                            ""
+                        }
+                    )
+                })
                 .unwrap_or_else(|| "unavailable".to_owned())
         }
     }
@@ -2885,7 +2944,16 @@ impl StreamOverlay {
             self.statistics.late_chunks,
             self.statistics.assembly_overflows,
         );
-        format!("{video}\n{}", self.audio_text())
+        let latency = self.latency_status.map_or_else(|| "Latency control: calibrating".to_owned(), |status| {
+            format!("Latency ceiling {}\nHighest delay pressure {:.0}%  Preference score {:.3}\nLatency measurements: {}{}",
+                format_soft_ceiling(status.ceiling_bits_per_second),
+                f64::from(status.highest_pressure_ppm) / 10_000.0,
+                f64::from(status.score_ppm) / 1_000_000.0,
+                if status.measurements_ready { "ready" } else { "calibrating or unavailable" },
+                if status.uses_estimates { " (includes estimates)" } else { "" },
+            )
+        });
+        format!("{video}\n{latency}\n{}", self.audio_text())
     }
 
     fn audio_text(&self) -> String {
@@ -3143,7 +3211,12 @@ mod tests {
                 .contains("Video capture to presentation 67.0 ms")
         );
 
-        overlay.last_video_presentation = Some(Instant::now() - VIDEO_PRESENTATION_STALL);
+        overlay.video_presentation.observe(
+            1,
+            Some(Duration::from_millis(67)),
+            false,
+            Instant::now() - VIDEO_PRESENTATION_STALL,
+        );
         assert!(
             overlay
                 .text("Streaming")
@@ -3167,7 +3240,12 @@ mod tests {
             Some(Duration::from_millis(67))
         );
         for age in [Duration::from_secs(1), Duration::from_secs(60)] {
-            overlay.last_video_presentation = Some(Instant::now() - VIDEO_PRESENTATION_STALL);
+            overlay.video_presentation.observe(
+                10,
+                Some(Duration::from_millis(67)),
+                false,
+                Instant::now() - VIDEO_PRESENTATION_STALL,
+            );
             assert_eq!(overlay.observe_video_presentation(10, Some(age)), None);
             assert!(
                 overlay

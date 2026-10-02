@@ -56,6 +56,7 @@ const CAPABILITY_FIXTURE: &[u8] = include_bytes!("../test-data/av1-2560x1440-420
 pub struct LinuxSecretStore;
 
 pub struct DecodedVideoFrame {
+    pub target_bitrate_bits_per_second: u64,
     pub sequence: u64,
     pub encoded_frame_bytes: usize,
     pub captured_at_micros: u64,
@@ -86,6 +87,8 @@ pub struct StreamCallbacks<Authenticated, Progress, Statistics, Audio, Video> {
 }
 
 pub struct StreamConfiguration {
+    pub maximum_delay_micros: u64,
+    pub latency_measurements: rustconsole_player_core::latency::LatencyMeasurements,
     pub display: Option<rustconsole_protocol::display::Display>,
     pub address: String,
     pub password: Option<Vec<u8>>,
@@ -297,6 +300,8 @@ pub fn stream_quic_video(
     >,
 ) -> Result<rustconsole_player_core::StreamHostResult, Box<dyn std::error::Error>> {
     let StreamConfiguration {
+        maximum_delay_micros,
+        latency_measurements,
         display,
         address,
         password,
@@ -385,6 +390,8 @@ pub fn stream_quic_video(
             observe_progress(progress);
         },
         full_diagnostics: latency_diagnostics,
+        maximum_delay_micros,
+        latency_measurements,
         video: (vec![capability_10, capability_8], settings),
         should_stop,
         input,
@@ -484,6 +491,7 @@ pub fn stream_quic_video(
                             }
                         }
                         consume_video(DecodedVideoFrame {
+                            target_bitrate_bits_per_second: frame.target_bitrate_bits_per_second,
                             sequence: frame.sequence,
                             encoded_frame_bytes: frame.payload.len(),
                             captured_at_micros: frame.captured_at_micros,
@@ -772,6 +780,7 @@ fn domain_capability(
 
 fn wire_settings(settings: &DomainSettings) -> Av1ViewerSettings {
     Av1ViewerSettings {
+        maximum_delay_micros: 0,
         width: settings.width,
         height: settings.height,
         frames_per_second: u32::from(settings.frames_per_second),
@@ -787,6 +796,7 @@ fn wire_selected(
     selected: rustconsole_protocol::NegotiatedAv1Configuration,
 ) -> SelectedAv1Configuration {
     SelectedAv1Configuration {
+        maximum_delay_micros: 0,
         dedicated_input_stream: false,
         video_datagram_version: rustconsole_protocol::VIDEO_DATAGRAM_VERSION,
         bandwidth_probe_version: 0,

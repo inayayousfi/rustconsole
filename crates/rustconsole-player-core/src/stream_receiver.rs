@@ -29,6 +29,7 @@ use std::time::{Duration, Instant};
 const KEYFRAME_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 
 enum DiagnosticEvent {
+    LatencyStatus(rustconsole_protocol::latency::LatencyControlStatus),
     ReleasePointerCapture,
     Clock(crate::ClockOffsetEstimate),
     HostNetworkLink(rustconsole_protocol::wire::PhysicalLinkKind),
@@ -211,24 +212,7 @@ fn clock_offset(
     pong: ClockPong,
     player_received_at_micros: u64,
 ) -> Option<crate::ClockOffsetEstimate> {
-    if pong.player_sent_at_micros > player_received_at_micros
-        || pong.host_received_at_micros > pong.host_sent_at_micros
-    {
-        return None;
-    }
-    let round_trip = player_received_at_micros - pong.player_sent_at_micros;
-    let host_processing = pong.host_sent_at_micros - pong.host_received_at_micros;
-    if host_processing > round_trip {
-        return None;
-    }
-    let offset = ((i128::from(pong.host_received_at_micros)
-        - i128::from(pong.player_sent_at_micros))
-        + (i128::from(pong.host_sent_at_micros) - i128::from(player_received_at_micros)))
-        / 2;
-    Some(crate::ClockOffsetEstimate {
-        offset_micros: i64::try_from(offset).ok()?,
-        uncertainty_micros: (round_trip - host_processing).div_ceil(2),
-    })
+    rustconsole_session::latency_probe::clock_offset(pong, player_received_at_micros)
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -698,6 +682,8 @@ pub(super) struct ReceiveStreamParameters<Stop, Progress, Audio, Video> {
     pub(super) audio_enabled: bool,
     pub(super) host_pointer_release: bool,
     pub(super) network_status: bool,
+    pub(super) session_started: Instant,
+    pub(super) latency_measurements: crate::latency::LatencyMeasurements,
     pub(super) diagnostic_stream: Option<quinn::RecvStream>,
     pub(super) should_stop: Stop,
     pub(super) input: crate::InputReceiver,
@@ -726,6 +712,8 @@ where
         audio_enabled,
         host_pointer_release,
         network_status,
+        session_started,
+        latency_measurements,
         diagnostic_stream,
         should_stop,
         input: mut next_input,
@@ -743,7 +731,6 @@ where
     let payload_digests = diagnostic_stream
         .as_ref()
         .map(|_| Arc::new(MediaQueue::new(4_096)));
-    let full_diagnostics = payload_digests.is_some();
     let snapshot = Arc::new(Mutex::new(Snapshot {
         audio: AudioTransportSnapshot {
             receive: AudioReceiveStatistics::default(),
@@ -770,7 +757,6 @@ where
     let keyframe_requests = Arc::new(AtomicU64::new(0));
     let keyframe_recovery_started = Arc::new(Mutex::new(None::<Instant>));
     let stop = Arc::new(AtomicBool::new(false));
-    let session_started = Instant::now();
     let mut receiver = Receiver {
         started: session_started,
         video: VideoFrameAssembler::new(fps),
@@ -790,7 +776,6 @@ where
     let reader_connection = connection.clone();
     let reader_diagnostics = Arc::clone(&diagnostic_events);
     let reader_started = session_started;
-    let reader_full_diagnostics = full_diagnostics;
     let digest_task = diagnostic_stream
         .zip(payload_digests.as_ref())
         .map(|(mut stream, queue)| {
@@ -846,6 +831,7 @@ where
             let input_generation = 1;
             let mut input_sequence = 0u64;
             let mut clock_sequence = 0_u64;
+            let mut pending_clocks = BTreeMap::new();
             let mut next_clock_sync = Instant::now();
             let mut keyboard_leds = KeyboardLedReceiver::default();
             let end = 'stream: loop {
@@ -861,8 +847,12 @@ where
                         }
                         message = &mut control => {
                             match message.map_err(|e| e.to_string())?.body {
-                                Some(envelope::Body::AudioStreamState(state)) => receiver.state(state),
+                                Some(envelope::Body::AudioStreamState(state)) => {
+                                    latency_measurements.set_audio_active(state.status == AudioStatus::Active as i32);
+                                    receiver.state(state);
+                                }
                                 Some(envelope::Body::InputAck(ack)) => {
+                                    latency_measurements.input_acknowledged(ack.through_sequence, Instant::now());
                                     reader_diagnostics.push(DiagnosticEvent::InputAck {
                                         sequence: ack.through_sequence,
                                         player_sent_at_micros: ack.player_sent_at_micros,
@@ -888,7 +878,10 @@ where
                                     });
                                 }
                                 Some(envelope::Body::ClockPong(pong)) => {
+                                    let Some(sent) = pending_clocks.remove(&pong.sequence) else { break; };
+                                    if sent != pong.player_sent_at_micros { return Err("clock reply does not match its request".to_owned()); }
                                     if let Some(estimate) = clock_offset(pong, elapsed_micros(reader_started)) {
+                                        latency_measurements.set_clock(estimate, Instant::now());
                                         reader_diagnostics.push(DiagnosticEvent::Clock(estimate));
                                     }
                                 }
@@ -907,6 +900,14 @@ where
                                 Some(envelope::Body::VideoStreamState(state)) => {
                                     let cause = state.reconfiguration_cause().ok_or("invalid video stream state")?;
                                     break 'stream StreamEnd::ReconfigurationRequired(cause);
+                                }
+                                Some(envelope::Body::LatencyControlStatus(status)) => {
+                                    if !status.valid() { return Err("invalid host latency status".to_owned()); }
+                                    reader_diagnostics.push(DiagnosticEvent::LatencyStatus(status));
+                                }
+                                Some(envelope::Body::LatencyBudgetFailure(failure)) => {
+                                    if !failure.valid() { return Err("invalid host latency failure".to_owned()); }
+                                    break 'stream StreamEnd::LatencyBudgetExceeded(failure);
                                 }
                                 Some(envelope::Body::HostSessionControl(control)) => {
                                     if !host_pointer_release {
@@ -942,15 +943,18 @@ where
                                     input_sequence = input_sequence.checked_add(1).ok_or("input sequence exhausted")?;
                                     let correlates_test_marker = matches!(event, InputEvent::PointerButton { pressed: true, .. });
                                     transitions.push(crate::encode_reliable_input(event, input_generation, input_sequence, player_sent_at_micros));
-                                    sent_events.push((input_sequence, occurred_at, correlates_test_marker));
+                                     sent_events.push((input_sequence, occurred_at, correlates_test_marker));
+                                     latency_measurements.input_queued(input_sequence, occurred_at);
                                 }
                                 permit.send(OutgoingControl { envelope: Envelope { body: Some(envelope::Body::InputPack(InputPack { transitions })) }, input_events: sent_events });
                         }
                         _ = ticks.tick() => {
                             if reader_stop.load(Ordering::Acquire) { break 'stream StreamEnd::Stopped; }
-                            if reader_full_diagnostics && Instant::now() >= next_clock_sync {
+                            if Instant::now() >= next_clock_sync {
                                 clock_sequence = clock_sequence.checked_add(1).ok_or("clock sequence exhausted")?;
                                 let player_sent_at_micros = elapsed_micros(reader_started);
+                                pending_clocks.insert(clock_sequence, player_sent_at_micros);
+                                while pending_clocks.len() > 16 { pending_clocks.pop_first(); }
                                 queue_control(&control_send, Envelope { body: Some(envelope::Body::ClockPing(ClockPing { sequence: clock_sequence, player_sent_at_micros })) }, Vec::new())?;
                                 next_clock_sync = Instant::now() + Duration::from_millis(500);
                             }
@@ -978,7 +982,8 @@ where
                                     last_completed_assembly_micros: stats.last_completed_assembly_micros,
                                     last_assembly_budget_micros: stats.last_assembly_budget_micros,
                                     completed_payload_bytes: stats.completed_payload_bytes,
-                                    measurement_interval_micros: last_report.elapsed().as_micros() as u64,
+                                     measurement_interval_micros: last_report.elapsed().as_micros() as u64,
+                                     latency: Some(latency_measurements.take_report(Instant::now())),
                                 };
                                 queue_control(&control_send, Envelope { body: Some(envelope::Body::VideoReceiverReport(report)) }, Vec::new())?;
                                 last_report = Instant::now();
@@ -987,13 +992,17 @@ where
                     }
                 }
             };
+            let terminal_latency_failure = matches!(end, StreamEnd::LatencyBudgetExceeded(_));
             input_sequence = input_sequence.checked_add(1).ok_or("input sequence exhausted")?;
-            queue_control(&input_send, Envelope { body: Some(envelope::Body::InputPack(InputPack { transitions: vec![crate::encode_reliable_input(InputEvent::ReleaseAll, input_generation, input_sequence, elapsed_micros(reader_started))] })) }, Vec::new())?;
-            queue_control(&control_send, Envelope { body: Some(envelope::Body::VideoControl(VideoControl { kind: VideoControlKind::Stop as i32 })) }, Vec::new())?;
+            let release = queue_control(&input_send, Envelope { body: Some(envelope::Body::InputPack(InputPack { transitions: vec![crate::encode_reliable_input(InputEvent::ReleaseAll, input_generation, input_sequence, elapsed_micros(reader_started))] })) }, Vec::new());
+            let stop = queue_control(&control_send, Envelope { body: Some(envelope::Body::VideoControl(VideoControl { kind: VideoControlKind::Stop as i32 })) }, Vec::new());
+            if !terminal_latency_failure { release?; stop?; }
             drop(input_send);
             drop(control_send);
             while let Some(writer) = writers.join_next().await {
-                writer.map_err(|error| error.to_string())??;
+                // The host releases input before delivering a terminal budget failure.
+                // Preserve that reason even if its subsequent close rejects cleanup writes.
+                if !terminal_latency_failure { writer.map_err(|error| error.to_string())??; }
             }
             Ok(end)
         }.await;
@@ -1056,6 +1065,9 @@ where
                     progress(StreamProgress::ReleasePointerCapture)
                 }
                 DiagnosticEvent::Clock(estimate) => progress(StreamProgress::ClockOffset(estimate)),
+                DiagnosticEvent::LatencyStatus(status) => {
+                    progress(StreamProgress::LatencyStatus(status))
+                }
                 DiagnosticEvent::HostNetworkLink(link) => {
                     progress(StreamProgress::HostNetworkLink(link))
                 }
@@ -1200,13 +1212,20 @@ where
                 });
                 first = false;
             }
+            let assembled_at = Instant::now();
+            let assembled_at_micros = u64::try_from(
+                assembled_at
+                    .saturating_duration_since(session_started)
+                    .as_micros(),
+            )
+            .unwrap_or(u64::MAX);
             let keep_streaming = consume_video(
                 frame,
                 StreamTransportStatistics {
                     round_trip_time: snapshot.rtt,
                     assembly: snapshot.video,
-                    assembled_at: payload_digests.as_ref().map(|_| Instant::now()),
-                    assembled_at_micros: elapsed_micros(session_started),
+                    assembled_at: Some(assembled_at),
+                    assembled_at_micros,
                     assembly_duration: Duration::from_micros(
                         snapshot.video.last_completed_assembly_micros,
                     ),
@@ -1247,12 +1266,88 @@ where
 pub enum StreamEnd {
     Stopped,
     ReconfigurationRequired(VideoReconfigurationCause),
+    LatencyBudgetExceeded(rustconsole_protocol::latency::LatencyBudgetFailure),
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use rustconsole_protocol::wire::{InputTransition, KeyTransition, input_transition};
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn host_budget_failure_reaches_the_terminal_player_result() {
+        let server = quinn::Endpoint::server(
+            rustconsole_session::quic::ephemeral_server_config().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .unwrap();
+        let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        client
+            .set_default_client_config(rustconsole_session::quic::opaque_client_config().unwrap());
+        let connecting = client
+            .connect(server.local_addr().unwrap(), "rustconsole.invalid")
+            .unwrap();
+        let (client_connection, server_connection) =
+            tokio::join!(async { connecting.await.unwrap() }, async {
+                server.accept().await.unwrap().await.unwrap()
+            },);
+        let (mut send, receive) = client_connection.open_bi().await.unwrap();
+        send.write_all(&[0]).await.unwrap();
+        let (mut host_send, mut host_receive) = server_connection.accept_bi().await.unwrap();
+        host_receive.read_exact(&mut [0]).await.unwrap();
+        let failure = rustconsole_protocol::latency::LatencyBudgetFailure {
+            channel: rustconsole_protocol::latency::LatencyChannel::Video as i32,
+            observed_delay_micros: 120_000,
+            budget_micros: 80_000,
+            absolute_limit_micros: 100_000,
+            baseline_micros: 40_000,
+            estimated: true,
+        };
+        let host = tokio::spawn(async move {
+            write_envelope(
+                &mut host_send,
+                Envelope {
+                    body: Some(envelope::Body::LatencyBudgetFailure(failure)),
+                },
+            )
+            .await
+            .unwrap();
+            host_send.finish().unwrap();
+            // Retain the connection until the player has read the terminal message.
+            let _ = server_connection.closed().await;
+        });
+        let (input_sender, input) = crate::input_channel();
+        let start = Instant::now();
+        let result = receive_stream(ReceiveStreamParameters {
+            connection: client_connection,
+            control: (send, receive),
+            input_stream: None,
+            fps: 60,
+            audio_enabled: false,
+            host_pointer_release: false,
+            network_status: false,
+            session_started: start,
+            latency_measurements: crate::latency::LatencyMeasurements::default(),
+            diagnostic_stream: None,
+            should_stop: || start.elapsed() > Duration::from_secs(2),
+            input,
+            progress: |_| {},
+            consumers: StreamConsumers {
+                audio: || |_| Ok(()),
+                video: |_, _| Ok(true),
+            },
+        })
+        .await
+        .unwrap();
+        drop(input_sender);
+        assert_eq!(result, StreamEnd::LatencyBudgetExceeded(failure));
+        let message = crate::latency::budget_failure_message(failure);
+        assert!(message.contains("video capture to presentation"));
+        assert!(message.contains("120.0 ms (estimated)"));
+        assert!(message.contains("Allowed delay: 80.0 ms"));
+        assert!(message.contains("minimum of 1 Mbit/s"));
+        host.await.unwrap();
+    }
 
     #[test]
     fn reliable_queue_preserves_key_transitions_and_rejects_overflow() {
@@ -1693,6 +1788,14 @@ mod tests {
         });
         let started = Instant::now();
         let mut count = 0;
+        let latency_measurements = crate::latency::LatencyMeasurements::default();
+        latency_measurements.set_clock(
+            crate::ClockOffsetEstimate {
+                offset_micros: 0,
+                uncertainty_micros: 0,
+            },
+            started,
+        );
         let audio_count = Arc::new(AtomicU64::new(0));
         let consumed_audio_count = Arc::clone(&audio_count);
         let video_audio_count = Arc::clone(&audio_count);
@@ -1722,6 +1825,8 @@ mod tests {
             audio_enabled: true,
             host_pointer_release: true,
             network_status: false,
+            session_started: started,
+            latency_measurements: latency_measurements.clone(),
             diagnostic_stream: None,
             should_stop: || started.elapsed() >= Duration::from_millis(550),
             input,
@@ -1737,7 +1842,27 @@ mod tests {
                         Ok(())
                     }
                 },
-                video: |_, _| {
+                video: |frame: VideoFramePayload, transport: StreamTransportStatistics| {
+                    let assembled_at = transport.assembled_at.expect(
+                        "normal video reception must carry its timing anchor without diagnostics",
+                    );
+                    assert!(transport.assembled_payload_sha256.is_none());
+                    let captured_at = crate::latency::capture_player_at(
+                        latency_measurements.clock(Instant::now()).unwrap(),
+                        frame.captured_at_micros,
+                        transport.assembled_at_micros,
+                        assembled_at,
+                    );
+                    assert!(captured_at.is_some());
+                    // A simulated submission endpoint exercises the actual receiver
+                    // timing path, without requiring a native decoder or display.
+                    latency_measurements.video_presentation(
+                        frame.captured_at_micros,
+                        captured_at,
+                        Instant::now(),
+                        frame.target_bitrate_bits_per_second,
+                        true,
+                    );
                     count += 1;
                     if count == 1 {
                         let deadline = Instant::now() + Duration::from_millis(500);
@@ -1762,6 +1887,16 @@ mod tests {
         input_producer.abort();
         let latest = latest.unwrap();
         assert_eq!(count, 2);
+        let video_delay = latency_measurements
+            .take_report(Instant::now())
+            .video
+            .expect("normal play must report video delay");
+        assert!(video_delay.valid());
+        assert!(video_delay.delay_micros > 0);
+        assert_eq!(
+            video_delay.samples, 1,
+            "repeated captures must not add delay samples"
+        );
         assert_eq!(audio_count.load(Ordering::Relaxed), 2);
         assert_eq!(latest.receive.completed_packets, 2);
         assert_eq!(latest.receive.malformed_fragments, 1);

@@ -466,6 +466,13 @@ mod tests {
         let ((), capacity) = tokio::join!(player, host);
 
         assert!(capacity > 0);
-        assert!(capacity <= 10_000_000);
+        // The 200 ms window can include one 7x keyframe burst, with
+        // other frames up to 1.8x average. Include a boundary frame
+        // and the partial datagram budget carried from warmup.
+        let maximum_frames = 30_u64;
+        let average_frame_bytes = 8_000_000_u64.div_ceil(8 * 144);
+        let maximum_bytes = average_frame_bytes * (7_000 + (maximum_frames - 1) * 1_800) / 1_000
+            + DATAGRAM_SIZE as u64;
+        assert!(capacity <= maximum_bytes * 8 * 5);
     }
 }

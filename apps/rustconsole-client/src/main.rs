@@ -327,6 +327,7 @@ struct StartRequest {
     password: String,
     remember: bool,
     maximum_bitrate_mbps: u64,
+    maximum_delay_ms: u64,
     frames_per_second: u16,
     latency_diagnostics: bool,
 }
@@ -342,10 +343,13 @@ fn start(
         password,
         remember,
         maximum_bitrate_mbps,
+        maximum_delay_ms,
         frames_per_second,
         latency_diagnostics,
     } = request;
     let maximum_bitrate_bits_per_second = maximum_bitrate(maximum_bitrate_mbps)?;
+    let maximum_delay_micros = rustconsole_client_core::maximum_delay_from_millis(maximum_delay_ms)
+        .map_err(|error| error.to_string())?;
     if frames_per_second == 0 {
         return Err("Frame rate must be a positive integer.".into());
     }
@@ -363,6 +367,7 @@ fn start(
         password: Zeroizing::new(password.to_vec()),
         remember_password: remember,
         maximum_bitrate_bits_per_second,
+        maximum_delay_micros,
         frames_per_second,
         latency_diagnostics,
     };

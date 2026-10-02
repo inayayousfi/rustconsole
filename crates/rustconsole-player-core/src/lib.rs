@@ -1,6 +1,7 @@
 //! Platform-neutral player session orchestration.
 
 mod input_pipeline;
+pub mod latency;
 mod playback;
 pub mod process_protocol;
 pub use input_pipeline::encode_reliable_input;
@@ -292,6 +293,7 @@ fn vb_cable_availability(status: i32) -> Result<VbCableAvailability, &'static st
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StreamProgress {
+    LatencyStatus(rustconsole_protocol::latency::LatencyControlStatus),
     AudioTransport(AudioTransportSnapshot),
     PointerCaptureAvailable(bool),
     ReleasePointerCapture,
@@ -455,6 +457,8 @@ pub struct StreamHostParameters<PasswordFor, Authenticated, Progress, Stop, Audi
     pub on_authenticated: Authenticated,
     pub on_progress: Progress,
     pub full_diagnostics: bool,
+    pub maximum_delay_micros: u64,
+    pub latency_measurements: latency::LatencyMeasurements,
     pub video: (Vec<DomainCapability>, DomainSettings),
     pub should_stop: Stop,
     pub input: InputReceiver,
@@ -626,12 +630,17 @@ where
         on_authenticated,
         mut on_progress,
         full_diagnostics,
+        maximum_delay_micros,
+        latency_measurements,
         video,
         should_stop,
         input,
         consumers,
     } = parameters;
     let (decoder_capabilities, settings) = video;
+    if !rustconsole_protocol::latency::valid_maximum_delay(maximum_delay_micros) {
+        return Err("maximum delay must be positive".into());
+    }
     let StreamConsumers {
         audio: consume_audio,
         video: consume_video,
@@ -686,7 +695,11 @@ where
                             .copied()
                             .map(wire_capability)
                             .collect(),
-                        viewer_settings: Some(wire_settings(&settings)),
+                        viewer_settings: Some({
+                            let mut value = wire_settings(&settings);
+                            value.maximum_delay_micros = maximum_delay_micros;
+                            value
+                        }),
                     })),
                 },
             )
@@ -758,6 +771,7 @@ where
         selected_wire.video_datagram_version = video_datagram_version;
         selected_wire.bandwidth_probe_version = bandwidth_probe_version;
         selected_wire.network_status_version = network_status_version;
+        selected_wire.maximum_delay_micros = maximum_delay_micros;
         session_try!(
             "sending player AV1 selection",
             rustconsole_session::quic::write_envelope(
@@ -791,11 +805,27 @@ where
             }
         }
         on_progress(StreamProgress::MeasuringConnection);
+        let session_started = Instant::now();
+        let (_, clock) = session_try!(
+            "measuring startup latency",
+            rustconsole_session::latency_probe::player(&mut send, &mut receive, session_started)
+                .await
+        );
+        latency_measurements.set_clock(clock, Instant::now());
+        on_progress(StreamProgress::ClockOffset(clock));
         session_try!(
             "measuring startup bandwidth",
             rustconsole_session::bandwidth_probe::receive(&connection, &mut send, &mut receive)
                 .await
         );
+        // Measure again after the loaded test without replacing the unloaded baseline.
+        let (_, clock) = session_try!(
+            "settling startup bandwidth queues",
+            rustconsole_session::latency_probe::player(&mut send, &mut receive, session_started)
+                .await
+        );
+        latency_measurements.set_clock(clock, Instant::now());
+        on_progress(StreamProgress::ClockOffset(clock));
         on_progress(StreamProgress::PointerCaptureAvailable(
             host_pointer_release,
         ));
@@ -838,6 +868,8 @@ where
                 audio_enabled: audio_transport.is_some(),
                 host_pointer_release,
                 network_status: network_status_version != 0,
+                session_started,
+                latency_measurements,
                 diagnostic_stream,
                 should_stop,
                 input,
@@ -943,6 +975,7 @@ fn domain_capability(
 
 fn wire_settings(settings: &DomainSettings) -> Av1ViewerSettings {
     Av1ViewerSettings {
+        maximum_delay_micros: 0,
         width: settings.width,
         height: settings.height,
         frames_per_second: u32::from(settings.frames_per_second),
@@ -980,6 +1013,7 @@ fn wire_selected(
         maximum_frames_per_second: selected.frames_per_second,
     });
     SelectedAv1Configuration {
+        maximum_delay_micros: 0,
         dedicated_input_stream: false,
         video_datagram_version: rustconsole_session::video_datagram::LEGACY_VIDEO_DATAGRAM_VERSION,
         bandwidth_probe_version: BANDWIDTH_PROBE_VERSION,

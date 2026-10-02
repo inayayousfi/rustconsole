@@ -19,6 +19,7 @@ pub struct HostEncodedVideoFrame {
 pub struct HostVideoStreamPolicy {
     bitrate: AdaptiveBitrateController,
     recovery: VideoRecovery,
+    latency: Option<crate::latency::LatencyPolicy>,
 }
 
 impl HostVideoStreamPolicy {
@@ -27,6 +28,7 @@ impl HostVideoStreamPolicy {
         Self {
             bitrate: AdaptiveBitrateController::new(maximum_bits_per_second),
             recovery: VideoRecovery::default(),
+            latency: None,
         }
     }
 
@@ -41,6 +43,7 @@ impl HostVideoStreamPolicy {
                 measured_capacity_bits_per_second,
             ),
             recovery: VideoRecovery::default(),
+            latency: None,
         }
     }
 
@@ -52,6 +55,72 @@ impl HostVideoStreamPolicy {
         self.bitrate.observe(path, delivery)
     }
 
+    pub fn enable_latency_control(
+        &mut self,
+        maximum_delay_micros: u64,
+        network_baseline_micros: u64,
+        now: Instant,
+    ) {
+        self.bitrate
+            .set_latency_target(crate::VIDEO_BITRATE_BOOTSTRAP, 0);
+        self.latency = Some(crate::latency::LatencyPolicy::new(
+            maximum_delay_micros,
+            network_baseline_micros,
+            now,
+        ));
+    }
+
+    pub fn observe_receiver_with_latency(
+        &mut self,
+        path: VideoPathReport,
+        delivery: VideoDeliveryReport,
+        report: Option<rustconsole_protocol::latency::LatencyReport>,
+        now: Instant,
+    ) -> Result<Option<BitrateChange>, rustconsole_protocol::latency::LatencyBudgetFailure> {
+        let reference = self
+            .bitrate
+            .delivery_ceiling_bits_per_second()
+            .unwrap_or(self.bitrate.maximum_bits_per_second)
+            .min(self.bitrate.maximum_bits_per_second);
+        let previous = self.target_bits_per_second();
+        let Some(latency) = self.latency.as_mut() else {
+            return Ok(self.bitrate.observe(path, delivery));
+        };
+        let evaluation = latency.observe(
+            report,
+            u64::try_from(path.round_trip_time.as_micros()).unwrap_or(u64::MAX),
+            previous,
+            reference,
+            now,
+        );
+        if let Some(failure) = evaluation.failure {
+            return Err(failure);
+        }
+        self.bitrate.configure_latency_ceiling(latency.ceiling());
+        let mut change =
+            self.bitrate
+                .observe_with_recovery(path, delivery, evaluation.allow_increase);
+        if let Some(target) = evaluation.reduce_to {
+            let target = target.min(self.bitrate.target_bits_per_second());
+            let latency_change = self
+                .bitrate
+                .set_latency_target(target, latency.retry_delay_micros());
+            if latency_change.is_some() {
+                change = latency_change;
+            }
+        }
+        if let Some(change) = change {
+            latency.bitrate_changed(previous, change.target_bits_per_second, reference, now);
+        }
+        Ok(change)
+    }
+
+    pub fn latency_status(&self) -> Option<rustconsole_protocol::latency::LatencyControlStatus> {
+        self.latency
+            .as_ref()
+            .map(crate::latency::LatencyPolicy::status)
+    }
+
     pub fn observe_worker_queue_drop(&mut self) {
         self.recovery.require_keyframe();
         self.bitrate.observe_sender_pressure();
@@ -59,7 +128,23 @@ impl HostVideoStreamPolicy {
 
     pub fn observe_send_deadline_expired(&mut self) -> Option<BitrateChange> {
         self.recovery.require_keyframe();
-        self.bitrate.observe_sender_congestion()
+        let previous = self.target_bits_per_second();
+        let change = self.bitrate.observe_sender_congestion();
+        if let Some(change) = change
+            && let Some(latency) = self.latency.as_mut()
+        {
+            let reference = self
+                .bitrate
+                .delivery_ceiling_bits_per_second()
+                .unwrap_or(self.bitrate.maximum_bits_per_second);
+            latency.bitrate_changed(
+                previous,
+                change.target_bits_per_second,
+                reference,
+                Instant::now(),
+            );
+        }
+        change
     }
 
     pub fn require_keyframe(&mut self) {

@@ -1,5 +1,6 @@
 //! Platform-neutral host session orchestration.
 
+pub mod latency;
 pub mod video_pacing;
 mod video_recovery;
 pub mod video_stream;
@@ -131,6 +132,7 @@ pub struct AdaptiveBitrateController {
     soft_ceiling_healthy_micros: u64,
     recovery_cooldown_micros: u64,
     provisional_ceiling_bits_per_second: Option<u64>,
+    latency_ceiling_bits_per_second: Option<u64>,
     failed_probe_targets: VecDeque<u64>,
     active_probe: Option<ActiveBitrateProbe>,
     probe_interval_micros: u64,
@@ -165,6 +167,7 @@ impl AdaptiveBitrateController {
             soft_ceiling_healthy_micros: 0,
             recovery_cooldown_micros: 0,
             provisional_ceiling_bits_per_second: None,
+            latency_ceiling_bits_per_second: None,
             failed_probe_targets: VecDeque::with_capacity(FAILED_PROBE_AVERAGE_SAMPLES),
             active_probe: None,
             probe_interval_micros: SOFT_CEILING_PROBE_INTERVAL_MICROS,
@@ -229,6 +232,15 @@ impl AdaptiveBitrateController {
         &mut self,
         path: VideoPathReport,
         delivery: VideoDeliveryReport,
+    ) -> Option<BitrateChange> {
+        self.observe_with_recovery(path, delivery, true)
+    }
+
+    pub fn observe_with_recovery(
+        &mut self,
+        path: VideoPathReport,
+        delivery: VideoDeliveryReport,
+        allow_increase: bool,
     ) -> Option<BitrateChange> {
         let completed_payload_bytes = delivery
             .completed_payload_bytes
@@ -395,6 +407,10 @@ impl AdaptiveBitrateController {
             );
         }
 
+        if !allow_increase {
+            self.reset_recovery_wait();
+            return None;
+        }
         let recovery_cooldown_was_active = self.recovery_cooldown_micros != 0;
         self.recovery_cooldown_micros = self
             .recovery_cooldown_micros
@@ -501,8 +517,38 @@ impl AdaptiveBitrateController {
     }
 
     fn recovery_ceiling_bits_per_second(&self) -> Option<u64> {
+        match (
+            self.delivery_ceiling_bits_per_second(),
+            self.latency_ceiling_bits_per_second,
+        ) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    pub fn delivery_ceiling_bits_per_second(&self) -> Option<u64> {
         self.soft_ceiling_bits_per_second()
             .or(self.provisional_ceiling_bits_per_second)
+    }
+
+    pub fn configure_latency_ceiling(&mut self, ceiling: Option<u64>) {
+        self.latency_ceiling_bits_per_second = ceiling;
+    }
+
+    pub fn set_latency_target(
+        &mut self,
+        target: u64,
+        cooldown_micros: u64,
+    ) -> Option<BitrateChange> {
+        self.active_probe = None;
+        self.reset_recovery_wait();
+        let change = self.set_target(
+            target,
+            BitrateChangeReason::Congestion,
+            VideoBitrateChangeCause::LatencyPressure,
+        );
+        self.recovery_cooldown_micros = cooldown_micros;
+        change
     }
 
     fn ordinary_recovery_target(&self) -> u64 {

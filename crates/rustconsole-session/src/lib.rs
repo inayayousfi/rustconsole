@@ -6,6 +6,7 @@ pub mod audio_datagram;
 pub mod authentication;
 pub mod bandwidth_probe;
 pub mod input_datagram;
+pub mod latency_probe;
 pub mod media_queue;
 pub mod observability;
 pub mod quic;

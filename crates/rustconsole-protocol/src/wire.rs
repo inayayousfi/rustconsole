@@ -1,5 +1,8 @@
 //! Bounded Protobuf messages used on reliable QUIC streams.
 
+pub use crate::latency::{
+    LatencyBudgetFailure, LatencyControlStatus, LatencyProbeReport, LatencyReport,
+};
 use prost::Message;
 use std::fmt;
 
@@ -16,7 +19,7 @@ pub const RELIABLE_FRAME_PREFIX_SIZE: usize = size_of::<u32>();
 pub struct Envelope {
     #[prost(
         oneof = "envelope::Body",
-        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27"
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30"
     )]
     pub body: Option<envelope::Body>,
 }
@@ -33,6 +36,12 @@ pub mod envelope {
 
     #[derive(Clone, PartialEq, Oneof)]
     pub enum Body {
+        #[prost(message, tag = "28")]
+        LatencyProbeReport(super::LatencyProbeReport),
+        #[prost(message, tag = "29")]
+        LatencyControlStatus(super::LatencyControlStatus),
+        #[prost(message, tag = "30")]
+        LatencyBudgetFailure(super::LatencyBudgetFailure),
         #[prost(message, tag = "22")]
         DisplayCatalogRequest(super::DisplayCatalogRequest),
         #[prost(message, tag = "23")]
@@ -546,6 +555,8 @@ pub struct VideoReceiverReport {
     pub completed_payload_bytes: u64,
     #[prost(uint64, tag = "11")]
     pub measurement_interval_micros: u64,
+    #[prost(message, optional, tag = "12")]
+    pub latency: Option<LatencyReport>,
 }
 
 #[derive(Clone, Copy, PartialEq, Message)]
@@ -654,6 +665,8 @@ pub struct Av1ViewerSettings {
     #[prost(uint64, tag = "5")]
     pub maximum_bitrate_bits_per_second: u64,
     // Field 6 was the minimum bitrate and must not be reused.
+    #[prost(uint64, tag = "7")]
+    pub maximum_delay_micros: u64,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq, Message)]
@@ -756,6 +769,8 @@ pub struct SelectedAv1Configuration {
     #[prost(uint64, tag = "5")]
     pub maximum_bitrate_bits_per_second: u64,
     // Field 6 was the minimum bitrate and must not be reused.
+    #[prost(uint64, tag = "14")]
+    pub maximum_delay_micros: u64,
     #[prost(message, optional, tag = "7")]
     pub audio_transport: Option<AudioConfiguration>,
     #[prost(bool, tag = "8")]
@@ -1033,12 +1048,99 @@ mod tests {
     }
 
     #[test]
+    fn latency_control_has_permanent_protocol_three_fixtures() {
+        let version = Envelope {
+            body: Some(envelope::Body::VersionOffer(VersionOffer {
+                protocol_major: 3,
+                protocol_minor: 0,
+                features: Vec::new(),
+            })),
+        };
+        assert_eq!(
+            encode_reliable_frame(&version).unwrap(),
+            [0, 0, 0, 4, 10, 2, 8, 3]
+        );
+        assert_eq!(crate::CURRENT_PROTOCOL_VERSION.major, 3);
+        let fixtures = [
+            (
+                Envelope {
+                    body: Some(envelope::Body::LatencyProbeReport(LatencyProbeReport {
+                        baseline_round_trip_micros: 10_000,
+                    })),
+                },
+                vec![0, 0, 0, 6, 226, 1, 3, 8, 144, 78],
+            ),
+            (
+                Envelope {
+                    body: Some(envelope::Body::LatencyControlStatus(LatencyControlStatus {
+                        ceiling_bits_per_second: Some(1_000_000),
+                        uses_estimates: true,
+                        ..Default::default()
+                    })),
+                },
+                vec![0, 0, 0, 9, 234, 1, 6, 8, 192, 132, 61, 40, 1],
+            ),
+            (
+                Envelope {
+                    body: Some(envelope::Body::LatencyBudgetFailure(LatencyBudgetFailure {
+                        channel: 1,
+                        observed_delay_micros: 120_000,
+                        budget_micros: 100_000,
+                        absolute_limit_micros: 100_000,
+                        baseline_micros: 40_000,
+                        estimated: true,
+                    })),
+                },
+                vec![
+                    0, 0, 0, 23, 242, 1, 20, 8, 1, 16, 192, 169, 7, 24, 160, 141, 6, 32, 160, 141,
+                    6, 40, 192, 184, 2, 48, 1,
+                ],
+            ),
+        ];
+        for (message, fixture) in fixtures {
+            assert_eq!(encode_reliable_frame(&message).unwrap(), fixture);
+            assert_eq!(decode_reliable_frame(&fixture).unwrap(), message);
+        }
+        let settings = Av1ViewerSettings {
+            maximum_delay_micros: 100_000,
+            ..Default::default()
+        };
+        assert_eq!(settings.encode_to_vec(), [56, 160, 141, 6]);
+        let selected = SelectedAv1Configuration {
+            maximum_delay_micros: 100_000,
+            ..Default::default()
+        };
+        assert_eq!(selected.encode_to_vec(), [112, 160, 141, 6]);
+        let report = Envelope {
+            body: Some(envelope::Body::VideoReceiverReport(VideoReceiverReport {
+                latency: Some(LatencyReport {
+                    video: Some(crate::latency::LatencyMeasurement {
+                        delay_micros: 40_000,
+                        estimated: true,
+                        samples: 1,
+                        uncertainty_micros: 0,
+                    }),
+                    presented_bitrate_bits_per_second: 1_000_000,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })),
+        };
+        let fixture = [
+            0, 0, 0, 18, 74, 16, 98, 14, 10, 8, 8, 192, 184, 2, 24, 1, 32, 1, 48, 192, 132, 61,
+        ];
+        assert_eq!(encode_reliable_frame(&report).unwrap(), fixture);
+        assert_eq!(decode_reliable_frame(&fixture).unwrap(), report);
+    }
+
+    #[test]
     fn maximum_only_av1_messages_match_permanent_wire_fixtures() {
         let mode = Av1Mode {
             chroma_subsampling: ChromaSubsampling::Yuv420 as i32,
             bit_depth: VideoBitDepth::Eight as i32,
         };
         let settings = Av1ViewerSettings {
+            maximum_delay_micros: 0,
             width: 2_560,
             height: 1_440,
             frames_per_second: 120,
@@ -1046,6 +1148,7 @@ mod tests {
             maximum_bitrate_bits_per_second: 100_000_000,
         };
         let selected = SelectedAv1Configuration {
+            maximum_delay_micros: 0,
             dedicated_input_stream: false,
             video_datagram_version: 0,
             bandwidth_probe_version: 0,
@@ -1296,6 +1399,7 @@ mod tests {
                 kind: VideoControlKind::RequestKeyframe as i32,
             }),
             envelope::Body::VideoReceiverReport(VideoReceiverReport {
+                latency: None,
                 newest_sequence: 90,
                 received_chunks: 400,
                 lost_chunks: 3,

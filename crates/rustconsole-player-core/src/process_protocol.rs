@@ -3,7 +3,7 @@ use std::io::{self, Read, Write};
 use std::net::SocketAddr;
 use zeroize::Zeroizing;
 
-pub const VERSION: u16 = 4;
+pub const VERSION: u16 = 5;
 pub const MAX_MESSAGE_SIZE: usize = 4 * 1024;
 pub const MAX_PASSWORD_SIZE: usize = 1024;
 pub const MAX_ERROR_SIZE: usize = 2048;
@@ -22,6 +22,7 @@ pub struct LaunchRequest {
     pub password: Zeroizing<Vec<u8>>,
     pub remember_password: bool,
     pub maximum_bitrate_bits_per_second: u64,
+    pub maximum_delay_micros: u64,
     pub frames_per_second: u16,
     pub latency_diagnostics: bool,
 }
@@ -88,6 +89,7 @@ pub fn write_launch(
         });
     }
     validate_maximum_bitrate(request.maximum_bitrate_bits_per_second)?;
+    validate_maximum_delay(request.maximum_delay_micros)?;
     validate_frame_rate(request.frames_per_second)?;
     let address = request.address.to_string();
     let address_length = u16::try_from(address.len())
@@ -99,6 +101,7 @@ pub fn write_launch(
     payload.extend_from_slice(&address_length.to_be_bytes());
     payload.extend_from_slice(address.as_bytes());
     payload.extend_from_slice(&request.maximum_bitrate_bits_per_second.to_be_bytes());
+    payload.extend_from_slice(&request.maximum_delay_micros.to_be_bytes());
     payload.extend_from_slice(&request.frames_per_second.to_be_bytes());
     payload.push(u8::from(request.remember_password));
     payload.push(u8::from(request.latency_diagnostics));
@@ -201,6 +204,8 @@ fn decode_launch(mut payload: &[u8]) -> Result<LaunchRequest, ProcessProtocolErr
         .map_err(|_| ProcessProtocolError::InvalidMessage("player address is invalid"))?;
     let maximum_bitrate_bits_per_second = take_u64(&mut payload)?;
     validate_maximum_bitrate(maximum_bitrate_bits_per_second)?;
+    let maximum_delay_micros = take_u64(&mut payload)?;
+    validate_maximum_delay(maximum_delay_micros)?;
     let frames_per_second = take_u16(&mut payload)?;
     validate_frame_rate(frames_per_second)?;
     let remember_password = match take(&mut payload, 1)?[0] {
@@ -239,6 +244,7 @@ fn decode_launch(mut payload: &[u8]) -> Result<LaunchRequest, ProcessProtocolErr
         password,
         remember_password,
         maximum_bitrate_bits_per_second,
+        maximum_delay_micros,
         frames_per_second,
         latency_diagnostics,
     })
@@ -254,6 +260,25 @@ fn validate_maximum_bitrate(value: u64) -> Result<(), ProcessProtocolError> {
         ));
     }
     Ok(())
+}
+
+fn validate_maximum_delay(value: u64) -> Result<(), ProcessProtocolError> {
+    if !rustconsole_protocol::latency::valid_maximum_delay(value) {
+        return Err(ProcessProtocolError::InvalidMessage(
+            "player maximum delay must be a positive number of milliseconds fitting u32",
+        ));
+    }
+    Ok(())
+}
+
+pub fn maximum_delay_from_millis(value: u64) -> Result<u64, ProcessProtocolError> {
+    let micros = value
+        .checked_mul(1_000)
+        .ok_or(ProcessProtocolError::InvalidMessage(
+            "maximum delay is too large",
+        ))?;
+    validate_maximum_delay(micros)?;
+    Ok(micros)
 }
 
 fn validate_frame_rate(value: u16) -> Result<(), ProcessProtocolError> {
@@ -326,6 +351,7 @@ mod tests {
             password: Zeroizing::new(b"not logged".to_vec()),
             remember_password: true,
             maximum_bitrate_bits_per_second: 100_000_000,
+            maximum_delay_micros: 100_000,
             frames_per_second: 120,
             latency_diagnostics: true,
         }
@@ -345,6 +371,7 @@ mod tests {
         assert_eq!(actual.remember_password, expected.remember_password);
         assert_eq!(actual.latency_diagnostics, expected.latency_diagnostics);
         assert_eq!(actual.frames_per_second, expected.frames_per_second);
+        assert_eq!(actual.maximum_delay_micros, expected.maximum_delay_micros);
         assert_eq!(
             actual.maximum_bitrate_bits_per_second,
             expected.maximum_bitrate_bits_per_second
@@ -375,6 +402,18 @@ mod tests {
             write_launch(&mut Vec::new(), &request),
             Err(ProcessProtocolError::InvalidMessage(_))
         ));
+    }
+
+    #[test]
+    fn maximum_delay_is_positive_and_survives_launch_encoding() {
+        assert_eq!(maximum_delay_from_millis(100).unwrap(), 100_000);
+        assert!(maximum_delay_from_millis(0).is_err());
+        assert!(maximum_delay_from_millis(u64::from(u32::MAX) + 1).is_err());
+        let request = LaunchRequest {
+            maximum_delay_micros: 0,
+            ..launch()
+        };
+        assert!(write_launch(&mut Vec::new(), &request).is_err());
     }
 
     #[test]

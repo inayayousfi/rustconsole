@@ -12,6 +12,7 @@ pub enum VideoBitrateChangeCause {
     SevereReceiverLoss = 4,
     SeverePathPressure = 5,
     SenderCongestion = 6,
+    LatencyPressure = 7,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

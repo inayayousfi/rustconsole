@@ -1,5 +1,6 @@
 //! Platform-neutral host selection, probing, and player supervision.
 
+pub use rustconsole_player_core::process_protocol::maximum_delay_from_millis;
 pub use rustconsole_player_core::process_protocol::{LaunchRequest, PlayerEvent};
 use rustconsole_player_core::process_protocol::{
     read_event, write_launch, write_reconnect, write_stop,

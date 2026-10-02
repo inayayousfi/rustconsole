@@ -703,6 +703,16 @@ mod windows {
                 .transpose()?,
             _ => None,
         };
+        let maximum_delay_micros = match &request.body {
+            Some(envelope::Body::Av1CapabilityOffer(offer)) => offer
+                .viewer_settings
+                .as_ref()
+                .map_or(0, |settings| settings.maximum_delay_micros),
+            _ => 0,
+        };
+        if !rustconsole_protocol::latency::valid_maximum_delay(maximum_delay_micros) {
+            return Err("player did not provide a valid maximum delay".into());
+        }
         let (decoder_capabilities, settings) = session_try!(
             "parsing player AV1 capability offer",
             parse_viewer_offer(request)
@@ -807,6 +817,7 @@ mod windows {
         selected_wire.video_datagram_version = video_datagram_version;
         selected_wire.bandwidth_probe_version = bandwidth_probe_version;
         selected_wire.network_status_version = network_status_version;
+        selected_wire.maximum_delay_micros = maximum_delay_micros;
         let player_selection = session_try!(
             "reading player AV1 selection",
             read_envelope(&mut receive).await
@@ -834,6 +845,14 @@ mod windows {
             .await
         );
 
+        let startup_clock = crate::clock::HostClock::new()?;
+        let network_baseline_micros = session_try!(
+            "measuring startup latency",
+            rustconsole_session::latency_probe::host(&mut send, &mut receive, || Ok(
+                startup_clock.now()?
+            ))
+            .await
+        );
         let startup_capacity_bits_per_second = session_try!(
             "measuring startup bandwidth",
             rustconsole_session::bandwidth_probe::send(
@@ -843,6 +862,14 @@ mod windows {
                 selected.maximum_bitrate_bits_per_second,
                 selected.frames_per_second,
             )
+            .await
+        );
+
+        session_try!(
+            "settling startup bandwidth queues",
+            rustconsole_session::latency_probe::host(&mut send, &mut receive, || Ok(
+                startup_clock.now()?
+            ))
             .await
         );
 
@@ -915,6 +942,8 @@ mod windows {
         let media_connection = connection.clone();
         let runtime = tokio::runtime::Handle::current();
         let media_latest_input = Arc::clone(&latest_input);
+        let (response_tx, mut responses) = tokio::sync::mpsc::channel::<Envelope>(64);
+        let media_responses = response_tx.clone();
         let mut media = tokio::task::spawn_blocking(move || {
             run_worker_video_stream(
                 media_connection,
@@ -923,6 +952,9 @@ mod windows {
                 selected,
                 video_datagram_version,
                 startup_capacity_bits_per_second,
+                maximum_delay_micros,
+                network_baseline_micros,
+                media_responses,
                 control_rx,
                 audio_configuration.is_some(),
                 audio_state_tx,
@@ -933,9 +965,7 @@ mod windows {
         let mut control_error = None::<String>;
         let mut media_finished = false;
         let mut input_session = InputSession::default();
-        let input_clock = full_diagnostics
-            .then(crate::clock::HostClock::new)
-            .transpose()?;
+        let input_clock = Some(crate::clock::HostClock::new()?);
         let pointer_datagrams_received = 0_u64;
         let pointer_updates_applied = 0_u64;
         let pointer_updates_ignored = 0_u64;
@@ -952,7 +982,6 @@ mod windows {
         let pointer_duplicate_or_late = 0_u64;
         let pointer_mode_rejections = 0_u64;
         let pointer_relative_baselines = 0_u64;
-        let (response_tx, mut responses) = tokio::sync::mpsc::channel::<Envelope>(64);
         let mut response_writer = tokio::task::JoinSet::new();
         response_writer.spawn(async move {
             while let Some(response) = responses.recv().await {
@@ -1038,6 +1067,11 @@ mod windows {
                             }
                             Ok(Ok(WorkerVideoExit::Stopped)) => {
                                 control_error = Some("media worker stopped".to_owned());
+                            }
+                            Ok(Ok(WorkerVideoExit::LatencyBudgetExceeded(failure))) => {
+                                if let Err(error) = response_tx.try_send(Envelope { body: Some(envelope::Body::LatencyBudgetFailure(failure)) }) {
+                                    control_error = Some(error.to_string());
+                                }
                             }
                             Ok(Err(error)) => control_error = Some(format!("media worker failed: {error}")),
                             Err(error) => control_error = Some(format!("media worker task failed: {error}")),
@@ -1270,6 +1304,14 @@ mod windows {
                     WorkerVideoControl::RequestKeyframe
                 }
                 Some(envelope::Body::VideoReceiverReport(report)) => {
+                    if report.measurement_interval_micros == 0
+                        || report.measurement_interval_micros
+                            > rustconsole_protocol::latency::MAX_REPORT_INTERVAL_MICROS
+                        || !report.latency.is_some_and(|latency| latency.valid())
+                    {
+                        control_error = Some("invalid latency receiver report".into());
+                        break;
+                    }
                     WorkerVideoControl::ReceiverReport(report)
                 }
                 _ => {
@@ -1470,6 +1512,7 @@ mod windows {
     }
 
     enum WorkerVideoExit {
+        LatencyBudgetExceeded(wire::LatencyBudgetFailure),
         Stopped,
         ReconfigurationRequired(wire::VideoReconfigurationCause),
     }
@@ -1638,6 +1681,9 @@ mod windows {
         selected: rustconsole_protocol::NegotiatedAv1Configuration,
         video_datagram_version: u32,
         startup_capacity_bits_per_second: u64,
+        maximum_delay_micros: u64,
+        network_baseline_micros: u64,
+        responses: tokio::sync::mpsc::Sender<Envelope>,
         controls: std::sync::mpsc::Receiver<WorkerVideoControl>,
         enable_audio: bool,
         audio_state: tokio::sync::watch::Sender<wire::AudioStreamState>,
@@ -1650,6 +1696,11 @@ mod windows {
         let mut video_policy = HostVideoStreamPolicy::from_startup_probe(
             bitrate_bits_per_second,
             startup_capacity_bits_per_second,
+        );
+        video_policy.enable_latency_control(
+            maximum_delay_micros,
+            network_baseline_micros,
+            Instant::now(),
         );
         let mut bitrate_change_sequence = 0_u64;
         let mut bitrate_change_cause = rustconsole_host_core::VideoBitrateChangeCause::Startup;
@@ -1687,7 +1738,7 @@ mod windows {
                     }
                     Ok(WorkerVideoControl::ReceiverReport(report)) => {
                         let path = connection.stats().path;
-                        let change = video_policy.observe_receiver(
+                        let change = video_policy.observe_receiver_with_latency(
                             VideoPathReport {
                                 round_trip_time: path.rtt,
                                 congestion_window_bytes: path.cwnd,
@@ -1702,7 +1753,22 @@ mod windows {
                                 assembly_overflows: report.assembly_overflows,
                                 incomplete_frames: report.incomplete_frames,
                             },
+                            report.latency,
+                            Instant::now(),
                         );
+                        let change = match change {
+                            Ok(change) => change,
+                            Err(failure) => {
+                                return Ok(WorkerVideoExit::LatencyBudgetExceeded(failure));
+                            }
+                        };
+                        if let Some(status) = video_policy.latency_status() {
+                            responses
+                                .try_send(Envelope {
+                                    body: Some(envelope::Body::LatencyControlStatus(status)),
+                                })
+                                .map_err(|_| "latency status response queue unavailable")?;
+                        }
                         if let Some(change) = change {
                             bitrate_change_sequence = bitrate_change_sequence.saturating_add(1);
                             bitrate_change_cause = change.cause;
@@ -2164,6 +2230,7 @@ mod windows {
         selected: rustconsole_protocol::NegotiatedAv1Configuration,
     ) -> SelectedAv1Configuration {
         SelectedAv1Configuration {
+            maximum_delay_micros: 0,
             dedicated_input_stream: false,
             video_datagram_version:
                 rustconsole_host_core::video_transport::LEGACY_VIDEO_DATAGRAM_VERSION,
