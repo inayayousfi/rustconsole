@@ -190,7 +190,9 @@ impl LatencyPolicy {
                 } else {
                     bitrate * 3 / 4
                 });
-                if new_incident {
+                let hold_proven =
+                    now.saturating_duration_since(self.changed_at) >= crate::PROVEN_HOLD;
+                if new_incident && !hold_proven {
                     self.learn_ceiling(bitrate);
                 }
             }

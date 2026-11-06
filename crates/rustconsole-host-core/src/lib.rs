@@ -82,6 +82,9 @@ const SEVERE_RECEIVER_LOSS_PERCENT: u128 = 2;
 const SEVERE_LOST_CHUNKS: u64 = 4;
 const SEVERE_INCOMPLETE_FRAMES: u64 = 2;
 const CAPACITY_AVERAGE_REPORTS: usize = 2;
+/// A target held this long is not the cause of a later incident, which was a passing network
+/// event. Blaming the held target would lower the limit a little more with every such event.
+pub(crate) const PROVEN_HOLD: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HostSessionControlAction {
@@ -135,6 +138,7 @@ pub struct AdaptiveBitrateController {
     degraded_reports: u8,
     healthy_reports: u8,
     soft_ceiling_healthy_micros: u64,
+    target_held_micros: u64,
     recovery_cooldown_micros: u64,
     provisional_ceiling_bits_per_second: Option<u64>,
     latency_ceiling_bits_per_second: Option<u64>,
@@ -169,6 +173,7 @@ impl AdaptiveBitrateController {
             degraded_reports: 0,
             healthy_reports: 0,
             soft_ceiling_healthy_micros: 0,
+            target_held_micros: 0,
             recovery_cooldown_micros: 0,
             provisional_ceiling_bits_per_second: None,
             latency_ceiling_bits_per_second: None,
@@ -259,6 +264,9 @@ impl AdaptiveBitrateController {
             || delivery.late_chunks > self.previous_delivery.late_chunks
             || delivery.assembly_overflows > self.previous_delivery.assembly_overflows
             || delivery.incomplete_frames > self.previous_delivery.incomplete_frames;
+        self.target_held_micros = self
+            .target_held_micros
+            .saturating_add(delivery.measurement_interval_micros);
         self.previous_delivery = delivery;
 
         if delivery.measurement_interval_micros == 0 {
@@ -600,6 +608,14 @@ impl AdaptiveBitrateController {
     fn record_active_probe_failure(&mut self) -> Option<u64> {
         if self.active_probe.is_none()
             && self.recovery_cooldown_micros == 0
+            && self.hold_is_proven()
+        {
+            return self
+                .near_soft_ceiling()
+                .then(|| percentage(self.target_bits_per_second, SOFT_CEILING_RANGE_PERCENT));
+        }
+        if self.active_probe.is_none()
+            && self.recovery_cooldown_micros == 0
             && self.near_soft_ceiling()
         {
             self.active_probe = Some(ActiveBitrateProbe {
@@ -625,6 +641,10 @@ impl AdaptiveBitrateController {
             .map(|previous| previous.min(hold))
     }
 
+    fn hold_is_proven(&self) -> bool {
+        u128::from(self.target_held_micros) >= PROVEN_HOLD.as_micros()
+    }
+
     /// A validated target clearly above the limit proves the connection improved.
     fn forget_ceiling_passed_by_probe(&mut self) {
         if self
@@ -644,12 +664,15 @@ impl AdaptiveBitrateController {
         target_bits_per_second: u64,
         cause: VideoBitrateChangeCause,
     ) -> Option<BitrateChange> {
+        let hold_was_proven = self.hold_is_proven();
         let change = self.set_target(
             target_bits_per_second,
             BitrateChangeReason::Congestion,
             cause,
         );
-        self.recovery_cooldown_micros = self.probe_interval_micros;
+        if !hold_was_proven {
+            self.recovery_cooldown_micros = self.probe_interval_micros;
+        }
         change
     }
 
@@ -671,6 +694,7 @@ impl AdaptiveBitrateController {
             return None;
         }
         self.target_bits_per_second = target;
+        self.target_held_micros = 0;
         if reason == BitrateChangeReason::Congestion {
             self.recovery_cooldown_micros = RECOVERY_COOLDOWN_MICROS;
         }
@@ -1583,6 +1607,32 @@ mod tests {
         controller.record_active_probe_failure();
 
         assert_eq!(controller.soft_ceiling_bits_per_second(), Some(22_000_000));
+    }
+
+    #[test]
+    fn loss_after_a_proven_hold_cuts_quickly_without_lowering_the_limit() {
+        let mut controller = AdaptiveBitrateController::new(100_000_000);
+        controller.failed_probe_targets = VecDeque::from([20_000_000; 5]);
+        controller.target_bits_per_second = 19_600_000;
+        controller.target_held_micros = PROVEN_HOLD.as_micros() as u64;
+        let lossy = |report: u64| VideoDeliveryReport {
+            lost_chunks: report,
+            ..delivery(report * 1_250_000)
+        };
+
+        assert_eq!(controller.observe(path(200_000_000), lossy(1)), None);
+        let change = controller.observe(path(200_000_000), lossy(2)).unwrap();
+
+        assert_eq!(change.target_bits_per_second, 18_816_000);
+        assert_eq!(controller.soft_ceiling_bits_per_second(), Some(20_000_000));
+        assert_eq!(
+            controller.probe_interval_micros,
+            SOFT_CEILING_PROBE_INTERVAL_MICROS
+        );
+        assert_eq!(
+            controller.recovery_cooldown_micros,
+            RECOVERY_COOLDOWN_MICROS
+        );
     }
 
     #[test]

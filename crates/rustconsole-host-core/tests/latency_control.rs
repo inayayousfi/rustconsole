@@ -327,3 +327,36 @@ fn a_host_stall_does_not_cut_bitrate_but_the_same_delay_from_the_network_does() 
     }
     assert!(congested.target_bits_per_second() < before_congestion);
 }
+
+#[test]
+fn a_passing_incident_after_a_proven_hold_keeps_the_limit_but_a_recent_rate_is_blamed() {
+    let start = Instant::now();
+    let mut policy = LatencyPolicy::new(100_000, 10_000, start);
+    calibrate(&mut policy, start);
+    let bad = |policy: &mut LatencyPolicy, bitrate: u64, seconds: u64| {
+        for half_second in 0..2_u64 {
+            let evaluation = policy.observe(
+                Some(report(90_000, bitrate)),
+                10_000,
+                bitrate,
+                20_000_000,
+                start + Duration::from_millis(seconds * 1_000 + half_second * 500),
+            );
+            if evaluation.reduce_to.is_some() {
+                return evaluation.reduce_to;
+            }
+        }
+        None
+    };
+    assert!(bad(&mut policy, 4_000_000, 4).is_some());
+    assert_eq!(policy.ceiling(), Some(4_000_000));
+
+    let cut_after_hold = start + Duration::from_secs(5);
+    policy.bitrate_changed(cut_after_hold);
+    assert_eq!(bad(&mut policy, 3_800_000, 70), Some(3_648_000));
+    assert_eq!(policy.ceiling(), Some(4_000_000));
+
+    policy.bitrate_changed(start + Duration::from_secs(75));
+    assert!(bad(&mut policy, 3_800_000, 90).is_some());
+    assert_eq!(policy.ceiling(), Some(3_800_000));
+}

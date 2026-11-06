@@ -47,6 +47,8 @@ Two consecutive excessive-delay reports cut bitrate by 25%, or by 4% for the fir
 
 Bitrate rises only while every active channel has a measurement and pressure is below 0.5. The steady bitrate is 96% of the lower of the delivery and latency limits. A limit does not expire with time. Below 90% of a limit, each step is checked for 1.5 seconds. Closer to a limit, each step is checked for 5 seconds and increases 2%.
 
+An incident at a bitrate held for at least 60 seconds still cuts bitrate, but it lowers no limit: the bitrate returns after the normal five-second wait, because a bitrate that held that long did not cause the incident.
+
 A step that fails returns to 96% of the failed bitrate. A first failure near a known limit counts the same way, so a small disturbance costs 4% rather than 25%. A second failure soon after it is treated as real trouble and cuts harder. The wait before the next step near the limit starts at 15 seconds and doubles after each failure, up to 10 minutes. A validated step more than 5% above the limit proves the connection improved, so the delivery limit is forgotten and the wait resets.
 
 The score combines latency and quality for display:
