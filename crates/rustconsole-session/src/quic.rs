@@ -106,9 +106,59 @@ fn configure_shared_transport(transport: &mut Arc<quinn::TransportConfig>) {
     configure_transport(transport);
 }
 
+/// Leaves rate decisions to the host's bitrate control, which sees delay and loss. QUIC's
+/// own controllers measure only their acknowledged window, so a second control loop would
+/// silently queue video on the sender while the link has room.
+#[derive(Clone)]
+struct FixedWindow;
+
+const FIXED_WINDOW_BYTES: u64 = 32 * 1024 * 1024;
+
+impl quinn::congestion::Controller for FixedWindow {
+    fn on_congestion_event(
+        &mut self,
+        _now: Instant,
+        _sent: Instant,
+        _is_persistent_congestion: bool,
+        _lost_bytes: u64,
+    ) {
+    }
+
+    fn on_mtu_update(&mut self, _new_mtu: u16) {}
+
+    fn window(&self) -> u64 {
+        FIXED_WINDOW_BYTES
+    }
+
+    fn clone_box(&self) -> Box<dyn quinn::congestion::Controller> {
+        Box::new(self.clone())
+    }
+
+    fn initial_window(&self) -> u64 {
+        FIXED_WINDOW_BYTES
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
+        self
+    }
+}
+
+impl quinn::congestion::ControllerFactory for FixedWindow {
+    fn build(
+        self: Arc<Self>,
+        _now: Instant,
+        _current_mtu: u16,
+    ) -> Box<dyn quinn::congestion::Controller> {
+        Box::new(FixedWindow)
+    }
+}
+
 fn configure_transport(transport: &mut quinn::TransportConfig) {
-    // Keep disposable media backlog close to two ordinary network packets.
-    transport.datagram_send_buffer_size(2 * 1500);
+    transport.congestion_controller_factory(Arc::new(FixedWindow));
+    // Holds a whole frame so the sender hands it over at once. A smaller buffer makes the
+    // sender wait on the transport task for every packet, which caps throughput near
+    // 46 Mbit/s. At 100 Mbit/s this bounds disposable media backlog to about 20 ms.
+    transport.datagram_send_buffer_size(256 * 1024);
     transport.max_concurrent_bidi_streams(8_u8.into());
     transport.max_concurrent_uni_streams(8_u8.into());
     transport.keep_alive_interval(Some(Duration::from_secs(2)));

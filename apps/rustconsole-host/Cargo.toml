@@ -10,6 +10,9 @@ publish.workspace = true
 name = "rustconsole-host"
 path = "src/main.rs"
 
+[features]
+development = ["rustconsole-host-windows/development"]
+
 [dependencies]
 clap.workspace = true
 rustconsole-host-windows.workspace = true

@@ -60,6 +60,7 @@ const allowedDependencies = new Map([
   ["rustconsole-host", ["rustconsole-host-windows"]],
   ["rustconsole-client", ["rustconsole-client-core"]],
   ["rustconsole-test-game", []],
+  ["rustconsole-lab", ["rustconsole-player-core", "rustconsole-player-linux"]],
   [
     "rustconsole-player",
     [

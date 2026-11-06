@@ -1,6 +1,5 @@
 use rustconsole_host_core::latency::{LatencyPolicy, delay_budget, preference_score};
 use rustconsole_host_core::video_stream::HostVideoStreamPolicy;
-use rustconsole_host_core::{VideoDeliveryReport, VideoPathReport};
 use rustconsole_protocol::latency::{LatencyChannel, LatencyMeasurement, LatencyReport};
 use std::time::{Duration, Instant};
 
@@ -50,35 +49,13 @@ fn quality_has_diminishing_rewards_and_delay_has_more_weight() {
 }
 
 #[test]
-fn ordinary_feedback_calibrates_at_minimum_then_increases_quality() {
+fn a_session_starts_from_the_measured_startup_bitrate() {
     let start = Instant::now();
     let mut policy = HostVideoStreamPolicy::from_startup_probe(20_000_000, 20_000_000);
+    let measured_start = policy.target_bits_per_second();
     policy.enable_latency_control(100_000, 10_000, start);
-    assert_eq!(policy.target_bits_per_second(), 1_000_000);
-    for index in 1..=12 {
-        let target = policy.target_bits_per_second();
-        policy
-            .observe_receiver_with_latency(
-                VideoPathReport {
-                    round_trip_time: Duration::from_millis(10),
-                    congestion_window_bytes: 1_000_000,
-                    lost_packets: 0,
-                },
-                VideoDeliveryReport {
-                    received_chunks: index * 100,
-                    completed_payload_bytes: index * 62_500,
-                    measurement_interval_micros: 500_000,
-                    ..Default::default()
-                },
-                Some(report(40_000, target)),
-                start + Duration::from_millis(index * 500),
-            )
-            .unwrap();
-        if index <= 4 {
-            assert_eq!(policy.target_bits_per_second(), 1_000_000);
-        }
-    }
-    assert!(policy.target_bits_per_second() > 1_000_000);
+    assert!(measured_start > 1_000_000);
+    assert_eq!(policy.target_bits_per_second(), measured_start);
 }
 
 #[test]
@@ -103,57 +80,32 @@ fn sustained_delay_cuts_twenty_five_percent_and_learns_a_separate_ceiling() {
         start + Duration::from_millis(4_500),
     );
     assert_eq!(second.reduce_to, Some(3_000_000));
-    assert_eq!(policy.ceiling(), Some(3_000_000));
+    assert_eq!(policy.ceiling(), Some(4_000_000));
 }
 
 #[test]
-fn delay_after_an_increase_restores_the_previous_bitrate() {
+fn repeated_cuts_in_one_incident_keep_the_first_limit() {
     let start = Instant::now();
     let mut policy = LatencyPolicy::new(100_000, 10_000, start);
     calibrate(&mut policy, start);
-    policy.bitrate_changed(
-        1_000_000,
-        1_250_000,
-        20_000_000,
-        start + Duration::from_secs(3),
-    );
-    for offset in [4_000, 4_500] {
-        let result = policy.observe(
-            Some(report(90_000, 1_250_000)),
-            10_000,
-            1_250_000,
-            20_000_000,
-            start + Duration::from_millis(offset),
-        );
-        if offset == 4_500 {
-            assert_eq!(result.reduce_to, Some(1_000_000));
+    let mut bitrate = 40_000_000;
+    let mut report_at = Duration::from_secs(4);
+    for _ in 0..3 {
+        policy.bitrate_changed(start + report_at - Duration::from_secs(2));
+        for _ in 0..2 {
+            let result = policy.observe(
+                Some(report(90_000, bitrate)),
+                10_000,
+                bitrate,
+                100_000_000,
+                start + report_at,
+            );
+            bitrate = result.reduce_to.unwrap_or(bitrate);
+            report_at += Duration::from_millis(500);
         }
     }
-}
-
-#[test]
-fn a_worse_sixty_forty_score_rolls_back_even_inside_delay_limits() {
-    let start = Instant::now();
-    let mut policy = LatencyPolicy::new(100_000, 10_000, start);
-    calibrate(&mut policy, start);
-    policy.bitrate_changed(
-        1_000_000,
-        1_250_000,
-        20_000_000,
-        start + Duration::from_secs(3),
-    );
-    let mut reduced = None;
-    for offset in 8..=18 {
-        let result = policy.observe(
-            Some(report(70_000, 1_250_000)),
-            10_000,
-            1_250_000,
-            20_000_000,
-            start + Duration::from_millis(offset * 500),
-        );
-        reduced = reduced.or(result.reduce_to);
-    }
-    assert_eq!(reduced, Some(1_000_000));
+    assert_eq!(bitrate, 16_875_000);
+    assert_eq!(policy.ceiling(), Some(40_000_000));
 }
 
 #[test]
@@ -234,12 +186,7 @@ fn old_bitrate_feedback_cannot_start_the_minimum_bitrate_failure_timer() {
     let start = Instant::now();
     let mut policy = LatencyPolicy::new(100_000, 10_000, start);
     calibrate(&mut policy, start);
-    policy.bitrate_changed(
-        4_000_000,
-        1_000_000,
-        20_000_000,
-        start + Duration::from_secs(4),
-    );
+    policy.bitrate_changed(start + Duration::from_secs(4));
     for index in 9..=25 {
         let result = policy.observe(
             Some(report(90_000, 4_000_000)),
@@ -254,22 +201,27 @@ fn old_bitrate_feedback_cannot_start_the_minimum_bitrate_failure_timer() {
 }
 
 #[test]
-fn late_active_audio_requires_a_minimum_bitrate_baseline() {
+fn late_active_audio_holds_bitrate_until_it_has_a_baseline() {
     let start = Instant::now();
     let mut policy = LatencyPolicy::new(100_000, 10_000, start);
     calibrate(&mut policy, start);
-    let mut feedback = report(40_000, 4_000_000);
-    feedback.audio_active = true;
-    feedback.audio = Some(measurement(60_000));
-    let result = policy.observe(
-        Some(feedback),
-        10_000,
-        4_000_000,
-        20_000_000,
-        start + Duration::from_secs(4),
-    );
-    assert_eq!(result.reduce_to, Some(1_000_000));
-    assert!(!result.allow_increase);
+    let mut allowed = Vec::new();
+    for index in 8..=13 {
+        let mut feedback = report(40_000, 1_000_000);
+        feedback.audio_active = true;
+        feedback.audio = Some(measurement(60_000));
+        let result = policy.observe(
+            Some(feedback),
+            10_000,
+            1_000_000,
+            20_000_000,
+            start + Duration::from_millis(index * 500),
+        );
+        assert_eq!(result.reduce_to, None);
+        allowed.push(result.allow_increase);
+    }
+    assert!(!allowed[0]);
+    assert!(*allowed.last().unwrap());
 }
 
 #[test]

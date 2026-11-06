@@ -8,6 +8,13 @@ const BASELINE_SAMPLES: usize = 5;
 const SETTLE: Duration = Duration::from_secs(1);
 const FAILURE_TIME: Duration = Duration::from_secs(5);
 const PROBE_TIME: Duration = Duration::from_secs(5);
+/// Above this share of the delay allowance the bitrate holds instead of rising.
+const INCREASE_PRESSURE_LIMIT: f64 = 0.5;
+/// Cuts this close together answer one incident, so only the first describes the link.
+const INCIDENT_TIME: Duration = Duration::from_secs(10);
+/// A first incident this close to the limit steps down gently instead of cutting hard.
+const NEAR_LIMIT_PERCENT: u64 = 90;
+const EDGE_CUT_PERCENT: u64 = 96;
 
 #[derive(Debug, Default)]
 struct Channel {
@@ -17,27 +24,14 @@ struct Channel {
 }
 
 #[derive(Debug)]
-struct Trial {
-    previous_bitrate: u64,
-    reference: u64,
-    previous_score: f64,
-    mask: u8,
-    started: Instant,
-    scores: f64,
-    reports: u32,
-}
-
-#[derive(Debug)]
 pub struct LatencyPolicy {
     absolute: u64,
     channels: [Channel; 3],
     changed_at: Instant,
     pressure_streak: u8,
-    trial: Option<Trial>,
     ceiling: Option<u64>,
     retry_seconds: u64,
-    last_pressure: f64,
-    last_mask: u8,
+    last_cut_at: Option<Instant>,
     last_report_at: Option<Instant>,
     status: LatencyControlStatus,
 }
@@ -68,11 +62,9 @@ impl LatencyPolicy {
             channels,
             changed_at: now,
             pressure_streak: 0,
-            trial: None,
             ceiling: None,
             retry_seconds: 5,
-            last_pressure: 0.0,
-            last_mask: 0,
+            last_cut_at: None,
             last_report_at: None,
             status: LatencyControlStatus::default(),
         }
@@ -109,7 +101,6 @@ impl LatencyPolicy {
         let mut ready = settled;
         let mut pressure = 0.0_f64;
         let mut excessive = false;
-        let mut mask = 0;
         let mut estimates = false;
         for index in 0..3 {
             let channel = &mut self.channels[index];
@@ -117,14 +108,13 @@ impl LatencyPolicy {
                 channel.excessive_since = None;
                 continue;
             }
-            mask |= 1 << index;
             let Some(value) = values[index].filter(|value| value.valid()) else {
                 ready = false;
                 channel.excessive_since = None;
                 continue;
             };
             estimates |= value.estimated || value.uncertainty_micros != 0;
-            if settled && bitrate == crate::VIDEO_BITRATE_BOOTSTRAP {
+            if settled {
                 if channel.calibration.len() == BASELINE_SAMPLES {
                     channel.calibration.pop_front();
                 }
@@ -139,9 +129,6 @@ impl LatencyPolicy {
             }
             let Some(baseline) = channel.baseline else {
                 ready = false;
-                if settled && bitrate > crate::VIDEO_BITRATE_BOOTSTRAP {
-                    result.reduce_to = Some(crate::VIDEO_BITRATE_BOOTSTRAP);
-                }
                 continue;
             };
             let budget = delay_budget(baseline, self.absolute);
@@ -176,8 +163,6 @@ impl LatencyPolicy {
                 channel.excessive_since = None;
             }
         }
-        self.last_pressure = pressure;
-        self.last_mask = mask;
         self.status = LatencyControlStatus {
             ceiling_bits_per_second: self.ceiling,
             highest_pressure_ppm: (pressure * 1_000_000.0).min(u32::MAX as f64) as u32,
@@ -193,47 +178,36 @@ impl LatencyPolicy {
             self.pressure_streak = self.pressure_streak.saturating_add(1);
             if self.pressure_streak >= 2 && bitrate > crate::VIDEO_BITRATE_BOOTSTRAP {
                 self.pressure_streak = 0;
-                let target = self
-                    .trial
-                    .take()
-                    .map_or(bitrate * 3 / 4, |trial| trial.previous_bitrate);
-                self.learn_ceiling(target.max(crate::VIDEO_BITRATE_BOOTSTRAP));
-                result.reduce_to = Some(target);
+                let new_incident = self
+                    .last_cut_at
+                    .is_none_or(|at| now.saturating_duration_since(at) >= INCIDENT_TIME);
+                let near_limit = self
+                    .ceiling
+                    .is_some_and(|ceiling| bitrate >= ceiling / 100 * NEAR_LIMIT_PERCENT);
+                self.last_cut_at = Some(now);
+                result.reduce_to = Some(if new_incident && near_limit {
+                    bitrate / 100 * EDGE_CUT_PERCENT
+                } else {
+                    bitrate * 3 / 4
+                });
+                if new_incident {
+                    self.learn_ceiling(bitrate);
+                }
             }
             return result;
         }
         self.pressure_streak = 0;
         if !ready {
-            // Missing measurements cannot validate an intentional increase.
-            if let Some(trial) = self.trial.as_mut() {
-                trial.started = now;
-                trial.scores = 0.0;
-                trial.reports = 0;
-            }
             return result;
         }
-        if self.trial.as_ref().is_some_and(|trial| trial.mask != mask) {
-            // Changed active channels make the before/after scores incomparable.
-            self.trial = None;
+        if self.ceiling.is_some_and(|ceiling| bitrate > ceiling)
+            && now.saturating_duration_since(self.changed_at) >= PROBE_TIME
+        {
+            self.ceiling = Some(bitrate);
+            self.status.ceiling_bits_per_second = self.ceiling;
+            self.retry_seconds = 5;
         }
-        if let Some(trial) = self.trial.as_mut() {
-            trial.scores += preference_score(pressure, bitrate, trial.reference);
-            trial.reports += 1;
-            if now.saturating_duration_since(trial.started) >= PROBE_TIME && trial.reports >= 5 {
-                let trial = self.trial.take().unwrap();
-                if trial.scores / f64::from(trial.reports) < trial.previous_score {
-                    self.learn_ceiling(trial.previous_bitrate);
-                    result.reduce_to = Some(trial.previous_bitrate);
-                    return result;
-                }
-                if self.ceiling.is_some_and(|ceiling| bitrate > ceiling) {
-                    self.ceiling = Some(bitrate);
-                    self.status.ceiling_bits_per_second = self.ceiling;
-                    self.retry_seconds = 5;
-                }
-            }
-        }
-        result.allow_increase = self.trial.is_none();
+        result.allow_increase = pressure < INCREASE_PRESSURE_LIMIT;
         result
     }
 
@@ -249,23 +223,9 @@ impl LatencyPolicy {
         for channel in &mut self.channels {
             channel.excessive_since = None;
         }
-        self.trial = None;
     }
 
-    pub fn bitrate_changed(&mut self, previous: u64, target: u64, reference: u64, now: Instant) {
-        if target > previous {
-            self.trial = Some(Trial {
-                previous_bitrate: previous,
-                reference,
-                previous_score: preference_score(self.last_pressure, previous, reference),
-                mask: self.last_mask,
-                started: now + SETTLE,
-                scores: 0.0,
-                reports: 0,
-            });
-        } else {
-            self.trial = None;
-        }
+    pub fn bitrate_changed(&mut self, now: Instant) {
         self.changed_at = now;
         for channel in &mut self.channels {
             channel.excessive_since = None;

@@ -1,0 +1,16 @@
+[package]
+name = "rustconsole-lab"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "rustconsole-lab"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+rustconsole-player-core.workspace = true
+rustconsole-player-linux.workspace = true

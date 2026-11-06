@@ -14,6 +14,10 @@ mod clock;
 mod credentials;
 #[cfg(windows)]
 mod desktop;
+#[cfg(all(windows, feature = "development"))]
+mod development_input;
+#[cfg(all(windows, feature = "development"))]
+mod development_stages;
 #[cfg(windows)]
 pub mod display;
 pub mod firewall;

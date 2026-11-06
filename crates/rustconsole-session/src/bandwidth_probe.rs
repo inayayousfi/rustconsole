@@ -16,6 +16,7 @@ pub const WARMUP_DURATION: Duration = Duration::from_secs(1);
 pub const MEASUREMENT_DURATION: Duration = Duration::from_secs(2);
 pub const DATAGRAM_SIZE: usize = 1_200;
 const MEASUREMENT_FLAG: u8 = 1;
+const SEND_BUFFER_DRAIN_LIMIT: Duration = Duration::from_millis(500);
 const MAXIMUM_RECEIVED_DATAGRAMS: usize = 100_000;
 const FRAME_PROFILE_LENGTH: u64 = 250;
 const KEYFRAME_MULTIPLIER_PER_MILLE: u64 = 7_000;
@@ -145,6 +146,7 @@ async fn send_with_configuration(
     )
     .await?;
 
+    let empty_send_buffer = connection.datagram_send_buffer_space();
     let started = tokio::time::Instant::now();
     let finished_at = started + warmup + measurement;
     let frame_period = Duration::from_secs(1) / u32::from(frames_per_second);
@@ -192,6 +194,13 @@ async fn send_with_configuration(
                 measurement_bytes_sent = measurement_bytes_sent.saturating_add(datagram_bytes);
             }
         }
+    }
+    // A probe datagram that leaves after the report would reach the video receiver.
+    let drain_deadline = tokio::time::Instant::now() + SEND_BUFFER_DRAIN_LIMIT;
+    while connection.datagram_send_buffer_space() < empty_send_buffer
+        && tokio::time::Instant::now() < drain_deadline
+    {
+        tokio::time::sleep(Duration::from_millis(1)).await;
     }
     crate::quic::write_envelope(
         control_send,

@@ -28,6 +28,7 @@ Keep these process boundaries explicit. The client is the control application, t
 - `apps/rustconsole-player` is the player composition root. It owns the interactive event loop, window lifecycle, reconnect behavior, input-event translation, and selection of media and rendering implementations. It currently composes SDL, the Linux player integration, and the Vulkan renderer.
 - `apps/rustconsole-host` is the host composition root. It owns process startup and command-line parsing, then selects the available host platform implementation. It currently delegates service, installation, firewall, worker, and proof behavior to `rustconsole-host-windows`.
 - `apps/rustconsole-test-game` is a Windows test application with predictable graphics, audio, and raw-input behavior. It is product test support, not a reusable application layer.
+- `apps/rustconsole-lab` is a development-only Linux application that is never packaged. It runs a headless player that records measurements and a relay that imitates bad networks. It pairs with a host built with the `development` feature, which uses UDP port 47998 and discards input so it can run beside the installed service.
 
 Application crates are composition roots. They may connect libraries and deal with process startup or UI frameworks, but reusable rules belong in the narrowest library that owns those rules.
 

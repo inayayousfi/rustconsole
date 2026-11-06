@@ -61,8 +61,6 @@ impl HostVideoStreamPolicy {
         network_baseline_micros: u64,
         now: Instant,
     ) {
-        self.bitrate
-            .set_latency_target(crate::VIDEO_BITRATE_BOOTSTRAP, 0);
         self.latency = Some(crate::latency::LatencyPolicy::new(
             maximum_delay_micros,
             network_baseline_micros,
@@ -109,8 +107,8 @@ impl HostVideoStreamPolicy {
                 change = latency_change;
             }
         }
-        if let Some(change) = change {
-            latency.bitrate_changed(previous, change.target_bits_per_second, reference, now);
+        if change.is_some() {
+            latency.bitrate_changed(now);
         }
         Ok(change)
     }
@@ -128,21 +126,11 @@ impl HostVideoStreamPolicy {
 
     pub fn observe_send_deadline_expired(&mut self) -> Option<BitrateChange> {
         self.recovery.require_keyframe();
-        let previous = self.target_bits_per_second();
         let change = self.bitrate.observe_sender_congestion();
-        if let Some(change) = change
+        if change.is_some()
             && let Some(latency) = self.latency.as_mut()
         {
-            let reference = self
-                .bitrate
-                .delivery_ceiling_bits_per_second()
-                .unwrap_or(self.bitrate.maximum_bits_per_second);
-            latency.bitrate_changed(
-                previous,
-                change.target_bits_per_second,
-                reference,
-                Instant::now(),
-            );
+            latency.bitrate_changed(Instant::now());
         }
         change
     }

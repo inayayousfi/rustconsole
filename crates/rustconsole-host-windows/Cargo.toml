@@ -9,6 +9,11 @@ publish.workspace = true
 [lib]
 path = "src/lib.rs"
 
+[features]
+# Builds a test host on its own port without virtual input, so it can run beside the
+# installed service. Never enable for a shipped build.
+development = []
+
 [dependencies]
 rustconsole-codec-ffmpeg.workspace = true
 rustconsole-host-core.workspace = true

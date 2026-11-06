@@ -153,6 +153,8 @@ impl CaptureFreshnessMonitor {
 #[cfg(windows)]
 mod windows {
     use super::*;
+    #[cfg(feature = "development")]
+    use crate::development_input::VirtualInputOwner;
     use crate::worker_protocol::WorkerEvent;
     use quinn::{Connection, Endpoint, VarInt};
     use rustconsole_host_core::authentication::{
@@ -165,7 +167,9 @@ mod windows {
         video_pacing::frame_period,
         video_stream::{HostEncodedVideoFrame, HostVideoStreamPolicy},
     };
-    use rustconsole_input_windows::{HidReport, InputSession, ReportSink, VirtualInputOwner};
+    #[cfg(not(feature = "development"))]
+    use rustconsole_input_windows::VirtualInputOwner;
+    use rustconsole_input_windows::{HidReport, InputSession, ReportSink};
     use rustconsole_protocol::diagnostics::{MediaKind, PayloadDigest, STREAM_PREAMBLE};
     use rustconsole_protocol::input::STREAM_PREAMBLE as INPUT_STREAM_PREAMBLE;
     use rustconsole_protocol::wire::{
@@ -198,8 +202,14 @@ mod windows {
     use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
     const STATUS_WAIT_HINT: Duration = Duration::from_secs(5);
-    const PRODUCTION_QUIC_IPV4_ADDRESS: &str = "0.0.0.0:47999";
-    const PRODUCTION_QUIC_IPV6_ADDRESS: &str = "[::]:47999";
+    #[cfg(not(feature = "development"))]
+    const QUIC_IPV4_ADDRESS: &str = "0.0.0.0:47999";
+    #[cfg(not(feature = "development"))]
+    const QUIC_IPV6_ADDRESS: &str = "[::]:47999";
+    #[cfg(feature = "development")]
+    const QUIC_IPV4_ADDRESS: &str = "0.0.0.0:47998";
+    #[cfg(feature = "development")]
+    const QUIC_IPV6_ADDRESS: &str = "[::]:47998";
     const IPV6_STATUS_REPORT: &str = r"C:\ProgramData\RustConsole\ipv6-status.txt";
     const BANDWIDTH_PROBE_VERSION: u32 = rustconsole_session::bandwidth_probe::VERSION;
 
@@ -413,12 +423,12 @@ mod windows {
                 .map_err(|error| format!("creating the ephemeral QUIC certificate: {error}"))?;
             let ipv4 = Endpoint::server(
                 server_config.clone(),
-                PRODUCTION_QUIC_IPV4_ADDRESS.parse()?,
+                QUIC_IPV4_ADDRESS.parse()?,
             )
             .map_err(|error| format!("opening the IPv4 QUIC endpoint: {error}"))?;
             let ipv6 = match Endpoint::server(
                 server_config,
-                PRODUCTION_QUIC_IPV6_ADDRESS.parse()?,
+                QUIC_IPV6_ADDRESS.parse()?,
             ) {
                 Ok(endpoint) => {
                     let _ = fs::remove_file(IPV6_STATUS_REPORT);

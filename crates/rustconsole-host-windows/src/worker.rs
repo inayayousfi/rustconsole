@@ -813,6 +813,8 @@ fn run_video_stream(
         None => None,
     };
     let mut sequence = 0_u64;
+    #[cfg(feature = "development")]
+    let mut stage_log = crate::development_stages::StageLog::default();
 
     loop {
         while stop_requested(commands)? {
@@ -856,6 +858,14 @@ fn run_video_stream(
         };
         if let Some(frame) = encoded {
             let encoded_at_micros = clock.now()?;
+            #[cfg(feature = "development")]
+            stage_log.observe([
+                frame.capture_acquisition_micros,
+                frame.cross_adapter_copy_micros,
+                frame.color_conversion_micros,
+                frame.encoder_call_micros,
+                encoded_at_micros.saturating_sub(encode_started_at_micros),
+            ]);
             let (payload_sha256, hash_duration_micros) = if diagnostics {
                 let started = Instant::now();
                 let digest = Sha256::digest(&frame.packet.data).into();
