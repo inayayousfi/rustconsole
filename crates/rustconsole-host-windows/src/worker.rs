@@ -771,8 +771,9 @@ fn run_video_stream(
     diagnostics: bool,
     prepared: Option<PreparedGpuCapture>,
 ) -> Result<StreamExit, Box<dyn std::error::Error>> {
-    let mut pacer = VideoFramePacer::new(frames_per_second, Instant::now())
-        .ok_or("video stream frame rate is zero")?;
+    let mut pacer =
+        VideoFramePacer::new(frames_per_second, bitrate_bits_per_second, Instant::now())
+            .ok_or("video stream frame rate is zero")?;
     let frame_period = pacer.frame_period();
     let prepared = prepared.ok_or("video stream was not prepared before start")?;
     let mut encoder =
@@ -819,7 +820,10 @@ fn run_video_stream(
     loop {
         while stop_requested(commands)? {
             match read_command(commands)? {
-                WorkerCommand::SetVideoBitrate(bitrate) => encoder.set_bitrate(bitrate)?,
+                WorkerCommand::SetVideoBitrate(bitrate) => {
+                    encoder.set_bitrate(bitrate)?;
+                    pacer.set_target_bitrate(bitrate, Instant::now());
+                }
                 WorkerCommand::SetVideoFrameDivisor(divisor) => pacer.set_frame_divisor(divisor)?,
                 WorkerCommand::RequestVideoKeyframe => encoder.request_keyframe()?,
                 WorkerCommand::RestartVideoCapture => {
@@ -843,20 +847,22 @@ fn run_video_stream(
         }
         let frame_started = Instant::now();
         let encode_started_at_micros = clock.now()?;
-        let encoded = if pacer.should_encode() {
-            match encoder.encode_next_frame(frame_period) {
-                Ok(frame) => frame,
-                Err(error) => {
-                    if report_video_reconfiguration(error.as_ref(), events)? {
-                        return Ok(StreamExit::Continue);
-                    }
-                    return Err(error);
-                }
-            }
+        let result = if pacer.should_encode(frame_started) {
+            encoder.encode_next_frame(frame_period)
         } else {
-            None
+            encoder.skip_next_frame(frame_period).map(|()| None)
+        };
+        let encoded = match result {
+            Ok(frame) => frame,
+            Err(error) => {
+                if report_video_reconfiguration(error.as_ref(), events)? {
+                    return Ok(StreamExit::Continue);
+                }
+                return Err(error);
+            }
         };
         if let Some(frame) = encoded {
+            pacer.frame_encoded(frame.packet.data.len());
             let encoded_at_micros = clock.now()?;
             #[cfg(feature = "development")]
             stage_log.observe(

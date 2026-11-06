@@ -245,7 +245,7 @@ fn client_endpoint(address: SocketAddr) -> Result<quinn::Endpoint, Box<dyn std::
     } else {
         "[::]:0"
     };
-    let mut endpoint = quinn::Endpoint::client(bind_address.parse()?)?;
+    let mut endpoint = rustconsole_session::quic::client_endpoint(bind_address.parse()?)?;
     endpoint.set_default_client_config(rustconsole_session::quic::opaque_client_config()?);
     Ok(endpoint)
 }

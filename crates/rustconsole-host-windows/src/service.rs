@@ -1329,9 +1329,15 @@ mod windows {
                     break;
                 }
             };
-            if control_tx.try_send(command).is_err() {
-                control_error = Some("media control queue is full or closed".into());
-                break;
+            match control_tx.try_send(command) {
+                // Reports carry running totals, so the next one replaces a dropped one.
+                Ok(())
+                | Err(std::sync::mpsc::TrySendError::Full(WorkerVideoControl::ReceiverReport(_))) =>
+                    {}
+                Err(_) => {
+                    control_error = Some("media control queue is full or closed".into());
+                    break;
+                }
             }
         }
         if let Ok(mut owner) = input_owner.lock() {

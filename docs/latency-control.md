@@ -13,9 +13,9 @@ The network protocol is 3.0 and the client-player process protocol is 5. Older n
 
 Startup uses eight small request/reply exchanges, spaced 25 ms apart, before the existing bandwidth probe. Another eight exchanges follow that probe to refresh clock alignment before media starts.
 
-During normal play, the player reports the largest measured delay in each 500 ms interval. Video measures capture to presentation, or labelled presentation submission when confirmed display feedback is unavailable. Repeated source captures do not create additional delay samples. Audio estimates capture to playback from submission time and the queued audio duration. Input measures local event to host acknowledgement, including local queueing. Pending acknowledgements report elapsed waiting time as an estimate.
+During normal play, the player reports the largest measured delay and the 75th percentile delay of each 500 ms interval. Bitrate control and the session limit read the 75th percentile, because congestion delays most frames while a brief wireless spike delays only a few. Video measures capture to presentation, or labelled presentation submission when confirmed display feedback is unavailable. Repeated source captures do not create additional delay samples. Audio estimates capture to playback from submission time and the queued audio duration. Input measures local event to host acknowledgement, including local queueing. Pending acknowledgements report elapsed waiting time as an estimate.
 
-A capture or encoder stall on the host reaches the player as extra video delay, but a lower bitrate cannot remove it. The host therefore tracks the largest capture-to-encoded time of fresh frames in each report interval, treats the lowest such value as usual, and subtracts the excess of the current and previous intervals, whichever is larger, from the reported video delay before the bitrate control reads it.
+A capture or encoder stall on the host reaches the player as extra video delay, but a lower bitrate cannot remove it. The host therefore tracks the 75th percentile capture-to-encoded time of fresh frames in each report interval, treats the lowest such value as usual, and subtracts the excess of the current and previous intervals, whichever is larger, from the reported video delay before the bitrate control reads it.
 
 Clock uncertainty accompanies media measurements. Clock estimates expire after five seconds. Missing measurements are unavailable, not zero delay; inactive audio and input do not count as failures. Input acknowledgement does not prove that the game responded, and queued audio does not prove its physical playback time.
 
@@ -43,7 +43,7 @@ When the absolute limit leaves no allowance above baseline, pressure is observed
 
 A session starts at 70% of the capacity measured by the startup probe, and that measurement is the first limit. Only one controller governs rate: the QUIC transport uses a fixed window, so video is never held back by a second control loop.
 
-Two consecutive excessive-delay reports cut bitrate by 25%, or by 4% for the first cut of an incident close to the latency limit. The first cut of an incident records the bitrate as the latency limit. Further cuts within 10 seconds belong to the same incident and leave the limit unchanged, because a stall at the source says nothing about the link. Delivery and sender-pressure responses stay active alongside delay.
+Two consecutive excessive-delay reports cut bitrate by 25%, or by 4% for the first cut of an incident close to the latency limit. A further cut within five seconds needs 25% more pressure than the previous cut, because delay that a cut did not reduce may have another cause. The first cut of an incident records the bitrate as the latency limit. Further cuts within 10 seconds belong to the same incident and leave the limit unchanged, because a stall at the source says nothing about the link. Delivery and sender-pressure responses stay active alongside delay.
 
 Bitrate rises only while every active channel has a measurement and pressure is below 0.5. A report at or above 0.5 pauses the wait for the next rise without clearing it. A rise near a limit waits 15 seconds and adds 2%. A failed rise, or a delay cut within 60 seconds of a bitrate change, doubles that wait up to ten minutes and resets the step. A passing rise at or above the limit halves the wait and doubles the step up to 16%. The steady bitrate is 96% of the lower of the delivery and latency limits. A limit does not expire with time. Below 90% of a limit, each step is checked for 1.5 seconds. Closer to a limit, each step is checked for 5 seconds and increases 2%.
 
@@ -61,10 +61,24 @@ score = 0.6 * latency preference + 0.4 * quality preference
 
 The score does not decide increases, because ordinary delay jitter is far larger than the score change from one bitrate step.
 
+## Recovery after a collapse
+
+The host remembers the highest bitrate it held for 20 seconds without a cut. When the bitrate falls below half of that and the link is healthy again, limits learned during the collapse are forgotten and bitrate climbs back in ordinary recovery steps. A cut during that climb lowers the remembered bitrate by 25%, but not below the bitrate that failed, and delays the next climb by 30 seconds. That delay doubles with each failure up to 10 minutes, so a link that really became slower settles quickly.
+
+## Loss on the link
+
+A frame's assembly deadline does not run while the link delivers nothing, because a silent link is delaying chunks rather than losing them. Loss above 10% of a report's chunks cuts at once. Smaller loss cuts only when the report before it also had loss, so a passing burst costs nothing and continuing loss costs at most one extra report of reaction time.
+
+## Below the encoder's smallest frame
+
+An encoder has a smallest possible frame for a given scene, so its output stops following a target below that size. The host then skips frames instead of exceeding the target. A frame is skipped while encoded data is more than 100 ms of the target ahead of the target rate, and that lead stops at one second of the target. An encoder within its target loses no frames.
+
 ## Session termination
 
-After minimum bitrate takes effect and settles, five seconds of uninterrupted excessive-delay reports for any one active channel ends the session. A healthy or missing measurement for that channel, a report gap longer than two seconds, or a bitrate change resets its failure timer.
+After minimum bitrate takes effect and settles, five seconds of uninterrupted reports above the client's maximum delay for any one active channel ends the session. Delay above the budget but within that maximum keeps reducing bitrate without ending the session, because on a slow link one frame's transfer alone can exceed the budget. A healthy or missing measurement for that channel, a report gap longer than two seconds, or a bitrate change resets its failure timer.
 
-The host sends a structured failure. The player stops instead of automatically reconnecting, and the client displays the failing channel, measured delay, budget, absolute limit, baseline, estimate status, and unsuccessful reduction to 1 Mbit/s.
+The player also ends the session after ten seconds in which frames keep failing and none completes. A host that sends nothing does not count, so a display change or locked desktop does not end the session.
+
+For a delay failure, the host sends a structured failure. The player stops instead of automatically reconnecting, and the client displays the failing channel, measured delay, budget, absolute limit, baseline, estimate status, and unsuccessful reduction to 1 Mbit/s.
 
 Tests cover the calculations, recovery sequences, behavior on a simulated noisy link, protocol fixtures, clock exchanges, and delivery of the terminal failure to player core. `apps/rustconsole-lab` measures a real stream without a display. Neither establishes physical playback, compositor timing, or gameplay performance.

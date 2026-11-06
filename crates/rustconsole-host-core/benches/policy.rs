@@ -55,12 +55,12 @@ fn benchmark_frame_pacing(criterion: &mut Criterion) {
         bench.iter_batched(
             || {
                 let now = Instant::now();
-                (VideoFramePacer::new(120, now).unwrap(), now)
+                (VideoFramePacer::new(120, 50_000_000, now).unwrap(), now)
             },
             |(mut pacer, mut now)| {
                 for _ in 0..120 {
                     black_box(pacer.wait_duration(now));
-                    black_box(pacer.should_encode());
+                    black_box(pacer.should_encode(now));
                     let completed = now + Duration::from_millis(2);
                     pacer.complete_tick(now, completed);
                     now += pacer.frame_period();

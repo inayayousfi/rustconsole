@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 const CLOCK_MAX_AGE: Duration = Duration::from_secs(5);
 const INPUT_ACTIVE_TIME: Duration = Duration::from_secs(1);
 const MAX_PENDING_INPUTS: usize = 1024;
+const MAX_INTERVAL_SAMPLES: usize = 512;
 
 pub fn budget_failure_message(
     failure: rustconsole_protocol::latency::LatencyBudgetFailure,
@@ -18,14 +19,13 @@ pub fn budget_failure_message(
         rustconsole_protocol::latency::LatencyChannel::label,
     );
     format!(
-        "Session ended because the delay limit could not be met. The {channel} delay was {:.1} ms{} for 5 continuous seconds after reducing video bitrate to the minimum of 1 Mbit/s. Allowed delay: {:.1} ms; client maximum: {:.1} ms; healthy baseline: {:.1} ms. Try a higher maximum delay or reduce network or device load before reconnecting.",
+        "Session ended because the delay limit could not be met. The {channel} delay was {:.1} ms{} for 5 continuous seconds after reducing video bitrate to the minimum of 1 Mbit/s. Client maximum: {:.1} ms; healthy baseline: {:.1} ms. Try a higher maximum delay or reduce network or device load before reconnecting.",
         failure.observed_delay_micros as f64 / 1_000.0,
         if failure.estimated {
             " (estimated)"
         } else {
             ""
         },
-        failure.budget_micros as f64 / 1_000.0,
         failure.absolute_limit_micros as f64 / 1_000.0,
         failure.baseline_micros as f64 / 1_000.0,
     )
@@ -86,9 +86,9 @@ impl VideoPresentationLatency {
 #[derive(Default)]
 struct State {
     clock: Option<(ClockOffsetEstimate, Instant)>,
-    video: Option<LatencyMeasurement>,
-    audio: Option<LatencyMeasurement>,
-    input: Option<LatencyMeasurement>,
+    video: IntervalDelay,
+    audio: IntervalDelay,
+    input: IntervalDelay,
     audio_active: bool,
     last_input: Option<Instant>,
     pending_input: BTreeMap<u64, Instant>,
@@ -99,31 +99,47 @@ struct State {
 #[derive(Clone, Default)]
 pub struct LatencyMeasurements(Arc<Mutex<State>>);
 
-fn observe(
-    slot: &mut Option<LatencyMeasurement>,
-    delay: Duration,
-    uncertainty: u64,
-    estimated: bool,
-) {
-    let delay_micros = u64::try_from(delay.as_micros()).unwrap_or(u64::MAX);
-    if delay_micros > MAX_MEASUREMENT_MICROS || uncertainty > MAX_MEASUREMENT_MICROS {
-        return;
+/// One channel's delays since the last report.
+#[derive(Default)]
+struct IntervalDelay {
+    measurement: Option<LatencyMeasurement>,
+    delays: Vec<u64>,
+}
+
+impl IntervalDelay {
+    fn observe(&mut self, delay: Duration, uncertainty: u64, estimated: bool) {
+        let delay_micros = u64::try_from(delay.as_micros()).unwrap_or(u64::MAX);
+        if delay_micros > MAX_MEASUREMENT_MICROS || uncertainty > MAX_MEASUREMENT_MICROS {
+            return;
+        }
+        if self.delays.len() < MAX_INTERVAL_SAMPLES {
+            self.delays.push(delay_micros);
+        }
+        match &mut self.measurement {
+            Some(value) => {
+                value.delay_micros = value.delay_micros.max(delay_micros);
+                value.uncertainty_micros = value.uncertainty_micros.max(uncertainty);
+                value.estimated |= estimated;
+                value.samples = value.samples.saturating_add(1).min(65_536);
+            }
+            None => {
+                self.measurement = Some(LatencyMeasurement {
+                    delay_micros,
+                    uncertainty_micros: uncertainty,
+                    estimated,
+                    samples: 1,
+                    typical_delay_micros: 0,
+                })
+            }
+        }
     }
-    match slot {
-        Some(value) => {
-            value.delay_micros = value.delay_micros.max(delay_micros);
-            value.uncertainty_micros = value.uncertainty_micros.max(uncertainty);
-            value.estimated |= estimated;
-            value.samples = value.samples.saturating_add(1).min(65_536);
-        }
-        None => {
-            *slot = Some(LatencyMeasurement {
-                delay_micros,
-                uncertainty_micros: uncertainty,
-                estimated,
-                samples: 1,
-            })
-        }
+
+    fn take(&mut self) -> Option<LatencyMeasurement> {
+        let mut measurement = self.measurement.take()?;
+        self.delays.sort_unstable();
+        measurement.typical_delay_micros = self.delays[self.delays.len() * 3 / 4];
+        self.delays.clear();
+        Some(measurement)
     }
 }
 
@@ -166,7 +182,9 @@ impl LatencyMeasurements {
                 .video_presentation
                 .observe(captured, delay, estimated, presented_at);
         if let (Some(delay), Some((clock, _))) = (observation, clock) {
-            observe(&mut state.video, delay, clock.uncertainty_micros, estimated);
+            state
+                .video
+                .observe(delay, clock.uncertainty_micros, estimated);
         }
     }
 
@@ -188,7 +206,7 @@ impl LatencyMeasurements {
             let delay = submitted_at
                 .saturating_duration_since(capture)
                 .saturating_add(Duration::from_micros(queued_micros));
-            observe(&mut state.audio, delay, clock.uncertainty_micros, true);
+            state.audio.observe(delay, clock.uncertainty_micros, true);
         }
     }
 
@@ -196,7 +214,7 @@ impl LatencyMeasurements {
         let mut state = self.0.lock().unwrap_or_else(|error| error.into_inner());
         state.audio_active = active;
         if !active {
-            state.audio = None;
+            state.audio = IntervalDelay::default();
         }
     }
 
@@ -221,26 +239,20 @@ impl LatencyMeasurements {
             oldest = Some(oldest.map_or(occurred_at, |at| at.min(occurred_at)));
         }
         if let Some(at) = oldest {
-            observe(
-                &mut state.input,
-                now.saturating_duration_since(at),
-                0,
-                false,
-            );
+            state
+                .input
+                .observe(now.saturating_duration_since(at), 0, false);
         }
     }
 
     pub fn take_report(&self, now: Instant) -> LatencyReport {
         let mut state = self.0.lock().unwrap_or_else(|error| error.into_inner());
         if let Some(oldest) = state.pending_input.values().min().copied() {
-            observe(
-                &mut state.input,
-                now.saturating_duration_since(oldest),
-                0,
-                true,
-            );
+            state
+                .input
+                .observe(now.saturating_duration_since(oldest), 0, true);
         }
-        let input_active = state.input.is_some()
+        let input_active = state.input.measurement.is_some()
             || !state.pending_input.is_empty()
             || state
                 .last_input

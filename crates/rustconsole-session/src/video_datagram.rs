@@ -169,6 +169,9 @@ fn parse_header(datagram: &[u8]) -> Result<(Header, &[u8]), VideoDatagramError> 
     ))
 }
 
+/// Frames normally arrive one period apart, so a longer gap means the link went quiet.
+const SILENCE_FRAME_PERIODS: u32 = 2;
+
 #[derive(Debug)]
 struct PartialFrame {
     header: Header,
@@ -198,6 +201,7 @@ pub struct VideoFrameAssembler {
     partial: BTreeMap<u64, PartialFrame>,
     newest_sequence: Option<u64>,
     newest_completed_sequence: Option<u64>,
+    last_datagram_at: Option<Instant>,
     stats: VideoAssemblyStats,
 }
 
@@ -214,6 +218,7 @@ impl VideoFrameAssembler {
             partial: BTreeMap::new(),
             newest_sequence: None,
             newest_completed_sequence: None,
+            last_datagram_at: None,
             stats: VideoAssemblyStats::default(),
         }
     }
@@ -229,6 +234,7 @@ impl VideoFrameAssembler {
         now: Instant,
         round_trip_time: Duration,
     ) -> Result<AssemblyResult, VideoDatagramError> {
+        self.extend_deadlines_across_silence(now);
         let mut dependency_lost = self.expire(now);
         let (header, payload) = parse_header(datagram)?;
         self.stats.received_chunks = self.stats.received_chunks.saturating_add(1);
@@ -390,6 +396,20 @@ impl VideoFrameAssembler {
             dependency_lost,
             progress: Some(progress),
         })
+    }
+
+    /// A link that delivers nothing is delaying chunks, not losing them, so silence must not
+    /// run down a frame whose remaining chunks may be the very next datagrams.
+    fn extend_deadlines_across_silence(&mut self, now: Instant) {
+        let silence = self
+            .last_datagram_at
+            .replace(now)
+            .map_or(Duration::ZERO, |last| now.saturating_duration_since(last));
+        if silence >= self.frame_period.saturating_mul(SILENCE_FRAME_PERIODS) {
+            for frame in self.partial.values_mut() {
+                frame.deadline += silence;
+            }
+        }
     }
 
     fn expire(&mut self, now: Instant) -> bool {
@@ -664,14 +684,40 @@ mod tests {
             .unwrap();
         assert_eq!(assembler.stats().late_chunks, 1);
 
-        let later = now + Duration::from_millis(101);
-        let next = packetize_video_frame(&frame(5, 16), 1_200)
-            .unwrap()
-            .remove(0);
-        assembler
-            .push(&next, later, Duration::from_millis(5))
-            .unwrap();
+        for (sequence, milliseconds) in [(5, 12), (6, 24), (7, 36)] {
+            let next = packetize_video_frame(&frame(sequence, 16), 1_200)
+                .unwrap()
+                .remove(0);
+            assembler
+                .push(
+                    &next,
+                    now + Duration::from_millis(milliseconds),
+                    Duration::from_millis(5),
+                )
+                .unwrap();
+        }
         assert_eq!(assembler.stats().lost_chunks, 3);
         assert_eq!(assembler.stats().incomplete_frames, 3);
+    }
+
+    #[test]
+    fn a_frame_delayed_by_a_silent_link_still_completes() {
+        let now = Instant::now();
+        let round_trip_time = Duration::from_millis(5);
+        let mut assembler = VideoFrameAssembler::new(120);
+        let mut chunks = packetize_video_frame(&frame(1, 2_000), 1_200).unwrap();
+        let last = chunks.pop().unwrap();
+        for chunk in &chunks {
+            assembler.push(chunk, now, round_trip_time).unwrap();
+        }
+
+        let result = assembler
+            .push(&last, now + Duration::from_millis(80), round_trip_time)
+            .unwrap();
+
+        assert_eq!(result.frame, Some(frame(1, 2_000)));
+        assert!(!result.dependency_lost);
+        assert_eq!(assembler.stats().incomplete_frames, 0);
+        assert_eq!(assembler.stats().lost_chunks, 0);
     }
 }

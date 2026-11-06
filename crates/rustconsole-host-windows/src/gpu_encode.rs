@@ -469,6 +469,13 @@ where
     E: VideoEncoder<ID3D11Texture2D>,
     E::Error: std::fmt::Display,
 {
+    /// Keeps capture moving on a tick without an encode. Otherwise the next encoded frame shows
+    /// the image prepared before the skip, which adds the whole skip to the stream's delay.
+    pub fn skip_next_frame(&mut self, timeout: Duration) -> Result<(), Box<dyn std::error::Error>> {
+        let diagnostics = self.quality.is_some() || cfg!(feature = "development");
+        self.capture.next_frame(timeout, diagnostics).map(|_| ())
+    }
+
     pub fn encode_next_frame(
         &mut self,
         timeout: Duration,

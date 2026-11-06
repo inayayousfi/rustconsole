@@ -78,6 +78,7 @@ impl Link {
                 uncertainty_micros: 700,
                 estimated: true,
                 samples: 60,
+                typical_delay_micros: 0,
             }),
             presented_bitrate_bits_per_second: target,
             ..LatencyReport::default()

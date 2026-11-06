@@ -26,13 +26,27 @@ pub struct LatencyMeasurement {
     pub estimated: bool,
     #[prost(uint32, tag = "4")]
     pub samples: u32,
+    /// 75th percentile of the interval. Zero means the sender did not report one.
+    #[prost(uint64, tag = "5")]
+    pub typical_delay_micros: u64,
 }
 
 impl LatencyMeasurement {
+    /// The delay most samples stayed within. Congestion delays most samples, while a brief
+    /// wireless spike only moves the largest one in `delay_micros`.
+    pub fn typical(self) -> u64 {
+        if self.typical_delay_micros == 0 {
+            self.delay_micros
+        } else {
+            self.typical_delay_micros
+        }
+    }
+
     pub fn valid(self) -> bool {
         self.samples > 0
             && self.samples <= 65_536
             && self.delay_micros <= MAX_MEASUREMENT_MICROS
+            && self.typical_delay_micros <= self.delay_micros
             && self.uncertainty_micros <= MAX_MEASUREMENT_MICROS
     }
 }

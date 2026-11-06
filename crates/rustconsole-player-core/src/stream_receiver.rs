@@ -641,6 +641,35 @@ async fn write_controls(
     stream.finish().map_err(|error| error.to_string())
 }
 
+/// Long enough that only a link too weak for even the smallest frame reaches it.
+const UNDELIVERABLE_VIDEO_TIME: Duration = Duration::from_secs(10);
+
+/// Detects a link that keeps delivering pieces of frames but never a whole one. A host that
+/// sends nothing, such as during a display change, is not a failing link.
+#[derive(Default)]
+struct VideoDeliveryWatch {
+    completed_frames: u64,
+    incomplete_frames: u64,
+    failing_since: Option<Instant>,
+}
+
+impl VideoDeliveryWatch {
+    fn undeliverable(&mut self, completed: u64, incomplete: u64, now: Instant) -> bool {
+        let frame_failed = incomplete != self.incomplete_frames;
+        if completed != self.completed_frames {
+            self.failing_since = None;
+        } else if frame_failed {
+            self.failing_since.get_or_insert(now);
+        }
+        self.completed_frames = completed;
+        self.incomplete_frames = incomplete;
+        frame_failed
+            && self.failing_since.is_some_and(|since| {
+                now.saturating_duration_since(since) >= UNDELIVERABLE_VIDEO_TIME
+            })
+    }
+}
+
 fn queue_control(
     sender: &tokio::sync::mpsc::Sender<OutgoingControl>,
     envelope: Envelope,
@@ -827,6 +856,7 @@ where
             let mut ticks = tokio::time::interval(frame_period);
             ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut last_report = Instant::now();
+            let mut delivery_watch = VideoDeliveryWatch::default();
             let mut last_keyframe = Instant::now() - KEYFRAME_RETRY_INTERVAL;
             let input_generation = 1;
             let mut input_sequence = 0u64;
@@ -974,6 +1004,9 @@ where
                             }
                             if last_report.elapsed() >= Duration::from_millis(500) {
                                 let stats = receiver.video.stats();
+                                if delivery_watch.undeliverable(stats.completed_frames, stats.incomplete_frames, Instant::now()) {
+                                    return Err("Session ended because the network stayed too poor to deliver any complete video frame for 10 seconds.".to_owned());
+                                }
                                 let report = VideoReceiverReport {
                                     newest_sequence: receiver.snapshot.lock().unwrap_or_else(|e| e.into_inner()).progress.map_or(0, |p| p.sequence),
                                     received_chunks: stats.received_chunks, lost_chunks: stats.lost_chunks,
@@ -1344,9 +1377,42 @@ mod tests {
         let message = crate::latency::budget_failure_message(failure);
         assert!(message.contains("video capture to presentation"));
         assert!(message.contains("120.0 ms (estimated)"));
-        assert!(message.contains("Allowed delay: 80.0 ms"));
         assert!(message.contains("minimum of 1 Mbit/s"));
         host.await.unwrap();
+    }
+
+    #[test]
+    fn frames_failing_for_ten_seconds_with_none_complete_end_the_session() {
+        let start = Instant::now();
+        let mut watch = VideoDeliveryWatch::default();
+        let ended = (1..=19_u64)
+            .map(|half_second| {
+                watch.undeliverable(
+                    0,
+                    half_second,
+                    start + Duration::from_millis(half_second * 500),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(ended.iter().all(|ended| !ended));
+        assert!(watch.undeliverable(0, 21, start + Duration::from_millis(10_500)));
+    }
+
+    #[test]
+    fn one_complete_frame_restarts_the_undeliverable_wait() {
+        let start = Instant::now();
+        let mut watch = VideoDeliveryWatch::default();
+        assert!(!watch.undeliverable(0, 1, start));
+        assert!(!watch.undeliverable(1, 2, start + Duration::from_secs(9)));
+        assert!(!watch.undeliverable(1, 3, start + Duration::from_secs(12)));
+    }
+
+    #[test]
+    fn a_host_sending_nothing_never_counts_as_an_undeliverable_link() {
+        let start = Instant::now();
+        let mut watch = VideoDeliveryWatch::default();
+        assert!(!watch.undeliverable(5, 1, start));
+        assert!(!watch.undeliverable(5, 1, start + Duration::from_secs(60)));
     }
 
     #[test]

@@ -66,6 +66,14 @@ const CEILING_DISPROVED_PERCENT: u128 = 105;
 /// The steady bitrate sits this share of the proven limit, leaving room for link jitter.
 const SOFT_CEILING_RANGE_PERCENT: u128 = 96;
 const SOFT_CEILING_PROBE_INTERVAL_MICROS: u64 = 15_000_000;
+/// A bitrate held this long without a cut is one the link really carried.
+const HEALTHY_BEST_HOLD_MICROS: u64 = 20_000_000;
+/// Falling below this share of the best held bitrate is a collapse, not a limit.
+const COLLAPSE_PERCENT: u128 = 50;
+/// Disturbances also cut a climb, so one failure only lowers the memory and delays the next try.
+const FAILED_RETURN_BEST_PERCENT: u128 = 75;
+const RETURN_RETRY_MICROS: u64 = 30_000_000;
+const MAXIMUM_RETURN_RETRY_MICROS: u64 = 600_000_000;
 const MAXIMUM_PROBE_BACKOFF_MICROS: u64 = 600_000_000;
 const RECOVERY_COOLDOWN_MICROS: u64 = 5_000_000;
 const FAILED_PROBE_ATTRIBUTION_MICROS: u64 = 5_000_000;
@@ -76,11 +84,15 @@ const FAILED_PROBE_AVERAGE_SAMPLES: usize = 5;
 const HEALTHY_REPORTS_BEFORE_RECOVERY: u8 = 4;
 const DEGRADED_REPORTS_BEFORE_REDUCTION: u8 = 2;
 const RTT_PRESSURE_REPORTS_BEFORE_REDUCTION: u8 = 2;
+/// Round-trip time follows delay, so it must not repeat a cut that delay control just made.
+const RTT_CUT_SPACING_MICROS: u64 = 5_000_000;
 const MINIMUM_RTT_PRESSURE_MARGIN: Duration = Duration::from_millis(20);
 const SENDER_PRESSURE_REPORTS_BEFORE_REDUCTION: u8 = 2;
 const SEVERE_SENDER_PRESSURE_EVENTS: u8 = 3;
 const SEVERE_RECEIVER_LOSS_PERCENT: u128 = 2;
 const SEVERE_LOST_CHUNKS: u64 = 4;
+/// Loss this heavy cannot be a passing burst, so it acts without waiting for a second report.
+const SUDDEN_RECEIVER_LOSS_PERCENT: u128 = 10;
 const SEVERE_INCOMPLETE_FRAMES: u64 = 2;
 const CAPACITY_AVERAGE_REPORTS: usize = 2;
 /// A target held this long is not the cause of a later incident, which was a passing network
@@ -140,6 +152,10 @@ pub struct AdaptiveBitrateController {
     healthy_reports: u8,
     soft_ceiling_healthy_micros: u64,
     target_held_micros: u64,
+    healthy_best_bits_per_second: Option<u64>,
+    returning_to_bits_per_second: Option<u64>,
+    return_retry_micros: u64,
+    return_wait_micros: u64,
     recovery_cooldown_micros: u64,
     provisional_ceiling_bits_per_second: Option<u64>,
     latency_ceiling_bits_per_second: Option<u64>,
@@ -149,6 +165,7 @@ pub struct AdaptiveBitrateController {
     probe_step_percent: u128,
     sender_pressure_events_since_report: u8,
     severe_sender_reduction_since_report: bool,
+    receiver_loss_in_previous_report: bool,
     sender_congested_report_streak: u8,
 }
 
@@ -176,6 +193,10 @@ impl AdaptiveBitrateController {
             healthy_reports: 0,
             soft_ceiling_healthy_micros: 0,
             target_held_micros: 0,
+            healthy_best_bits_per_second: None,
+            returning_to_bits_per_second: None,
+            return_retry_micros: RETURN_RETRY_MICROS,
+            return_wait_micros: 0,
             recovery_cooldown_micros: 0,
             provisional_ceiling_bits_per_second: None,
             latency_ceiling_bits_per_second: None,
@@ -185,6 +206,7 @@ impl AdaptiveBitrateController {
             probe_step_percent: SOFT_CEILING_PROBE_PERCENT,
             sender_pressure_events_since_report: 0,
             severe_sender_reduction_since_report: false,
+            receiver_loss_in_previous_report: false,
             sender_congested_report_streak: 0,
         }
     }
@@ -270,6 +292,11 @@ impl AdaptiveBitrateController {
         self.target_held_micros = self
             .target_held_micros
             .saturating_add(delivery.measurement_interval_micros);
+        if self.target_held_micros >= HEALTHY_BEST_HOLD_MICROS {
+            self.healthy_best_bits_per_second = self
+                .healthy_best_bits_per_second
+                .max(Some(self.target_bits_per_second));
+        }
         self.previous_delivery = delivery;
 
         if delivery.measurement_interval_micros == 0 {
@@ -331,14 +358,17 @@ impl AdaptiveBitrateController {
             self.rtt_pressure_report_streak = 0;
         }
 
-        let severe_receiver_loss = assembly_overflows > 0
+        let total_chunks = received_chunks.saturating_add(lost_chunks);
+        let heavy_receiver_loss = assembly_overflows > 0
             || incomplete_frames >= SEVERE_INCOMPLETE_FRAMES
             || (lost_chunks >= SEVERE_LOST_CHUNKS
-                && loss_percent_at_least(
-                    lost_chunks,
-                    received_chunks.saturating_add(lost_chunks),
-                    SEVERE_RECEIVER_LOSS_PERCENT,
-                ));
+                && loss_percent_at_least(lost_chunks, total_chunks, SEVERE_RECEIVER_LOSS_PERCENT));
+        let sudden_receiver_loss = lost_chunks >= SEVERE_LOST_CHUNKS
+            && loss_percent_at_least(lost_chunks, total_chunks, SUDDEN_RECEIVER_LOSS_PERCENT);
+        // A burst lost to radio noise says nothing about the bitrate. Congestion keeps losing.
+        let severe_receiver_loss =
+            sudden_receiver_loss || (heavy_receiver_loss && self.receiver_loss_in_previous_report);
+        self.receiver_loss_in_previous_report = receiver_loss;
         let severe_path_pressure =
             safe_path_capacity < percentage(self.target_bits_per_second, CONGESTION_TARGET_PERCENT);
         if severe_receiver_loss || severe_path_pressure {
@@ -382,7 +412,9 @@ impl AdaptiveBitrateController {
 
         if self.rtt_pressure_report_streak != 0 {
             self.reset_recovery_wait();
-            if self.rtt_pressure_report_streak < RTT_PRESSURE_REPORTS_BEFORE_REDUCTION {
+            if self.rtt_pressure_report_streak < RTT_PRESSURE_REPORTS_BEFORE_REDUCTION
+                || (self.active_probe.is_none() && self.target_held_micros < RTT_CUT_SPACING_MICROS)
+            {
                 return None;
             }
             self.rtt_pressure_report_streak = 0;
@@ -431,6 +463,7 @@ impl AdaptiveBitrateController {
             return None;
         }
 
+        self.update_return_after_collapse(delivery.measurement_interval_micros);
         let probe_validated = self.advance_active_probe(delivery.measurement_interval_micros);
         if self.target_bits_per_second == self.maximum_bits_per_second {
             return None;
@@ -524,7 +557,43 @@ impl AdaptiveBitrateController {
             })
     }
 
+    /// Limits learned during a collapse describe that moment, not the link. Once the link is
+    /// healthy again they are forgotten and recovery climbs back to what the link really carried.
+    fn update_return_after_collapse(&mut self, interval_micros: u64) {
+        if let Some(best) = self.returning_to_bits_per_second {
+            if self.target_bits_per_second >= percentage(best, SOFT_CEILING_RANGE_PERCENT) {
+                self.returning_to_bits_per_second = None;
+                self.provisional_ceiling_bits_per_second = Some(best);
+                self.return_retry_micros = RETURN_RETRY_MICROS;
+            }
+            return;
+        }
+        self.return_wait_micros = self.return_wait_micros.saturating_sub(interval_micros);
+        let Some(best) = self.healthy_best_bits_per_second else {
+            return;
+        };
+        if self.return_wait_micros != 0 {
+            return;
+        }
+        if self.target_bits_per_second < percentage(best, COLLAPSE_PERCENT) {
+            self.returning_to_bits_per_second = Some(best);
+            self.failed_probe_targets.clear();
+            self.provisional_ceiling_bits_per_second = None;
+            self.latency_ceiling_bits_per_second = None;
+            self.probe_step_percent = SOFT_CEILING_PROBE_PERCENT;
+            self.probe_interval_micros = SOFT_CEILING_PROBE_INTERVAL_MICROS;
+        }
+    }
+
+    #[must_use]
+    pub const fn returning_after_collapse(&self) -> bool {
+        self.returning_to_bits_per_second.is_some()
+    }
+
     fn recovery_ceiling_bits_per_second(&self) -> Option<u64> {
+        if self.returning_to_bits_per_second.is_some() {
+            return self.returning_to_bits_per_second;
+        }
         match (
             self.delivery_ceiling_bits_per_second(),
             self.latency_ceiling_bits_per_second,
@@ -722,11 +791,21 @@ impl AdaptiveBitrateController {
         if target == self.target_bits_per_second {
             return None;
         }
-        self.target_bits_per_second = target;
-        self.target_held_micros = 0;
         if reason == BitrateChangeReason::Congestion {
             self.recovery_cooldown_micros = RECOVERY_COOLDOWN_MICROS;
+            if let Some(best) = self.returning_to_bits_per_second.take() {
+                self.healthy_best_bits_per_second = Some(
+                    percentage(best, FAILED_RETURN_BEST_PERCENT).max(self.target_bits_per_second),
+                );
+                self.return_wait_micros = self.return_retry_micros;
+                self.return_retry_micros = self
+                    .return_retry_micros
+                    .saturating_mul(2)
+                    .min(MAXIMUM_RETURN_RETRY_MICROS);
+            }
         }
+        self.target_bits_per_second = target;
+        self.target_held_micros = 0;
         Some(BitrateChange {
             target_bits_per_second: target,
             reason,
@@ -1131,7 +1210,7 @@ mod tests {
     fn failed_startup_target_replaces_the_provisional_ceiling() {
         let mut controller = AdaptiveBitrateController::from_startup_probe(100_000_000, 10_000_000);
         let mut report = delivery(1_000_000);
-        report.received_chunks = 196;
+        report.received_chunks = 36;
         report.lost_chunks = 4;
 
         controller.observe(path(200_000_000), report);
@@ -1193,6 +1272,7 @@ mod tests {
     #[test]
     fn consecutive_rtt_pressure_reports_reduce_ten_percent() {
         let mut controller = AdaptiveBitrateController::new(20_000_000);
+        controller.target_held_micros = RTT_CUT_SPACING_MICROS;
         controller.observe(path_with_rtt(10), delivery(625_000));
         controller.observe(path_with_rtt(31), delivery(1_250_000));
 
@@ -1318,7 +1398,7 @@ mod tests {
         let mut controller = AdaptiveBitrateController::new(100_000_000);
         controller.target_bits_per_second = 20_000_000;
         let mut report = delivery(1_000_000);
-        report.received_chunks = 196;
+        report.received_chunks = 36;
         report.lost_chunks = 4;
 
         let change = controller.observe(path(200_000_000), report).unwrap();
@@ -1329,13 +1409,97 @@ mod tests {
         assert_eq!(controller.estimated_capacity_bits_per_second(), 16_000_000);
     }
 
+    fn clean_reports(controller: &mut AdaptiveBitrateController, bytes: &mut u64, seconds: u64) {
+        for _ in 0..seconds * 2 {
+            *bytes += 2_000_000;
+            controller.observe(path(200_000_000), delivery(*bytes));
+        }
+    }
+
+    #[test]
+    fn a_collapse_climbs_back_to_the_best_held_bitrate_within_a_minute() {
+        let mut controller = AdaptiveBitrateController::new(30_000_000);
+        controller.target_bits_per_second = 30_000_000;
+        let mut bytes = 0;
+        clean_reports(&mut controller, &mut bytes, 21);
+        controller.set_latency_target(2_000_000, RECOVERY_COOLDOWN_MICROS);
+        controller.configure_latency_ceiling(Some(2_100_000));
+
+        clean_reports(&mut controller, &mut bytes, 60);
+
+        assert!(
+            controller.target_bits_per_second() >= 28_000_000,
+            "{}",
+            controller.target_bits_per_second()
+        );
+    }
+
+    #[test]
+    fn a_failed_climb_lowers_the_memory_and_waits_before_the_next_one() {
+        let mut controller = AdaptiveBitrateController::new(100_000_000);
+        controller.healthy_best_bits_per_second = Some(30_000_000);
+        controller.target_bits_per_second = 2_000_000;
+        let mut bytes = 0;
+        clean_reports(&mut controller, &mut bytes, 10);
+        assert!(controller.returning_after_collapse());
+        let failed_at = controller.target_bits_per_second();
+
+        controller.set_latency_target(failed_at / 2, RECOVERY_COOLDOWN_MICROS);
+
+        assert!(!controller.returning_after_collapse());
+        assert_eq!(controller.healthy_best_bits_per_second, Some(22_500_000));
+        clean_reports(&mut controller, &mut bytes, 20);
+        assert!(!controller.returning_after_collapse());
+        clean_reports(&mut controller, &mut bytes, 20);
+        assert!(controller.returning_after_collapse());
+    }
+
+    #[test]
+    fn a_loss_burst_that_passes_leaves_the_bitrate_alone() {
+        let mut controller = AdaptiveBitrateController::new(100_000_000);
+        controller.target_bits_per_second = 20_000_000;
+        let mut burst = delivery(1_000_000);
+        burst.received_chunks = 960;
+        burst.lost_chunks = 40;
+        burst.incomplete_frames = 2;
+        burst.assembly_overflows = 1;
+        assert_eq!(controller.observe(path(200_000_000), burst), None);
+
+        let mut clean = delivery(2_000_000);
+        clean.received_chunks = 1_960;
+        clean.lost_chunks = 40;
+        clean.incomplete_frames = 2;
+        clean.assembly_overflows = 1;
+        assert_eq!(controller.observe(path(200_000_000), clean), None);
+
+        assert_eq!(controller.target_bits_per_second(), 20_000_000);
+    }
+
+    #[test]
+    fn loss_in_two_reports_in_a_row_cuts_twenty_five_percent() {
+        let mut controller = AdaptiveBitrateController::new(100_000_000);
+        controller.target_bits_per_second = 20_000_000;
+        let mut first = delivery(1_000_000);
+        first.received_chunks = 960;
+        first.lost_chunks = 40;
+        assert_eq!(controller.observe(path(200_000_000), first), None);
+
+        let mut second = delivery(2_000_000);
+        second.received_chunks = 1_920;
+        second.lost_chunks = 80;
+        let change = controller.observe(path(200_000_000), second).unwrap();
+
+        assert_eq!(change.cause, VideoBitrateChangeCause::SevereReceiverLoss);
+        assert_eq!(change.target_bits_per_second, 15_000_000);
+    }
+
     #[test]
     fn severe_loss_during_a_probe_returns_below_the_failed_target() {
         let mut controller = AdaptiveBitrateController::new(20_000_000);
         assert_eq!(controller.target_bits_per_second(), 10_000_000);
         controller.set_recovery_target(10_200_000);
         let mut report = delivery(1_000_000);
-        report.received_chunks = 196;
+        report.received_chunks = 36;
         report.lost_chunks = 4;
 
         let change = controller.observe(path(200_000_000), report).unwrap();
@@ -1352,11 +1516,11 @@ mod tests {
         let mut controller = AdaptiveBitrateController::new(20_000_000);
         controller.set_recovery_target(10_200_000);
         let mut first = delivery(1_000_000);
-        first.received_chunks = 196;
+        first.received_chunks = 36;
         first.lost_chunks = 4;
         controller.observe(path(200_000_000), first);
         let mut second = delivery(2_000_000);
-        second.received_chunks = 392;
+        second.received_chunks = 72;
         second.lost_chunks = 8;
 
         let change = controller.observe(path(200_000_000), second).unwrap();
@@ -1393,18 +1557,18 @@ mod tests {
         let mut controller = AdaptiveBitrateController::new(20_000_000);
         controller.set_recovery_target(10_200_000);
         let mut loss = delivery(1_000_000);
-        loss.received_chunks = 196;
+        loss.received_chunks = 36;
         loss.lost_chunks = 4;
         controller.observe(path(200_000_000), loss);
 
         for report_index in 1..60_u64 {
             let mut clean = delivery(1_000_000 + report_index * 625_000);
-            clean.received_chunks = 196;
+            clean.received_chunks = 36;
             clean.lost_chunks = 4;
             assert_eq!(controller.observe(path(200_000_000), clean), None);
         }
         let mut clean = delivery(38_500_000);
-        clean.received_chunks = 196;
+        clean.received_chunks = 36;
         clean.lost_chunks = 4;
         assert_eq!(
             controller.observe(path(200_000_000), clean),
@@ -1469,7 +1633,7 @@ mod tests {
     fn recovery_waits_five_clean_seconds_then_uses_a_bounded_step() {
         let mut controller = AdaptiveBitrateController::new(100_000_000);
         let mut report = delivery(1_250_000);
-        report.received_chunks = 196;
+        report.received_chunks = 36;
         report.lost_chunks = 4;
         controller.observe(path(80_000_000), report);
         assert_eq!(controller.target_bits_per_second(), 37_500_000);
@@ -1494,7 +1658,7 @@ mod tests {
     fn stable_higher_rtt_does_not_prevent_full_recovery() {
         let mut controller = AdaptiveBitrateController::new(100_000_000);
         let mut congested = delivery(1_250_000);
-        congested.received_chunks = 196;
+        congested.received_chunks = 36;
         congested.lost_chunks = 4;
         controller.observe(path(200_000_000), congested);
         assert_eq!(controller.target_bits_per_second(), 37_500_000);

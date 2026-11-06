@@ -15,6 +15,8 @@ pub struct HostEncodedVideoFrame {
     pub payload: Vec<u8>,
 }
 
+const MAX_SOURCE_DELAY_SAMPLES: usize = 512;
+
 /// Delay this host added before sending, beyond its usual capture-to-encoded time.
 ///
 /// A capture or encoder stall reaches the player as extra delay, but a lower bitrate cannot remove
@@ -22,7 +24,7 @@ pub struct HostEncodedVideoFrame {
 #[derive(Default)]
 struct SourceDelay {
     last_capture_micros: u64,
-    largest_micros: u64,
+    delays_micros: Vec<u64>,
     usual_micros: Option<u64>,
     previous_excess_micros: u64,
 }
@@ -34,23 +36,29 @@ impl SourceDelay {
             return;
         }
         self.last_capture_micros = captured_at_micros;
-        self.largest_micros = self
-            .largest_micros
-            .max(encoded_at_micros.saturating_sub(captured_at_micros));
+        if self.delays_micros.len() < MAX_SOURCE_DELAY_SAMPLES {
+            self.delays_micros
+                .push(encoded_at_micros.saturating_sub(captured_at_micros));
+        }
     }
 
     /// Closes one report interval. A stall near its end can reach the player in the next report,
     /// so the excess of the previous interval still counts.
     fn take_excess_micros(&mut self) -> u64 {
-        let largest = std::mem::take(&mut self.largest_micros);
         let mut excess = 0;
-        if largest != 0 {
+        self.delays_micros.sort_unstable();
+        if let Some(typical) = self
+            .delays_micros
+            .get(self.delays_micros.len() * 3 / 4)
+            .copied()
+        {
             let usual = self
                 .usual_micros
-                .map_or(largest, |usual| usual.min(largest));
+                .map_or(typical, |usual| usual.min(typical));
             self.usual_micros = Some(usual);
-            excess = largest - usual;
+            excess = typical - usual;
         }
+        self.delays_micros.clear();
         excess.max(std::mem::replace(&mut self.previous_excess_micros, excess))
     }
 }
@@ -127,7 +135,7 @@ impl HostVideoStreamPolicy {
         let source_excess = self.source_delay.take_excess_micros();
         let report = report.map(|mut report| {
             if let Some(video) = report.video.as_mut() {
-                video.delay_micros = video.delay_micros.saturating_sub(source_excess);
+                video.typical_delay_micros = video.typical().saturating_sub(source_excess).max(1);
             }
             report
         });
@@ -143,6 +151,9 @@ impl HostVideoStreamPolicy {
         );
         if let Some(failure) = evaluation.failure {
             return Err(failure);
+        }
+        if self.bitrate.returning_after_collapse() {
+            latency.forget_ceiling();
         }
         self.bitrate.configure_latency_ceiling(latency.ceiling());
         let mut change =

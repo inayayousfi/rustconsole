@@ -11,6 +11,7 @@ fn measurement(delay_micros: u64) -> LatencyMeasurement {
         uncertainty_micros: 1_000,
         estimated: true,
         samples: 10,
+        typical_delay_micros: 0,
     }
 }
 
@@ -92,11 +93,11 @@ fn repeated_cuts_in_one_incident_keep_the_first_limit() {
     calibrate(&mut policy, start);
     let mut bitrate = 40_000_000;
     let mut report_at = Duration::from_secs(4);
-    for _ in 0..3 {
+    for delay in [85_000, 100_000, 120_000] {
         policy.bitrate_changed(start + report_at - Duration::from_secs(2));
         for _ in 0..2 {
             let result = policy.observe(
-                Some(report(90_000, bitrate)),
+                Some(report(delay, bitrate)),
                 10_000,
                 bitrate,
                 100_000_000,
@@ -134,7 +135,7 @@ fn one_bad_channel_cannot_be_hidden_by_healthy_video_and_network() {
         feedback.audio_active = true;
         feedback.audio = Some(measurement(60_000));
         feedback.input_active = true;
-        feedback.input = Some(measurement(50_000));
+        feedback.input = Some(measurement(110_000));
         let result = policy.observe(
             Some(feedback),
             10_000,
@@ -359,4 +360,98 @@ fn a_passing_incident_after_a_proven_hold_keeps_the_limit_but_a_recent_rate_is_b
     policy.bitrate_changed(start + Duration::from_secs(75));
     assert!(bad(&mut policy, 3_800_000, 90).is_some());
     assert_eq!(policy.ceiling(), Some(3_800_000));
+}
+
+#[test]
+fn brief_spikes_in_every_report_leave_the_bitrate_and_the_session_alone() {
+    let start = Instant::now();
+    let mut policy = LatencyPolicy::new(100_000, 10_000, start);
+    calibrate(&mut policy, start);
+    for half_second in 8..=80 {
+        let mut spiky = report(95_000, 1_000_000);
+        spiky.video.as_mut().unwrap().typical_delay_micros = 40_000;
+        let evaluation = policy.observe(
+            Some(spiky),
+            10_000,
+            1_000_000,
+            20_000_000,
+            start + Duration::from_millis(half_second * 500),
+        );
+        assert_eq!(evaluation.reduce_to, None);
+        assert_eq!(evaluation.failure, None);
+    }
+}
+
+#[test]
+fn delay_on_most_frames_still_ends_a_session_stuck_at_the_minimum_bitrate() {
+    let start = Instant::now();
+    let mut policy = LatencyPolicy::new(100_000, 10_000, start);
+    calibrate(&mut policy, start);
+    let failed = (8..=24).any(|half_second| {
+        let mut congested = report(125_000, 1_000_000);
+        congested.video.as_mut().unwrap().typical_delay_micros = 120_000;
+        policy
+            .observe(
+                Some(congested),
+                10_000,
+                1_000_000,
+                20_000_000,
+                start + Duration::from_millis(half_second * 500),
+            )
+            .failure
+            .is_some()
+    });
+    assert!(failed);
+}
+
+#[test]
+fn delay_over_the_budget_but_within_the_client_limit_never_ends_a_session() {
+    let start = Instant::now();
+    let mut policy = LatencyPolicy::new(100_000, 10_000, start);
+    calibrate(&mut policy, start);
+    for half_second in 8..=60 {
+        let evaluation = policy.observe(
+            Some(report(60_000, 1_000_000)),
+            10_000,
+            1_000_000,
+            20_000_000,
+            start + Duration::from_millis(half_second * 500),
+        );
+        assert_eq!(evaluation.failure, None);
+    }
+}
+
+/// Reports the same delay every half second and returns each bitrate cut with its time.
+fn cuts_under_steady_delay(seconds: u64) -> Vec<(Duration, u64)> {
+    let start = Instant::now();
+    let mut policy = LatencyPolicy::new(100_000, 10_000, start);
+    calibrate(&mut policy, start);
+    let mut bitrate = 40_000_000;
+    let mut cuts = Vec::new();
+    for half_second in 8..8 + seconds * 2 {
+        let at = Duration::from_millis(half_second * 500);
+        policy.bitrate_changed(start + at - Duration::from_secs(2));
+        let result = policy.observe(
+            Some(report(90_000, bitrate)),
+            10_000,
+            bitrate,
+            100_000_000,
+            start + at,
+        );
+        if let Some(target) = result.reduce_to {
+            bitrate = target;
+            cuts.push((at, target));
+        }
+    }
+    cuts
+}
+
+#[test]
+fn delay_that_a_cut_does_not_change_is_cut_only_every_five_seconds() {
+    let cuts = cuts_under_steady_delay(12);
+    assert_eq!(cuts.len(), 3);
+    assert!(
+        cuts.windows(2)
+            .all(|pair| pair[1].0 - pair[0].0 >= Duration::from_secs(5))
+    );
 }

@@ -15,6 +15,7 @@ use rustls::client::danger::{ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use std::collections::HashMap;
 use std::fmt;
+use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -166,6 +167,19 @@ fn configure_transport(transport: &mut quinn::TransportConfig) {
         quinn::IdleTimeout::try_from(Duration::from_secs(10))
             .expect("ten seconds is a valid QUIC idle timeout"),
     ));
+}
+
+/// A link that stalls hands over everything it held at once. About 300 ms of a 100 Mbit/s stream
+/// must fit here, or the kernel drops media the link did deliver.
+const CLIENT_RECEIVE_BUFFER_BYTES: usize = 4 * 1024 * 1024;
+
+pub fn client_endpoint(bind_address: SocketAddr) -> io::Result<Endpoint> {
+    let socket = std::net::UdpSocket::bind(bind_address)?;
+    quinn::udp::UdpSocketState::new((&socket).into())?
+        .set_recv_buffer_size((&socket).into(), CLIENT_RECEIVE_BUFFER_BYTES)?;
+    let runtime = quinn::default_runtime()
+        .ok_or_else(|| io::Error::other("QUIC needs an asynchronous runtime"))?;
+    Endpoint::new(quinn::EndpointConfig::default(), None, socket, runtime)
 }
 
 pub async fn send_media_datagram(

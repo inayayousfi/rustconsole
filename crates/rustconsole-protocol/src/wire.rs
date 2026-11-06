@@ -1119,6 +1119,7 @@ mod tests {
                         estimated: true,
                         samples: 1,
                         uncertainty_micros: 0,
+                        typical_delay_micros: 0,
                     }),
                     presented_bitrate_bits_per_second: 1_000_000,
                     ..Default::default()

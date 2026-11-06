@@ -15,6 +15,10 @@ const INCIDENT_TIME: Duration = Duration::from_secs(10);
 /// A first incident this close to the limit steps down gently instead of cutting hard.
 const NEAR_LIMIT_PERCENT: u64 = 90;
 const EDGE_CUT_PERCENT: u64 = 96;
+/// A cut that did not lower the delay says the bitrate may not be the cause, so the next one
+/// waits this long unless the delay clearly worsens, as it does on an overloaded link.
+const CUT_SPACING: Duration = Duration::from_secs(5);
+const WORSENING_PRESSURE_FACTOR: f64 = 1.25;
 
 #[derive(Debug, Default)]
 struct Channel {
@@ -32,6 +36,7 @@ pub struct LatencyPolicy {
     ceiling: Option<u64>,
     retry_seconds: u64,
     last_cut_at: Option<Instant>,
+    last_cut_pressure: f64,
     last_report_at: Option<Instant>,
     status: LatencyControlStatus,
 }
@@ -65,6 +70,7 @@ impl LatencyPolicy {
             ceiling: None,
             retry_seconds: 5,
             last_cut_at: None,
+            last_cut_pressure: 0.0,
             last_report_at: None,
             status: LatencyControlStatus::default(),
         }
@@ -114,11 +120,12 @@ impl LatencyPolicy {
                 continue;
             };
             estimates |= value.estimated || value.uncertainty_micros != 0;
+            let delay = value.typical();
             if settled {
                 if channel.calibration.len() == BASELINE_SAMPLES {
                     channel.calibration.pop_front();
                 }
-                channel.calibration.push_back(value.delay_micros);
+                channel.calibration.push_back(delay);
                 if channel.calibration.len() == BASELINE_SAMPLES {
                     let mut samples: Vec<_> = channel.calibration.iter().copied().collect();
                     samples.sort_unstable();
@@ -135,21 +142,23 @@ impl LatencyPolicy {
             // Clock uncertainty is retained in the report; compare the estimate,
             // rather than turn uncertainty itself into an observed delay failure.
             let current_pressure = if budget > baseline {
-                value.delay_micros.saturating_sub(baseline) as f64 / (budget - baseline) as f64
+                delay.saturating_sub(baseline) as f64 / (budget - baseline) as f64
             } else {
-                value.delay_micros as f64 / budget.max(1) as f64
+                delay as f64 / budget.max(1) as f64
             };
             pressure = pressure.max(current_pressure);
-            if value.delay_micros > budget {
+            if delay > budget {
                 excessive = true;
-                if settled && bitrate == crate::VIDEO_BITRATE_BOOTSTRAP {
+                // The budget steers the bitrate. Only the client's limit is worth ending for: on a
+                // slow link one frame's transfer alone can exceed the budget at any bitrate.
+                if settled && bitrate == crate::VIDEO_BITRATE_BOOTSTRAP && delay > self.absolute {
                     let since = *channel.excessive_since.get_or_insert(now);
                     if now.saturating_duration_since(since) >= FAILURE_TIME
                         && result.failure.is_none()
                     {
                         result.failure = Some(LatencyBudgetFailure {
                             channel: index as i32 + 1,
-                            observed_delay_micros: value.delay_micros,
+                            observed_delay_micros: delay,
                             budget_micros: budget,
                             absolute_limit_micros: self.absolute,
                             baseline_micros: baseline,
@@ -178,13 +187,18 @@ impl LatencyPolicy {
             self.pressure_streak = self.pressure_streak.saturating_add(1);
             if self.pressure_streak >= 2 && bitrate > crate::VIDEO_BITRATE_BOOTSTRAP {
                 self.pressure_streak = 0;
-                let new_incident = self
-                    .last_cut_at
-                    .is_none_or(|at| now.saturating_duration_since(at) >= INCIDENT_TIME);
+                let since_cut = self.last_cut_at.map(|at| now.saturating_duration_since(at));
+                if since_cut.is_some_and(|since| since < CUT_SPACING)
+                    && pressure < self.last_cut_pressure * WORSENING_PRESSURE_FACTOR
+                {
+                    return result;
+                }
+                let new_incident = since_cut.is_none_or(|since| since >= INCIDENT_TIME);
                 let near_limit = self
                     .ceiling
                     .is_some_and(|ceiling| bitrate >= ceiling / 100 * NEAR_LIMIT_PERCENT);
                 self.last_cut_at = Some(now);
+                self.last_cut_pressure = pressure;
                 result.reduce_to = Some(if new_incident && near_limit {
                     bitrate / 100 * EDGE_CUT_PERCENT
                 } else {
@@ -240,6 +254,12 @@ impl LatencyPolicy {
     pub fn ceiling(&self) -> Option<u64> {
         self.ceiling
     }
+
+    pub fn forget_ceiling(&mut self) {
+        self.ceiling = None;
+        self.status.ceiling_bits_per_second = None;
+    }
+
     pub fn retry_delay_micros(&self) -> u64 {
         self.retry_seconds * 1_000_000
     }
