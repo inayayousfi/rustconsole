@@ -41,6 +41,7 @@ pub const MAX_CONCURRENT_LAN_PROBES: usize = 24;
 pub const MAX_CONCURRENT_ROUTED_PROBES: usize =
     MAX_CONCURRENT_DISCOVERY_PROBES - MAX_CONCURRENT_LAN_PROBES;
 const BANDWIDTH_PROBE_VERSION: u32 = rustconsole_session::bandwidth_probe::VERSION;
+const CLOSE_DELIVERY_TIME: Duration = Duration::from_millis(200);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct DiscoveryProgress {
@@ -858,29 +859,30 @@ where
             None
         };
 
-        let end = session_try!(
-            "receiving stream",
-            stream_receiver::receive_stream(stream_receiver::ReceiveStreamParameters {
-                connection: connection.clone(),
-                control: (send, receive),
-                input_stream,
-                fps: selected.frames_per_second,
-                audio_enabled: audio_transport.is_some(),
-                host_pointer_release,
-                network_status: network_status_version != 0,
-                session_started,
-                latency_measurements,
-                diagnostic_stream,
-                should_stop,
-                input,
-                progress: on_progress,
-                consumers: StreamConsumers {
-                    audio: consume_audio,
-                    video: consume_video,
-                },
-            })
-            .await
-        );
+        let received = stream_receiver::receive_stream(stream_receiver::ReceiveStreamParameters {
+            connection: connection.clone(),
+            control: (send, receive),
+            input_stream,
+            fps: selected.frames_per_second,
+            audio_enabled: audio_transport.is_some(),
+            host_pointer_release,
+            network_status: network_status_version != 0,
+            session_started,
+            latency_measurements,
+            diagnostic_stream,
+            should_stop,
+            input,
+            progress: on_progress,
+            consumers: StreamConsumers {
+                audio: consume_audio,
+                video: consume_video,
+            },
+        })
+        .await;
+        // A process that exits now never sends the close, and the host then keeps the stream
+        // slot and turns away reconnects until its idle timeout.
+        let _ = tokio::time::timeout(CLOSE_DELIVERY_TIME, endpoint.wait_idle()).await;
+        let end = session_try!("receiving stream", received);
         Ok(StreamHostResult { identity, end })
     })
 }
