@@ -59,7 +59,8 @@ const SAFE_PATH_PERCENT: u128 = 100;
 const RECOVERY_PROBE_PERCENT: u128 = 110;
 const RECOVERY_MINIMUM_STEP_PERCENT: u128 = 3;
 const RECOVERY_MAXIMUM_STEP_PERCENT: u128 = 25;
-const SOFT_CEILING_PROBE_PERCENT: u128 = 102;
+const SOFT_CEILING_PROBE_PERCENT: u128 = 2;
+const MAXIMUM_PROBE_STEP_PERCENT: u128 = 16;
 /// A link buffer can absorb a small overshoot, so only a clear excess disproves a limit.
 const CEILING_DISPROVED_PERCENT: u128 = 105;
 /// The steady bitrate sits this share of the proven limit, leaving room for link jitter.
@@ -145,6 +146,7 @@ pub struct AdaptiveBitrateController {
     failed_probe_targets: VecDeque<u64>,
     active_probe: Option<ActiveBitrateProbe>,
     probe_interval_micros: u64,
+    probe_step_percent: u128,
     sender_pressure_events_since_report: u8,
     severe_sender_reduction_since_report: bool,
     sender_congested_report_streak: u8,
@@ -180,6 +182,7 @@ impl AdaptiveBitrateController {
             failed_probe_targets: VecDeque::with_capacity(FAILED_PROBE_AVERAGE_SAMPLES),
             active_probe: None,
             probe_interval_micros: SOFT_CEILING_PROBE_INTERVAL_MICROS,
+            probe_step_percent: SOFT_CEILING_PROBE_PERCENT,
             sender_pressure_events_since_report: 0,
             severe_sender_reduction_since_report: false,
             sender_congested_report_streak: 0,
@@ -413,8 +416,10 @@ impl AdaptiveBitrateController {
             );
         }
 
+        // Moderate delay only pauses the wait. Clearing it would stop probes for good on a link
+        // whose clean stretches are shorter than the probe interval.
         if !allow_increase {
-            self.reset_recovery_wait();
+            self.healthy_reports = 0;
             return None;
         }
         let recovery_cooldown_was_active = self.recovery_cooldown_micros != 0;
@@ -438,6 +443,12 @@ impl AdaptiveBitrateController {
 
         if probe_validated {
             self.forget_ceiling_passed_by_probe();
+            if self
+                .recovery_ceiling_bits_per_second()
+                .is_none_or(|ceiling| self.target_bits_per_second >= ceiling)
+            {
+                self.gain_probe_momentum();
+            }
             self.healthy_reports = 0;
             self.soft_ceiling_healthy_micros = 0;
             if self.near_soft_ceiling() {
@@ -451,7 +462,7 @@ impl AdaptiveBitrateController {
             self.healthy_reports = 0;
             self.soft_ceiling_healthy_micros = 0;
             let recovery_target = if self.near_soft_ceiling() {
-                percentage(self.target_bits_per_second, SOFT_CEILING_PROBE_PERCENT)
+                percentage(self.target_bits_per_second, 100 + self.probe_step_percent)
             } else {
                 self.ordinary_recovery_target()
             };
@@ -468,7 +479,7 @@ impl AdaptiveBitrateController {
             }
             self.soft_ceiling_healthy_micros = 0;
             return self.set_recovery_target(
-                percentage(self.target_bits_per_second, SOFT_CEILING_PROBE_PERCENT)
+                percentage(self.target_bits_per_second, 100 + self.probe_step_percent)
                     .min(safe_path_capacity),
             );
         }
@@ -539,6 +550,9 @@ impl AdaptiveBitrateController {
     ) -> Option<BitrateChange> {
         self.active_probe = None;
         self.reset_recovery_wait();
+        if !self.hold_is_proven() {
+            self.lose_probe_momentum();
+        }
         let change = self.set_target(
             target,
             BitrateChangeReason::Congestion,
@@ -631,14 +645,29 @@ impl AdaptiveBitrateController {
         }
         self.failed_probe_targets
             .push_back(probe.target_bits_per_second);
-        self.probe_interval_micros = self
-            .probe_interval_micros
-            .saturating_mul(2)
-            .min(MAXIMUM_PROBE_BACKOFF_MICROS);
+        self.lose_probe_momentum();
         let hold = percentage(probe.target_bits_per_second, SOFT_CEILING_RANGE_PERCENT);
         probe
             .previous_target_bits_per_second
             .map(|previous| previous.min(hold))
+    }
+
+    /// Probes thin out at a real limit, so failures there cost a rare small dip.
+    fn lose_probe_momentum(&mut self) {
+        self.probe_step_percent = SOFT_CEILING_PROBE_PERCENT;
+        self.probe_interval_micros = self
+            .probe_interval_micros
+            .saturating_mul(2)
+            .min(MAXIMUM_PROBE_BACKOFF_MICROS);
+    }
+
+    /// A probe that passes the known limit shows the limit was too low, so the next ones speed
+    /// up and a limit lowered by a bad network period recovers in minutes. A probe below the
+    /// limit proves nothing new: counting it would cancel the thinning out at a real limit.
+    fn gain_probe_momentum(&mut self) {
+        self.probe_step_percent = (self.probe_step_percent * 2).min(MAXIMUM_PROBE_STEP_PERCENT);
+        self.probe_interval_micros =
+            (self.probe_interval_micros / 2).max(SOFT_CEILING_PROBE_INTERVAL_MICROS);
     }
 
     fn hold_is_proven(&self) -> bool {
@@ -1607,6 +1636,47 @@ mod tests {
         controller.record_active_probe_failure();
 
         assert_eq!(controller.soft_ceiling_bits_per_second(), Some(22_000_000));
+    }
+
+    #[test]
+    fn delay_cuts_soon_after_a_rise_thin_out_probes_and_passing_probes_speed_them_up() {
+        let mut controller = AdaptiveBitrateController::new(100_000_000);
+        controller.set_latency_target(19_000_000, 0);
+        assert_eq!(
+            controller.probe_interval_micros,
+            SOFT_CEILING_PROBE_INTERVAL_MICROS * 2
+        );
+
+        controller.gain_probe_momentum();
+        controller.gain_probe_momentum();
+        assert_eq!(
+            controller.probe_interval_micros,
+            SOFT_CEILING_PROBE_INTERVAL_MICROS
+        );
+        assert_eq!(controller.probe_step_percent, 8);
+
+        controller.set_latency_target(18_000_000, 0);
+        assert_eq!(controller.probe_step_percent, SOFT_CEILING_PROBE_PERCENT);
+    }
+
+    #[test]
+    fn moderate_delay_pauses_the_wait_for_a_probe_without_clearing_it() {
+        let mut controller = AdaptiveBitrateController::new(100_000_000);
+        controller.failed_probe_targets = VecDeque::from([20_000_000; 5]);
+        controller.target_bits_per_second = 19_600_000;
+
+        for report in 1..=59_u64 {
+            let change = controller.observe_with_recovery(
+                path(200_000_000),
+                delivery(report * 1_250_000),
+                report % 2 == 0,
+            );
+            assert_eq!(change, None);
+        }
+        let change =
+            controller.observe_with_recovery(path(200_000_000), delivery(60 * 1_250_000), true);
+
+        assert_eq!(change.unwrap().target_bits_per_second, 19_992_000);
     }
 
     #[test]

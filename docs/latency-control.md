@@ -45,7 +45,7 @@ A session starts at 70% of the capacity measured by the startup probe, and that 
 
 Two consecutive excessive-delay reports cut bitrate by 25%, or by 4% for the first cut of an incident close to the latency limit. The first cut of an incident records the bitrate as the latency limit. Further cuts within 10 seconds belong to the same incident and leave the limit unchanged, because a stall at the source says nothing about the link. Delivery and sender-pressure responses stay active alongside delay.
 
-Bitrate rises only while every active channel has a measurement and pressure is below 0.5. The steady bitrate is 96% of the lower of the delivery and latency limits. A limit does not expire with time. Below 90% of a limit, each step is checked for 1.5 seconds. Closer to a limit, each step is checked for 5 seconds and increases 2%.
+Bitrate rises only while every active channel has a measurement and pressure is below 0.5. A report at or above 0.5 pauses the wait for the next rise without clearing it. A rise near a limit waits 15 seconds and adds 2%. A failed rise, or a delay cut within 60 seconds of a bitrate change, doubles that wait up to ten minutes and resets the step. A passing rise at or above the limit halves the wait and doubles the step up to 16%. The steady bitrate is 96% of the lower of the delivery and latency limits. A limit does not expire with time. Below 90% of a limit, each step is checked for 1.5 seconds. Closer to a limit, each step is checked for 5 seconds and increases 2%.
 
 An incident at a bitrate held for at least 60 seconds still cuts bitrate, but it lowers no limit: the bitrate returns after the normal five-second wait, because a bitrate that held that long did not cause the incident.
 
