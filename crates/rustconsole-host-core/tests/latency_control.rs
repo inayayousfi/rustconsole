@@ -1,6 +1,8 @@
 use rustconsole_host_core::latency::{LatencyPolicy, delay_budget, preference_score};
-use rustconsole_host_core::video_stream::HostVideoStreamPolicy;
+use rustconsole_host_core::video_stream::{HostEncodedVideoFrame, HostVideoStreamPolicy};
+use rustconsole_host_core::{VideoDeliveryReport, VideoPathReport};
 use rustconsole_protocol::latency::{LatencyChannel, LatencyMeasurement, LatencyReport};
+use rustconsole_session::video_datagram::VIDEO_DATAGRAM_VERSION;
 use std::time::{Duration, Instant};
 
 fn measurement(delay_micros: u64) -> LatencyMeasurement {
@@ -256,4 +258,72 @@ fn network_delay_alone_cannot_end_the_session_under_application_budgets() {
         assert!(result.failure.is_none());
         assert!(result.reduce_to.is_none());
     }
+}
+
+/// Sends one frame with the given capture-to-encoded time, then one player report.
+fn report_interval(
+    policy: &mut HostVideoStreamPolicy,
+    half_second: u64,
+    source_delay: u64,
+    player_delay: u64,
+    start: Instant,
+) {
+    let captured_at_micros = half_second * 500_000;
+    policy
+        .packetize_encoded_frame(
+            HostEncodedVideoFrame {
+                sequence: half_second,
+                captured_at_micros,
+                encoded_at_micros: captured_at_micros + source_delay,
+                packetized_at_micros: captured_at_micros + source_delay,
+                input_sequence: 0,
+                keyframe: true,
+                payload: vec![0; 64],
+            },
+            1_200,
+            VIDEO_DATAGRAM_VERSION,
+        )
+        .unwrap();
+    let target = policy.target_bits_per_second();
+    let _ = policy.observe_receiver_with_latency(
+        VideoPathReport {
+            round_trip_time: Duration::from_millis(3),
+            congestion_window_bytes: 250_000,
+            lost_packets: 0,
+        },
+        VideoDeliveryReport {
+            completed_payload_bytes: target / 16,
+            measurement_interval_micros: 500_000,
+            ..VideoDeliveryReport::default()
+        },
+        Some(report(player_delay, target)),
+        start + Duration::from_millis(half_second * 500),
+    );
+}
+
+fn calibrated_stream(start: Instant) -> HostVideoStreamPolicy {
+    let mut policy = HostVideoStreamPolicy::from_startup_probe(100_000_000, 50_000_000);
+    policy.enable_latency_control(100_000, 3_000, start);
+    for half_second in 1..=12 {
+        report_interval(&mut policy, half_second, 13_000, 20_000, start);
+    }
+    policy
+}
+
+#[test]
+fn a_host_stall_does_not_cut_bitrate_but_the_same_delay_from_the_network_does() {
+    let start = Instant::now();
+    let mut stalled = calibrated_stream(start);
+    let before_stall = stalled.target_bits_per_second();
+    for half_second in 13..=18 {
+        report_interval(&mut stalled, half_second, 73_000, 80_000, start);
+    }
+    assert!(stalled.target_bits_per_second() >= before_stall);
+
+    let mut congested = calibrated_stream(start);
+    let before_congestion = congested.target_bits_per_second();
+    for half_second in 13..=18 {
+        report_interval(&mut congested, half_second, 13_000, 80_000, start);
+    }
+    assert!(congested.target_bits_per_second() < before_congestion);
 }

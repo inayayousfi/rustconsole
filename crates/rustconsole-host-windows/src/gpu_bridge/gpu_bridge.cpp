@@ -107,6 +107,7 @@ struct RustConsoleGpuBridge {
     uint32_t height = 0;
     uint32_t refresh_rate = 0;
     bool encoder_texture_outstanding = false;
+    bool producer_mutex_held = false;
 
     ~RustConsoleGpuBridge() {
         try {
@@ -142,9 +143,16 @@ static HRESULT restart_wgc_capture(RustConsoleGpuBridge* bridge) {
     bridge->frame_pool = winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool::CreateFreeThreaded(
         bridge->wgc_device,
         winrt::Windows::Graphics::DirectX::DirectXPixelFormat::R16G16B16A16Float,
-        2, bridge->capture_item.Size());
+        3, bridge->capture_item.Size());
     failure_stage = "recreate the Windows.Graphics.Capture session";
     bridge->capture_session = bridge->frame_pool.CreateCaptureSession(bridge->capture_item);
+    failure_stage = "lift the Windows.Graphics.Capture update limit";
+    try {
+        // Windows otherwise delivers about 60 images per second whatever the display shows.
+        bridge->capture_session.MinUpdateInterval(std::chrono::milliseconds(1));
+    } catch (const winrt::hresult_no_interface&) {
+        // Windows versions without this setting keep their default delivery rate.
+    }
     failure_stage = "restart the Windows.Graphics.Capture session";
     bridge->capture_session.StartCapture();
     failure_stage = nullptr;
@@ -763,6 +771,14 @@ static HRESULT capture_frame(
     bridge->reconfiguration_cause = RECONFIGURE_NONE;
     HRESULT result = check_configuration(bridge);
     if (FAILED(result)) return result;
+    // Own the shared texture before choosing an image, so the image is not already a tick old by
+    // the time the consumer lets it be converted.
+    if (!bridge->producer_mutex_held) {
+        failure_stage = "wait for the consumer to release the shared capture texture";
+        if (FAILED(result = producer_mutex_result(bridge->processing_mutex->AcquireSync(0, 5000))))
+            return result;
+        bridge->producer_mutex_held = true;
+    }
     DXGI_OUTDUPL_FRAME_INFO frame_info{};
     ComPtr<ID3D11Texture2D> source_texture;
     bool frame_acquired = false;
@@ -781,6 +797,14 @@ static HRESULT capture_frame(
             if (std::chrono::steady_clock::now() - started >=
                 std::chrono::milliseconds(timeout_millis)) return DXGI_ERROR_WAIT_TIMEOUT;
             Sleep(1);
+        }
+        // The pool returns its oldest frame first, and it fills whenever images arrive faster
+        // than this loop runs, so older images must be skipped to reach the newest one.
+        uint32_t frames_taken = 1;
+        while (auto newer = bridge->frame_pool.TryGetNextFrame()) {
+            frame.Close();
+            frame = std::move(newer);
+            ++frames_taken;
         }
         auto access = frame.Surface().as<Direct3DDxgiInterfaceAccess>();
         if (FAILED(result = access->GetInterface(IID_PPV_ARGS(&source_texture)))) return result;
@@ -802,7 +826,7 @@ static HRESULT capture_frame(
         frame_info.LastPresentTime.QuadPart =
             whole_seconds * frequency.QuadPart +
             remaining_100ns * frequency.QuadPart / 10000000;
-        frame_info.AccumulatedFrames = 1;
+        frame_info.AccumulatedFrames = frames_taken;
     } else {
         ComPtr<IDXGIResource> desktop_resource;
         failure_stage = "acquire Desktop Duplication frame";
@@ -873,9 +897,6 @@ static HRESULT capture_frame(
 
     const auto conversion_started =
         diagnostics ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    failure_stage = "wait for the consumer to release the shared capture texture";
-    if (FAILED(result = producer_mutex_result(bridge->processing_mutex->AcquireSync(0, 5000))))
-        return result;
     failure_stage = "convert processing-local capture texture to encoder format";
     ID3D11Resource *wrapped[] = {bridge->processing_local_source11.Get()};
     if (bridge->cross_adapter)
@@ -903,6 +924,7 @@ static HRESULT capture_frame(
         bridge->processing_interop->ReleaseWrappedResources(wrapped, ARRAYSIZE(wrapped));
     bridge->processing_context->Flush();
     const HRESULT released_nv12 = bridge->processing_mutex->ReleaseSync(1);
+    if (SUCCEEDED(released_nv12)) bridge->producer_mutex_held = false;
     if (SUCCEEDED(result)) result = released_nv12;
     if (FAILED(result)) return result;
     if (diagnostics) *color_conversion_micros = std::chrono::duration_cast<std::chrono::microseconds>(

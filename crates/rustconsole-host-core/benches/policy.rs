@@ -78,7 +78,7 @@ fn benchmark_fake_encoded_video_path(criterion: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(size), &size, |bench, size| {
             bench.iter_batched(
                 || (HostVideoStreamPolicy::new(40_000_000), vec![42; *size]),
-                |(policy, payload)| {
+                |(mut policy, payload)| {
                     let datagrams = policy
                         .packetize_encoded_frame(
                             HostEncodedVideoFrame {

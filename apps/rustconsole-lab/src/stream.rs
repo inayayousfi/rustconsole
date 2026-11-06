@@ -26,6 +26,7 @@ pub struct Options {
 #[derive(Default)]
 struct Interval {
     frames: u64,
+    fresh_frames: u64,
     bytes: u64,
     capture_to_decoded: Vec<u64>,
     capture_to_encoded: Vec<u64>,
@@ -69,7 +70,7 @@ impl Recorder {
         writeln!(
             self.output,
             concat!(
-                "{{\"t\":{:.3},\"target\":{},\"encoded\":{},\"frames\":{},",
+                "{{\"t\":{:.3},\"target\":{},\"encoded\":{},\"frames\":{},\"fresh\":{},",
                 "\"delay_p50\":{},\"delay_p99\":{},\"delay_max\":{},",
                 "\"encode_p50\":{},\"network_p50\":{},\"network_p99\":{},\"decode_p50\":{},\"decode_max\":{},\"decoder_queue_max\":{},",
                 "\"rtt\":{},\"capacity\":{},\"ceiling\":{},\"latency_ceiling\":{},",
@@ -80,6 +81,7 @@ impl Recorder {
             self.target,
             bits_per_second,
             interval.frames,
+            interval.fresh_frames,
             percentile(&mut interval.capture_to_decoded, 50),
             percentile(&mut interval.capture_to_decoded, 99),
             percentile(&mut interval.capture_to_decoded, 100),
@@ -118,6 +120,7 @@ impl Recorder {
         // is a frame age, not a delay.
         let new_capture = frame.captured_at_micros != self.last_capture;
         self.last_capture = frame.captured_at_micros;
+        self.interval.fresh_frames += u64::from(new_capture);
         if new_capture {
             self.interval.capture_to_encoded.push(
                 frame

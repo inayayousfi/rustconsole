@@ -15,11 +15,52 @@ pub struct HostEncodedVideoFrame {
     pub payload: Vec<u8>,
 }
 
+/// Delay this host added before sending, beyond its usual capture-to-encoded time.
+///
+/// A capture or encoder stall reaches the player as extra delay, but a lower bitrate cannot remove
+/// it. The bitrate control therefore sees the player's delay without this excess.
+#[derive(Default)]
+struct SourceDelay {
+    last_capture_micros: u64,
+    largest_micros: u64,
+    usual_micros: Option<u64>,
+    previous_excess_micros: u64,
+}
+
+impl SourceDelay {
+    fn observe(&mut self, captured_at_micros: u64, encoded_at_micros: u64) {
+        // A repeated capture keeps its original timestamp, so its age says nothing about a stall.
+        if captured_at_micros == self.last_capture_micros {
+            return;
+        }
+        self.last_capture_micros = captured_at_micros;
+        self.largest_micros = self
+            .largest_micros
+            .max(encoded_at_micros.saturating_sub(captured_at_micros));
+    }
+
+    /// Closes one report interval. A stall near its end can reach the player in the next report,
+    /// so the excess of the previous interval still counts.
+    fn take_excess_micros(&mut self) -> u64 {
+        let largest = std::mem::take(&mut self.largest_micros);
+        let mut excess = 0;
+        if largest != 0 {
+            let usual = self
+                .usual_micros
+                .map_or(largest, |usual| usual.min(largest));
+            self.usual_micros = Some(usual);
+            excess = largest - usual;
+        }
+        excess.max(std::mem::replace(&mut self.previous_excess_micros, excess))
+    }
+}
+
 /// Platform-neutral decisions for one encoded-video delivery path.
 pub struct HostVideoStreamPolicy {
     bitrate: AdaptiveBitrateController,
     recovery: VideoRecovery,
     latency: Option<crate::latency::LatencyPolicy>,
+    source_delay: SourceDelay,
 }
 
 impl HostVideoStreamPolicy {
@@ -29,6 +70,7 @@ impl HostVideoStreamPolicy {
             bitrate: AdaptiveBitrateController::new(maximum_bits_per_second),
             recovery: VideoRecovery::default(),
             latency: None,
+            source_delay: SourceDelay::default(),
         }
     }
 
@@ -44,6 +86,7 @@ impl HostVideoStreamPolicy {
             ),
             recovery: VideoRecovery::default(),
             latency: None,
+            source_delay: SourceDelay::default(),
         }
     }
 
@@ -81,6 +124,13 @@ impl HostVideoStreamPolicy {
             .unwrap_or(self.bitrate.maximum_bits_per_second)
             .min(self.bitrate.maximum_bits_per_second);
         let previous = self.target_bits_per_second();
+        let source_excess = self.source_delay.take_excess_micros();
+        let report = report.map(|mut report| {
+            if let Some(video) = report.video.as_mut() {
+                video.delay_micros = video.delay_micros.saturating_sub(source_excess);
+            }
+            report
+        });
         let Some(latency) = self.latency.as_mut() else {
             return Ok(self.bitrate.observe(path, delivery));
         };
@@ -149,11 +199,13 @@ impl HostVideoStreamPolicy {
     }
 
     pub fn packetize_encoded_frame(
-        &self,
+        &mut self,
         frame: HostEncodedVideoFrame,
         maximum_datagram_size: usize,
         video_datagram_version: u32,
     ) -> Result<Vec<Vec<u8>>, VideoDatagramError> {
+        self.source_delay
+            .observe(frame.captured_at_micros, frame.encoded_at_micros);
         packetize_video_frame_for_version(
             &VideoFramePayload {
                 sequence: frame.sequence,
@@ -247,7 +299,7 @@ mod tests {
 
     #[test]
     fn fake_encoder_frame_reaches_the_receiver_assembler() {
-        let policy = HostVideoStreamPolicy::new(40_000_000);
+        let mut policy = HostVideoStreamPolicy::new(40_000_000);
         let payload = vec![42; 64 * 1024];
         let datagrams = policy
             .packetize_encoded_frame(

@@ -359,8 +359,11 @@ impl GpuCapture {
         timeout: Duration,
         diagnostics: bool,
     ) -> Result<Option<CapturedGpuFrame<'_>>, Box<dyn std::error::Error>> {
+        // The producer prepares the next image while this tick encodes. Waiting for a late image
+        // avoids repeating a frame, because a lower fresh frame rate lets the GPU drop to a power
+        // state that keeps images late. The limit leaves the rest of the tick for encoding.
         let capture_timeout = if self.cached_texture.is_some() {
-            Duration::ZERO
+            timeout * 3 / 4
         } else {
             timeout
         };
@@ -470,7 +473,7 @@ where
         &mut self,
         timeout: Duration,
     ) -> Result<Option<EncodedSnapshot>, Box<dyn std::error::Error>> {
-        let diagnostics = self.quality.is_some();
+        let diagnostics = self.quality.is_some() || cfg!(feature = "development");
         let Some(frame) = self.capture.next_frame(timeout, diagnostics)? else {
             return Ok(None);
         };
@@ -569,7 +572,8 @@ where
     }
 
     pub fn restart_capture(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        self.capture.restart(self.quality.is_some())?;
+        self.capture
+            .restart(self.quality.is_some() || cfg!(feature = "development"))?;
         self.pending_metadata.clear();
         if let Some(quality) = self.quality.as_mut() {
             quality.sources.clear();

@@ -15,6 +15,8 @@ Startup uses eight small request/reply exchanges, spaced 25 ms apart, before the
 
 During normal play, the player reports the largest measured delay in each 500 ms interval. Video measures capture to presentation, or labelled presentation submission when confirmed display feedback is unavailable. Repeated source captures do not create additional delay samples. Audio estimates capture to playback from submission time and the queued audio duration. Input measures local event to host acknowledgement, including local queueing. Pending acknowledgements report elapsed waiting time as an estimate.
 
+A capture or encoder stall on the host reaches the player as extra video delay, but a lower bitrate cannot remove it. The host therefore tracks the largest capture-to-encoded time of fresh frames in each report interval, treats the lowest such value as usual, and subtracts the excess of the current and previous intervals, whichever is larger, from the reported video delay before the bitrate control reads it.
+
 Clock uncertainty accompanies media measurements. Clock estimates expire after five seconds. Missing measurements are unavailable, not zero delay; inactive audio and input do not count as failures. Input acknowledgement does not prove that the game responded, and queued audio does not prove its physical playback time.
 
 ## Baselines and budgets
