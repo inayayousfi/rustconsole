@@ -27,6 +27,8 @@ pub struct Options {
 struct Interval {
     frames: u64,
     fresh_frames: u64,
+    keyframes: u64,
+    longest_frame_gap: u64,
     bytes: u64,
     capture_to_decoded: Vec<u64>,
     capture_to_encoded: Vec<u64>,
@@ -46,6 +48,7 @@ struct Recorder {
     latency_ceiling: u64,
     clock_uncertainty: u64,
     last_capture: u64,
+    last_decoded: Option<Instant>,
 }
 
 fn percentile(values: &mut [u64], percent: usize) -> u64 {
@@ -70,7 +73,7 @@ impl Recorder {
         writeln!(
             self.output,
             concat!(
-                "{{\"t\":{:.3},\"target\":{},\"encoded\":{},\"frames\":{},\"fresh\":{},",
+                "{{\"t\":{:.3},\"target\":{},\"encoded\":{},\"frames\":{},\"fresh\":{},\"keyframes\":{},\"frame_gap_max\":{},",
                 "\"delay_p50\":{},\"delay_p99\":{},\"delay_max\":{},",
                 "\"encode_p50\":{},\"network_p50\":{},\"network_p99\":{},\"decode_p50\":{},\"decode_max\":{},\"decoder_queue_max\":{},",
                 "\"rtt\":{},\"capacity\":{},\"ceiling\":{},\"latency_ceiling\":{},",
@@ -82,6 +85,8 @@ impl Recorder {
             bits_per_second,
             interval.frames,
             interval.fresh_frames,
+            interval.keyframes,
+            interval.longest_frame_gap,
             percentile(&mut interval.capture_to_decoded, 50),
             percentile(&mut interval.capture_to_decoded, 99),
             percentile(&mut interval.capture_to_decoded, 100),
@@ -115,6 +120,10 @@ impl Recorder {
     ) -> std::io::Result<()> {
         self.target = frame.target_bitrate_bits_per_second;
         self.interval.frames += 1;
+        if let Some(last) = self.last_decoded.replace(decoded_at) {
+            let gap = decoded_at.saturating_duration_since(last).as_micros() as u64;
+            self.interval.longest_frame_gap = self.interval.longest_frame_gap.max(gap);
+        }
         self.interval.bytes += frame.encoded_frame_bytes as u64;
         // A repeated capture of an unchanged screen carries its original timestamp, which
         // is a frame age, not a delay.
@@ -182,6 +191,7 @@ pub fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
         latency_ceiling: 0,
         clock_uncertainty: 0,
         last_capture: 0,
+        last_decoded: None,
     }));
     let measurements = LatencyMeasurements::default();
     let audio_measurements = measurements.clone();
@@ -217,11 +227,12 @@ pub fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
                     recorder.latency_ceiling = status.ceiling_bits_per_second.unwrap_or(0);
                 }
             },
-            statistics: move |sample| {
-                statistics_recorder
+            statistics: move |sample: rustconsole_player_core::VideoStreamSample| {
+                let mut recorder = statistics_recorder
                     .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .latest = Some(sample);
+                    .unwrap_or_else(|error| error.into_inner());
+                recorder.interval.keyframes += u64::from(sample.keyframe);
+                recorder.latest = Some(sample);
             },
             audio: move |event| {
                 if let DecodedAudioEvent::Samples(decoded) = event {

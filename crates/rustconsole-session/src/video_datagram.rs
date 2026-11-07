@@ -340,7 +340,8 @@ impl VideoFrameAssembler {
         let skipped = resend.released_sequence.map_or(0, |released| {
             sequence.saturating_sub(released.saturating_add(1))
         });
-        resend.dependency_lost |= skipped != 0;
+        // A keyframe depends on nothing before it, so it also ends any earlier loss.
+        resend.dependency_lost = !frame.keyframe && (resend.dependency_lost || skipped != 0);
         resend.released_sequence = Some(sequence);
         self.stats.skipped_frames = self.stats.skipped_frames.saturating_add(skipped);
         self.newest_completed_sequence = Some(sequence);
@@ -578,7 +579,7 @@ impl VideoFrameAssembler {
                     .saturating_sub(sequence.saturating_add(1))
             })
         };
-        dependency_lost |= skipped_frames != 0;
+        dependency_lost = !partial.header.keyframe && (dependency_lost || skipped_frames != 0);
         self.stats.skipped_frames = self.stats.skipped_frames.saturating_add(skipped_frames);
         let mut payload = Vec::with_capacity(partial.header.frame_size);
         for chunk in partial.chunks {
@@ -610,6 +611,12 @@ impl VideoFrameAssembler {
         };
         let frame = match &mut self.resend {
             Some(resend) => {
+                // A keyframe replaces everything older, so nothing older is worth waiting for.
+                if frame.keyframe {
+                    self.partial = self.partial.split_off(&frame.sequence);
+                    resend.unseen = resend.unseen.split_off(&frame.sequence);
+                    resend.ready = resend.ready.split_off(&frame.sequence);
+                }
                 resend.ready.insert(frame.sequence, frame);
                 None
             }
@@ -1040,6 +1047,48 @@ mod tests {
         assert_eq!(assembler.stats().incomplete_frames, 1);
         assert_eq!(assembler.stats().assembly_overflows, 1);
         assert_eq!(assembler.stats().lost_chunks, 90);
+    }
+
+    fn keyframe_chunk(sequence: u64) -> Vec<u8> {
+        let frame = VideoFramePayload {
+            keyframe: true,
+            ..frame(sequence, 16)
+        };
+        packetize_video_frame(&frame, 1_200).unwrap().remove(0)
+    }
+
+    #[test]
+    fn a_keyframe_after_skipped_frames_loses_no_dependency() {
+        let now = Instant::now();
+        for mut assembler in [
+            VideoFrameAssembler::new(120),
+            VideoFrameAssembler::with_resend(120),
+        ] {
+            let first = keyframe_chunk(1);
+            assert!(!assembler.push(&first, now, RTT).unwrap().dependency_lost);
+            let result = assembler.push(&keyframe_chunk(30), now, RTT).unwrap();
+            assert_eq!(result.frame.map(|frame| frame.sequence), Some(30));
+            assert!(!result.dependency_lost);
+            let next = packetize_video_frame(&frame(31, 16), 1_200)
+                .unwrap()
+                .remove(0);
+            assert!(!assembler.push(&next, now, RTT).unwrap().dependency_lost);
+        }
+    }
+
+    #[test]
+    fn an_ordinary_frame_after_skipped_frames_still_loses_its_dependency() {
+        let now = Instant::now();
+        let mut assembler = VideoFrameAssembler::with_resend(120);
+        assembler.push(&keyframe_chunk(1), now, RTT).unwrap();
+        let later = packetize_video_frame(&frame(30, 16), 1_200)
+            .unwrap()
+            .remove(0);
+        let lost = (1..=20).any(|step| {
+            let at = now + Duration::from_millis(5 * step);
+            assembler.push(&later, at, RTT).unwrap().dependency_lost
+        });
+        assert!(lost);
     }
 
     #[test]
