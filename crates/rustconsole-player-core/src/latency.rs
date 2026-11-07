@@ -137,7 +137,7 @@ impl IntervalDelay {
     fn take(&mut self) -> Option<LatencyMeasurement> {
         let mut measurement = self.measurement.take()?;
         self.delays.sort_unstable();
-        measurement.typical_delay_micros = self.delays[self.delays.len() * 3 / 4];
+        measurement.typical_delay_micros = self.delays[self.delays.len() / 2];
         self.delays.clear();
         Some(measurement)
     }

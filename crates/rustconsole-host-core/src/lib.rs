@@ -3,6 +3,7 @@
 pub mod latency;
 pub mod video_pacing;
 mod video_recovery;
+pub mod video_resend;
 pub mod video_stream;
 
 use rustconsole_media::{AudioSamples, VideoFormat, VideoFrame};
@@ -27,8 +28,9 @@ pub mod authentication {
 
 pub mod video_transport {
     pub use rustconsole_session::video_datagram::{
-        LEGACY_VIDEO_DATAGRAM_VERSION, VIDEO_DATAGRAM_VERSION, VideoFramePayload,
-        assembly_deadline, packetize_video_frame, packetize_video_frame_for_version,
+        LEGACY_VIDEO_DATAGRAM_VERSION, MissingVideoChunks, VIDEO_DATAGRAM_VERSION,
+        VideoFramePayload, assembly_deadline, packetize_video_frame,
+        packetize_video_frame_for_version,
     };
 }
 
@@ -84,8 +86,6 @@ const FAILED_PROBE_AVERAGE_SAMPLES: usize = 5;
 const HEALTHY_REPORTS_BEFORE_RECOVERY: u8 = 4;
 const DEGRADED_REPORTS_BEFORE_REDUCTION: u8 = 2;
 const RTT_PRESSURE_REPORTS_BEFORE_REDUCTION: u8 = 2;
-/// Round-trip time follows delay, so it must not repeat a cut that delay control just made.
-const RTT_CUT_SPACING_MICROS: u64 = 5_000_000;
 const MINIMUM_RTT_PRESSURE_MARGIN: Duration = Duration::from_millis(20);
 const SENDER_PRESSURE_REPORTS_BEFORE_REDUCTION: u8 = 2;
 const SEVERE_SENDER_PRESSURE_EVENTS: u8 = 3;
@@ -166,6 +166,7 @@ pub struct AdaptiveBitrateController {
     sender_pressure_events_since_report: u8,
     severe_sender_reduction_since_report: bool,
     receiver_loss_in_previous_report: bool,
+    media_delay_measured: bool,
     sender_congested_report_streak: u8,
 }
 
@@ -207,6 +208,7 @@ impl AdaptiveBitrateController {
             sender_pressure_events_since_report: 0,
             severe_sender_reduction_since_report: false,
             receiver_loss_in_previous_report: false,
+            media_delay_measured: false,
             sender_congested_report_streak: 0,
         }
     }
@@ -410,11 +412,11 @@ impl AdaptiveBitrateController {
         }
         self.degraded_reports = 0;
 
-        if self.rtt_pressure_report_streak != 0 {
+        // Measured media delay is the better signal. Round-trip time also rises with Wi-Fi power
+        // saving and delayed acknowledgements, most of all at the low bitrates it would hold down.
+        if self.rtt_pressure_report_streak != 0 && !self.media_delay_measured {
             self.reset_recovery_wait();
-            if self.rtt_pressure_report_streak < RTT_PRESSURE_REPORTS_BEFORE_REDUCTION
-                || (self.active_probe.is_none() && self.target_held_micros < RTT_CUT_SPACING_MICROS)
-            {
+            if self.rtt_pressure_report_streak < RTT_PRESSURE_REPORTS_BEFORE_REDUCTION {
                 return None;
             }
             self.rtt_pressure_report_streak = 0;
@@ -606,6 +608,10 @@ impl AdaptiveBitrateController {
     pub fn delivery_ceiling_bits_per_second(&self) -> Option<u64> {
         self.soft_ceiling_bits_per_second()
             .or(self.provisional_ceiling_bits_per_second)
+    }
+
+    pub const fn use_measured_media_delay(&mut self) {
+        self.media_delay_measured = true;
     }
 
     pub fn configure_latency_ceiling(&mut self, ceiling: Option<u64>) {
@@ -1272,7 +1278,6 @@ mod tests {
     #[test]
     fn consecutive_rtt_pressure_reports_reduce_ten_percent() {
         let mut controller = AdaptiveBitrateController::new(20_000_000);
-        controller.target_held_micros = RTT_CUT_SPACING_MICROS;
         controller.observe(path_with_rtt(10), delivery(625_000));
         controller.observe(path_with_rtt(31), delivery(1_250_000));
 
@@ -1452,6 +1457,21 @@ mod tests {
         assert!(!controller.returning_after_collapse());
         clean_reports(&mut controller, &mut bytes, 20);
         assert!(controller.returning_after_collapse());
+    }
+
+    #[test]
+    fn round_trip_time_does_not_hold_the_bitrate_when_media_delay_is_measured() {
+        let mut controller = AdaptiveBitrateController::new(20_000_000);
+        controller.use_measured_media_delay();
+        controller.observe(path_with_rtt(10), delivery(625_000));
+        let target = controller.target_bits_per_second();
+        let mut raised = false;
+        for report in 2..=20 {
+            raised |= controller
+                .observe(path_with_rtt(60), delivery(report * 625_000))
+                .is_some_and(|change| change.target_bits_per_second > target);
+        }
+        assert!(raised);
     }
 
     #[test]

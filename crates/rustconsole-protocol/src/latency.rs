@@ -26,7 +26,7 @@ pub struct LatencyMeasurement {
     pub estimated: bool,
     #[prost(uint32, tag = "4")]
     pub samples: u32,
-    /// 75th percentile of the interval. Zero means the sender did not report one.
+    /// Median of the interval. Zero means the sender did not report one.
     #[prost(uint64, tag = "5")]
     pub typical_delay_micros: u64,
 }

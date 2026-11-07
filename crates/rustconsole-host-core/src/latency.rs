@@ -16,8 +16,9 @@ const INCIDENT_TIME: Duration = Duration::from_secs(10);
 const NEAR_LIMIT_PERCENT: u64 = 90;
 const EDGE_CUT_PERCENT: u64 = 96;
 /// A cut that did not lower the delay says the bitrate may not be the cause, so the next one
-/// waits this long unless the delay clearly worsens, as it does on an overloaded link.
-const CUT_SPACING: Duration = Duration::from_secs(5);
+/// waits this long unless the delay clearly worsens, as it does on an overloaded link. It
+/// outlasts the seven seconds a Wi-Fi background scan disturbs the link.
+const CUT_SPACING: Duration = Duration::from_secs(8);
 const WORSENING_PRESSURE_FACTOR: f64 = 1.25;
 
 #[derive(Debug, Default)]

@@ -674,6 +674,7 @@ mod windows {
             video_datagram_version,
             bandwidth_probe_version,
             network_status_version,
+            video_resend_version,
         ) = match &request.body {
             Some(envelope::Body::Av1CapabilityOffer(offer)) => (
                 offer
@@ -691,6 +692,7 @@ mod windows {
                 },
                 offer.bandwidth_probe_version,
                 offer.network_status_version.min(1),
+                offer.video_resend_version.min(1),
             ),
             _ => (
                 None,
@@ -698,6 +700,7 @@ mod windows {
                 false,
                 false,
                 rustconsole_host_core::video_transport::LEGACY_VIDEO_DATAGRAM_VERSION,
+                0,
                 0,
                 0,
             ),
@@ -808,6 +811,7 @@ mod windows {
                         video_datagram_version,
                         bandwidth_probe_version,
                         network_status_version,
+                        video_resend_version,
                         host_pointer_release,
                         full_diagnostics,
                         audio_transport: audio_configuration,
@@ -827,6 +831,7 @@ mod windows {
         selected_wire.video_datagram_version = video_datagram_version;
         selected_wire.bandwidth_probe_version = bandwidth_probe_version;
         selected_wire.network_status_version = network_status_version;
+        selected_wire.video_resend_version = video_resend_version;
         selected_wire.maximum_delay_micros = maximum_delay_micros;
         let player_selection = session_try!(
             "reading player AV1 selection",
@@ -961,6 +966,7 @@ mod windows {
                 worker,
                 selected,
                 video_datagram_version,
+                video_resend_version != 0,
                 startup_capacity_bits_per_second,
                 maximum_delay_micros,
                 network_baseline_micros,
@@ -1004,6 +1010,18 @@ mod windows {
         });
         let link_reports = response_tx.clone();
         let peer_address = connection.remote_address().ip();
+        let chunk_requests = control_tx.clone();
+        let chunk_request_connection = connection.clone();
+        let chunk_request_reader = tokio::spawn(async move {
+            while let Ok(datagram) = chunk_request_connection.read_datagram().await {
+                if let Some(request) =
+                    rustconsole_host_core::video_transport::MissingVideoChunks::parse(&datagram)
+                {
+                    // A player repeats a request that gets no answer.
+                    let _ = chunk_requests.try_send(WorkerVideoControl::ResendChunks(request));
+                }
+            }
+        });
         let link_reporter = tokio::spawn(async move {
             if network_status_version == 0 {
                 return;
@@ -1348,6 +1366,7 @@ mod windows {
             control_error
                 .get_or_insert_with(|| "virtual input owner lock poisoned during release".into());
         }
+        chunk_request_reader.abort();
         let _ = control_tx.try_send(WorkerVideoControl::Stop);
         drop(control_tx);
         drop(readers);
@@ -1524,6 +1543,7 @@ mod windows {
     enum WorkerVideoControl {
         RequestKeyframe,
         ReceiverReport(wire::VideoReceiverReport),
+        ResendChunks(rustconsole_host_core::video_transport::MissingVideoChunks),
         Stop,
     }
 
@@ -1696,6 +1716,7 @@ mod windows {
         worker: crate::worker::MediaWorker,
         selected: rustconsole_protocol::NegotiatedAv1Configuration,
         video_datagram_version: u32,
+        video_resend: bool,
         startup_capacity_bits_per_second: u64,
         maximum_delay_micros: u64,
         network_baseline_micros: u64,
@@ -1736,6 +1757,11 @@ mod windows {
         };
         let mut video_pending = std::collections::VecDeque::<bytes::Bytes>::new();
         let mut video_pending_diagnostic = None::<PayloadDigest>;
+        let mut recent_video =
+            rustconsole_host_core::video_resend::RecentVideoChunks::<bytes::Bytes>::new(
+                Instant::now(),
+            );
+        let mut resend_pending = std::collections::VecDeque::<bytes::Bytes>::new();
         let mut video_started = Instant::now();
         let mut audio_pending = std::collections::VecDeque::<bytes::Bytes>::new();
         let mut audio_pending_diagnostic = None::<PayloadDigest>;
@@ -1751,6 +1777,14 @@ mod windows {
                 match controls.try_recv() {
                     Ok(WorkerVideoControl::RequestKeyframe) => {
                         video_policy.require_keyframe();
+                    }
+                    Ok(WorkerVideoControl::ResendChunks(request)) => {
+                        resend_pending.extend(recent_video.take(
+                            request.sequence,
+                            &request.chunk_indexes,
+                            video_policy.target_bits_per_second(),
+                            Instant::now(),
+                        ));
                     }
                     Ok(WorkerVideoControl::ReceiverReport(report)) => {
                         let path = connection.stats().path;
@@ -2111,6 +2145,11 @@ mod windows {
                             record.packetization_completed_at_micros = clock.now()?;
                         }
                         video_pending = datagrams.into_iter().map(bytes::Bytes::from).collect();
+                        recent_video.remember(
+                            sequence,
+                            video_pending.iter().cloned().collect(),
+                            Instant::now(),
+                        );
                         video_pending_diagnostic = prepared_diagnostic;
                         video_started = Instant::now();
                     }
@@ -2121,7 +2160,23 @@ mod windows {
                     _ => return Err("media worker returned an unexpected stream event".into()),
                 }
             }
-            if let Some(datagram) = video_pending.front() {
+            if video_resend {
+                resend_pending.extend(recent_video.take_announcement(Instant::now()));
+            }
+            if let Some(datagram) = resend_pending.front() {
+                match runtime.block_on(rustconsole_host_core::authentication::send_media_datagram(
+                    &connection,
+                    datagram.clone(),
+                    Duration::from_millis(1),
+                )) {
+                    Ok(true) => {
+                        resend_pending.pop_front();
+                    }
+                    Ok(false) => {}
+                    Err(quinn::SendDatagramError::TooLarge) => resend_pending.clear(),
+                    Err(error) => return Err(error.into()),
+                }
+            } else if let Some(datagram) = video_pending.front() {
                 if let Some(record) = video_pending_diagnostic.as_mut()
                     && record.first_send_attempt_at_micros == 0
                 {
@@ -2252,6 +2307,7 @@ mod windows {
                 rustconsole_host_core::video_transport::LEGACY_VIDEO_DATAGRAM_VERSION,
             bandwidth_probe_version: 0,
             network_status_version: 0,
+            video_resend_version: 0,
             host_pointer_release: false,
             full_diagnostics: false,
             audio_transport: None,

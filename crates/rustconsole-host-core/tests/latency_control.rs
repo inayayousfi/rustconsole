@@ -447,11 +447,11 @@ fn cuts_under_steady_delay(seconds: u64) -> Vec<(Duration, u64)> {
 }
 
 #[test]
-fn delay_that_a_cut_does_not_change_is_cut_only_every_five_seconds() {
-    let cuts = cuts_under_steady_delay(12);
+fn delay_that_a_cut_does_not_change_is_cut_only_every_eight_seconds() {
+    let cuts = cuts_under_steady_delay(18);
     assert_eq!(cuts.len(), 3);
     assert!(
         cuts.windows(2)
-            .all(|pair| pair[1].0 - pair[0].0 >= Duration::from_secs(5))
+            .all(|pair| pair[1].0 - pair[0].0 >= Duration::from_secs(8))
     );
 }

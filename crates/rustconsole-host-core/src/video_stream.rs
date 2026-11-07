@@ -112,6 +112,7 @@ impl HostVideoStreamPolicy {
         network_baseline_micros: u64,
         now: Instant,
     ) {
+        self.bitrate.use_measured_media_delay();
         self.latency = Some(crate::latency::LatencyPolicy::new(
             maximum_delay_micros,
             network_baseline_micros,

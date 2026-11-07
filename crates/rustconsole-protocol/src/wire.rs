@@ -636,6 +636,8 @@ pub struct Av1CapabilityOffer {
     pub bandwidth_probe_version: u32,
     #[prost(uint32, tag = "11")]
     pub network_status_version: u32,
+    #[prost(uint32, tag = "12")]
+    pub video_resend_version: u32,
 }
 
 #[derive(Clone, Copy, PartialEq, Message)]
@@ -785,6 +787,8 @@ pub struct SelectedAv1Configuration {
     pub bandwidth_probe_version: u32,
     #[prost(uint32, tag = "13")]
     pub network_status_version: u32,
+    #[prost(uint32, tag = "15")]
+    pub video_resend_version: u32,
 }
 
 #[derive(Clone, Copy, PartialEq, Message)]
@@ -1154,6 +1158,7 @@ mod tests {
             video_datagram_version: 0,
             bandwidth_probe_version: 0,
             network_status_version: 0,
+            video_resend_version: 0,
             host_pointer_release: false,
             full_diagnostics: false,
             audio_transport: None,
@@ -1243,6 +1248,7 @@ mod tests {
         let offer = Envelope {
             body: Some(envelope::Body::Av1CapabilityOffer(Av1CapabilityOffer {
                 network_status_version: 1,
+                video_resend_version: 0,
                 ..Default::default()
             })),
         };
@@ -1250,6 +1256,7 @@ mod tests {
             body: Some(envelope::Body::SelectedAv1Configuration(
                 SelectedAv1Configuration {
                     network_status_version: 1,
+                    video_resend_version: 0,
                     ..Default::default()
                 },
             )),
@@ -1498,6 +1505,7 @@ fn audio_offer_has_a_fixed_fixture_and_is_optional_to_older_peers() {
         video_datagram_version: 0,
         bandwidth_probe_version: 0,
         network_status_version: 0,
+        video_resend_version: 0,
         host_pointer_release: false,
         full_diagnostics: false,
         encoder_capabilities: Vec::new(),
@@ -1552,6 +1560,7 @@ fn host_pointer_release_is_negotiated_as_an_optional_field() {
         video_datagram_version: 0,
         bandwidth_probe_version: 0,
         network_status_version: 0,
+        video_resend_version: 0,
         host_pointer_release: true,
         full_diagnostics: false,
         encoder_capabilities: Vec::new(),
@@ -1592,6 +1601,7 @@ fn dedicated_input_stream_is_negotiated_as_an_optional_field() {
         video_datagram_version: 0,
         bandwidth_probe_version: 0,
         network_status_version: 0,
+        video_resend_version: 0,
         host_pointer_release: false,
         full_diagnostics: false,
         encoder_capabilities: Vec::new(),
@@ -1623,6 +1633,7 @@ fn video_datagram_version_is_negotiated_as_an_optional_field() {
         video_datagram_version: crate::VIDEO_DATAGRAM_VERSION,
         bandwidth_probe_version: 0,
         network_status_version: 0,
+        video_resend_version: 0,
         host_pointer_release: false,
         full_diagnostics: false,
         encoder_capabilities: Vec::new(),

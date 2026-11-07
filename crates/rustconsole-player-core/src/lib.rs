@@ -685,6 +685,7 @@ where
                             rustconsole_session::video_datagram::VIDEO_DATAGRAM_VERSION,
                         bandwidth_probe_version: BANDWIDTH_PROBE_VERSION,
                         network_status_version: 1,
+                        video_resend_version: 1,
                         host_pointer_release: true,
                         full_diagnostics,
                         audio_transport: Some(
@@ -712,6 +713,7 @@ where
         let video_datagram_version;
         let bandwidth_probe_version;
         let network_status_version;
+        let video_resend_version;
         let host_offer = session_try!(
             "reading host AV1 capability offer",
             rustconsole_session::quic::read_envelope(&mut receive).await
@@ -732,6 +734,7 @@ where
                 };
                 bandwidth_probe_version = offer.bandwidth_probe_version;
                 network_status_version = offer.network_status_version.min(1);
+                video_resend_version = offer.video_resend_version.min(1);
                 if bandwidth_probe_version != BANDWIDTH_PROBE_VERSION {
                     return Err("host does not support the required startup bandwidth probe".into());
                 }
@@ -772,6 +775,7 @@ where
         selected_wire.video_datagram_version = video_datagram_version;
         selected_wire.bandwidth_probe_version = bandwidth_probe_version;
         selected_wire.network_status_version = network_status_version;
+        selected_wire.video_resend_version = video_resend_version;
         selected_wire.maximum_delay_micros = maximum_delay_micros;
         session_try!(
             "sending player AV1 selection",
@@ -867,6 +871,7 @@ where
             audio_enabled: audio_transport.is_some(),
             host_pointer_release,
             network_status: network_status_version != 0,
+            video_resend: video_resend_version != 0,
             session_started,
             latency_measurements,
             diagnostic_stream,
@@ -1020,6 +1025,7 @@ fn wire_selected(
         video_datagram_version: rustconsole_session::video_datagram::LEGACY_VIDEO_DATAGRAM_VERSION,
         bandwidth_probe_version: BANDWIDTH_PROBE_VERSION,
         network_status_version: 0,
+        video_resend_version: 0,
         host_pointer_release: false,
         full_diagnostics: false,
         audio_transport: None,

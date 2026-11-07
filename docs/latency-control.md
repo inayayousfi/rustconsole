@@ -13,7 +13,7 @@ The network protocol is 3.0 and the client-player process protocol is 5. Older n
 
 Startup uses eight small request/reply exchanges, spaced 25 ms apart, before the existing bandwidth probe. Another eight exchanges follow that probe to refresh clock alignment before media starts.
 
-During normal play, the player reports the largest measured delay and the 75th percentile delay of each 500 ms interval. Bitrate control and the session limit read the 75th percentile, because congestion delays most frames while a brief wireless spike delays only a few. Video measures capture to presentation, or labelled presentation submission when confirmed display feedback is unavailable. Repeated source captures do not create additional delay samples. Audio estimates capture to playback from submission time and the queued audio duration. Input measures local event to host acknowledgement, including local queueing. Pending acknowledgements report elapsed waiting time as an estimate.
+During normal play, the player reports the largest measured delay and the median delay of each 500 ms interval. Bitrate control and the session limit read the median, because congestion delays most frames while a brief wireless spike or a repaired frame delays only a few. Video measures capture to presentation, or labelled presentation submission when confirmed display feedback is unavailable. Repeated source captures do not create additional delay samples. Audio estimates capture to playback from submission time and the queued audio duration. Input measures local event to host acknowledgement, including local queueing. Pending acknowledgements report elapsed waiting time as an estimate.
 
 A capture or encoder stall on the host reaches the player as extra video delay, but a lower bitrate cannot remove it. The host therefore tracks the 75th percentile capture-to-encoded time of fresh frames in each report interval, treats the lowest such value as usual, and subtracts the excess of the current and previous intervals, whichever is larger, from the reported video delay before the bitrate control reads it.
 
@@ -21,7 +21,7 @@ Clock uncertainty accompanies media measurements. Clock estimates expire after f
 
 ## Baselines and budgets
 
-Video, active audio, and active input each have a separate baseline. Network round-trip delay remains a delivery-control signal, not a fourth enforced budget.
+Video, active audio, and active input each have a separate baseline. Network round-trip delay is not a fourth enforced budget and does not steer bitrate while media delay is measured, because it also rises with Wi-Fi power saving and delayed acknowledgements.
 
 Each channel keeps its last five valid reports taken after one second of settling and confirmation that the player has presented the current bitrate. The second-lowest of those five reports sets the baseline. Later reports can lower a baseline but cannot raise it. A newly active channel holds bitrate increases until it has a baseline.
 
@@ -43,7 +43,7 @@ When the absolute limit leaves no allowance above baseline, pressure is observed
 
 A session starts at 70% of the capacity measured by the startup probe, and that measurement is the first limit. Only one controller governs rate: the QUIC transport uses a fixed window, so video is never held back by a second control loop.
 
-Two consecutive excessive-delay reports cut bitrate by 25%, or by 4% for the first cut of an incident close to the latency limit. A further cut within five seconds needs 25% more pressure than the previous cut, because delay that a cut did not reduce may have another cause. The first cut of an incident records the bitrate as the latency limit. Further cuts within 10 seconds belong to the same incident and leave the limit unchanged, because a stall at the source says nothing about the link. Delivery and sender-pressure responses stay active alongside delay.
+Two consecutive excessive-delay reports cut bitrate by 25%, or by 4% for the first cut of an incident close to the latency limit. A further cut within eight seconds needs 25% more pressure than the previous cut, because delay that a cut did not reduce may have another cause. The first cut of an incident records the bitrate as the latency limit. Further cuts within 10 seconds belong to the same incident and leave the limit unchanged, because a stall at the source says nothing about the link. Delivery and sender-pressure responses stay active alongside delay.
 
 Bitrate rises only while every active channel has a measurement and pressure is below 0.5. A report at or above 0.5 pauses the wait for the next rise without clearing it. A rise near a limit waits 15 seconds and adds 2%. A failed rise, or a delay cut within 60 seconds of a bitrate change, doubles that wait up to ten minutes and resets the step. A passing rise at or above the limit halves the wait and doubles the step up to 16%. The steady bitrate is 96% of the lower of the delivery and latency limits. A limit does not expire with time. Below 90% of a limit, each step is checked for 1.5 seconds. Closer to a limit, each step is checked for 5 seconds and increases 2%.
 
@@ -67,7 +67,9 @@ The host remembers the highest bitrate it held for 20 seconds without a cut. Whe
 
 ## Loss on the link
 
-A frame's assembly deadline does not run while the link delivers nothing, because a silent link is delaying chunks rather than losing them. Loss above 10% of a report's chunks cuts at once. Smaller loss cuts only when the report before it also had loss, so a passing burst costs nothing and continuing loss costs at most one extra report of reaction time.
+When both ends support it, the player asks the host to send missing chunks again and holds newer frames until the repair arrives, for about 50 ms and at most 8 frames. The host keeps its 16 newest frames for this and limits resends to a quarter of the target, with a floor of 2 Mbit/s. A repaired frame counts as neither lost nor late, so repaired loss never lowers the bitrate. Requests travel as datagrams, because a reliable stream would hold them behind its retransmission timer. A player cannot ask for a frame it never heard of, so at low frame rates the host repeats a frame's last chunk 20 ms later to announce it.
+
+A frame's assembly deadline does not run while the link delivers nothing, because a silent link is delaying chunks rather than losing them. With resends, a frame still waits at most twice its normal budget. Loss above 10% of a report's chunks cuts at once. Smaller loss cuts only when the report before it also had loss, so a passing burst costs nothing and continuing loss costs at most one extra report of reaction time.
 
 ## Below the encoder's smallest frame
 

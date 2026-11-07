@@ -16,7 +16,8 @@ use rustconsole_session::audio_datagram::{
 use rustconsole_session::media_queue::MediaQueue;
 use rustconsole_session::quic::{read_envelope, write_envelope};
 use rustconsole_session::video_datagram::{
-    FrameAssemblyProgress, VideoAssemblyStats, VideoFrameAssembler, VideoFramePayload,
+    FrameAssemblyProgress, MissingVideoChunks, VideoAssemblyStats, VideoFrameAssembler,
+    VideoFramePayload,
 };
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -27,6 +28,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 const KEYFRAME_RETRY_INTERVAL: Duration = Duration::from_millis(250);
+const MISSING_CHUNK_CHECK_INTERVAL: Duration = Duration::from_millis(2);
 
 enum DiagnosticEvent {
     LatencyStatus(rustconsole_protocol::latency::LatencyControlStatus),
@@ -443,6 +445,7 @@ impl KeyboardLedReceiver {
 struct Receiver {
     started: Instant,
     video: VideoFrameAssembler,
+    next_missing_check: Instant,
     audio: AudioAssembler,
     audio_enabled: bool,
     ordered_audio: OrderedAudioPackets,
@@ -494,9 +497,11 @@ impl Receiver {
             if assembled.dependency_lost {
                 self.recover.store(true, Ordering::Release);
             }
+            let mut frames = Vec::from_iter(assembled.frame);
+            frames.extend(std::iter::from_fn(|| self.video.next_ready()));
             let mut snapshot = self.snapshot.lock().unwrap_or_else(|e| e.into_inner());
             snapshot.progress = assembled.progress;
-            if let Some(frame) = assembled.frame {
+            for frame in frames {
                 let digest = self.payload_digests.as_ref().map(|digests| {
                     let digest = local_payload_digest(
                         MediaKind::Video,
@@ -523,6 +528,14 @@ impl Receiver {
         }
         self.publish(rtt);
         Ok(())
+    }
+
+    fn missing_chunks(&mut self, now: Instant, rtt: Duration) -> Vec<MissingVideoChunks> {
+        if now < self.next_missing_check {
+            return Vec::new();
+        }
+        self.next_missing_check = now + MISSING_CHUNK_CHECK_INTERVAL;
+        self.video.take_missing(now, rtt)
     }
 
     fn queue_audio(&self, events: Vec<AudioPlaybackEvent>) {
@@ -670,6 +683,18 @@ impl VideoDeliveryWatch {
     }
 }
 
+/// A request that cannot be sent is repeated by a later check.
+fn request_missing_chunks(
+    receiver: &mut Receiver,
+    connection: &quinn::Connection,
+    now: Instant,
+    rtt: Duration,
+) {
+    for missing in receiver.missing_chunks(now, rtt) {
+        let _ = connection.send_datagram(missing.encode().into());
+    }
+}
+
 fn queue_control(
     sender: &tokio::sync::mpsc::Sender<OutgoingControl>,
     envelope: Envelope,
@@ -711,6 +736,7 @@ pub(super) struct ReceiveStreamParameters<Stop, Progress, Audio, Video> {
     pub(super) audio_enabled: bool,
     pub(super) host_pointer_release: bool,
     pub(super) network_status: bool,
+    pub(super) video_resend: bool,
     pub(super) session_started: Instant,
     pub(super) latency_measurements: crate::latency::LatencyMeasurements,
     pub(super) diagnostic_stream: Option<quinn::RecvStream>,
@@ -741,6 +767,7 @@ where
         audio_enabled,
         host_pointer_release,
         network_status,
+        video_resend,
         session_started,
         latency_measurements,
         diagnostic_stream,
@@ -788,7 +815,12 @@ where
     let stop = Arc::new(AtomicBool::new(false));
     let mut receiver = Receiver {
         started: session_started,
-        video: VideoFrameAssembler::new(fps),
+        video: if video_resend {
+            VideoFrameAssembler::with_resend(fps)
+        } else {
+            VideoFrameAssembler::new(fps)
+        },
+        next_missing_check: session_started,
         audio: AudioAssembler::default(),
         audio_enabled,
         ordered_audio: OrderedAudioPackets::default(),
@@ -955,7 +987,10 @@ where
                             break;
                         }
                         datagram = reader_connection.read_datagram() => {
-                            receiver.datagram(&datagram.map_err(|e| e.to_string())?, Instant::now(), reader_connection.rtt())?;
+                            let now = Instant::now();
+                            let rtt = reader_connection.rtt();
+                            receiver.datagram(&datagram.map_err(|e| e.to_string())?, now, rtt)?;
+                            request_missing_chunks(&mut receiver, &reader_connection, now, rtt);
                         }
                         ready = async {
                             let permit = input_send.reserve().await.map_err(|error| error.to_string())?;
@@ -979,6 +1014,7 @@ where
                                 permit.send(OutgoingControl { envelope: Envelope { body: Some(envelope::Body::InputPack(InputPack { transitions })) }, input_events: sent_events });
                         }
                         _ = ticks.tick() => {
+                            request_missing_chunks(&mut receiver, &reader_connection, Instant::now(), reader_connection.rtt());
                             if reader_stop.load(Ordering::Acquire) { break 'stream StreamEnd::Stopped; }
                             if Instant::now() >= next_clock_sync {
                                 clock_sequence = clock_sequence.checked_add(1).ok_or("clock sequence exhausted")?;
@@ -1359,6 +1395,7 @@ mod tests {
             audio_enabled: false,
             host_pointer_release: false,
             network_status: false,
+            video_resend: false,
             session_started: start,
             latency_measurements: crate::latency::LatencyMeasurements::default(),
             diagnostic_stream: None,
@@ -1642,6 +1679,7 @@ mod tests {
         let mut receiver = Receiver {
             started: Instant::now(),
             video: VideoFrameAssembler::new(120),
+            next_missing_check: Instant::now(),
             audio: AudioAssembler::default(),
             audio_enabled: true,
             ordered_audio: OrderedAudioPackets::default(),
@@ -1891,6 +1929,7 @@ mod tests {
             audio_enabled: true,
             host_pointer_release: true,
             network_status: false,
+            video_resend: false,
             session_started: started,
             latency_measurements: latency_measurements.clone(),
             diagnostic_stream: None,
