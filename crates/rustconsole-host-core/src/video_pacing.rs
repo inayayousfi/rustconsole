@@ -116,9 +116,110 @@ impl fmt::Display for InvalidFrameDivisor {
 
 impl std::error::Error for InvalidFrameDivisor {}
 
+/// Sending rate of a spread frame, in percent of the target bitrate.
+const SPREAD_RATE_PERCENT: u64 = 150;
+/// Longest spread of one frame. A keyframe is many times the usual size, and spreading it
+/// at the usual rate would outlast its send deadline.
+const LONGEST_FRAME_SPREAD: Duration = Duration::from_millis(20);
+/// A timer tick can run late. Sending may catch up by this much instead of falling behind.
+const SEND_CATCH_UP: Duration = Duration::from_millis(2);
+/// A clean link pays no delay for spreading, so loss turns it on for this long.
+const SPREAD_AFTER_LOSS: Duration = Duration::from_secs(30);
+
+/// Spreads the datagrams of one frame over time once the link has lost data. A frame sent
+/// as one burst overflows a small buffer on a narrow link, and a short radio gap swallows
+/// most of it.
+#[derive(Debug, Default)]
+pub struct VideoSendPacer {
+    spread_until: Option<Instant>,
+    next_send: Option<Instant>,
+    nanos_per_byte: u64,
+}
+
+impl VideoSendPacer {
+    pub fn observe_loss(&mut self, now: Instant) {
+        self.spread_until = Some(now + SPREAD_AFTER_LOSS);
+    }
+
+    pub fn begin_frame(&mut self, bytes: usize, target_bits_per_second: u64, now: Instant) {
+        self.next_send = None;
+        self.nanos_per_byte = 0;
+        if bytes == 0 || self.spread_until.is_none_or(|until| now >= until) {
+            return;
+        }
+        let rate = u128::from(target_bits_per_second.max(1)) * u128::from(SPREAD_RATE_PERCENT);
+        let spread =
+            (bytes as u128 * 8 * 100 * 1_000_000_000 / rate).min(LONGEST_FRAME_SPREAD.as_nanos());
+        self.nanos_per_byte = u64::try_from(spread / bytes as u128).unwrap_or(u64::MAX);
+    }
+
+    #[must_use]
+    pub fn ready(&self, now: Instant) -> bool {
+        self.next_send.is_none_or(|next| now >= next)
+    }
+
+    pub fn sent(&mut self, bytes: usize, now: Instant) {
+        if self.nanos_per_byte == 0 {
+            return;
+        }
+        let earliest = now.checked_sub(SEND_CATCH_UP).unwrap_or(now);
+        let start = self.next_send.map_or(now, |next| next.max(earliest));
+        let wait = self.nanos_per_byte.saturating_mul(bytes as u64);
+        self.next_send = Some(start + Duration::from_nanos(wait));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn send_duration(pacer: &mut VideoSendPacer, datagrams: usize, start: Instant) -> Duration {
+        let mut now = start;
+        for _ in 0..datagrams {
+            while !pacer.ready(now) {
+                now += Duration::from_micros(100);
+            }
+            pacer.sent(1200, now);
+        }
+        now - start
+    }
+
+    #[test]
+    fn a_clean_link_sends_a_frame_at_once() {
+        let now = Instant::now();
+        let mut pacer = VideoSendPacer::default();
+        pacer.begin_frame(24_000, 5_000_000, now);
+        assert_eq!(send_duration(&mut pacer, 20, now), Duration::ZERO);
+    }
+
+    #[test]
+    fn after_loss_a_frame_leaves_at_one_and_a_half_times_the_target() {
+        let now = Instant::now();
+        let mut pacer = VideoSendPacer::default();
+        pacer.observe_loss(now);
+        pacer.begin_frame(12_000, 8_000_000, now);
+        let spread = send_duration(&mut pacer, 10, now);
+        assert!(spread >= Duration::from_millis(7) && spread <= Duration::from_millis(8));
+    }
+
+    #[test]
+    fn a_keyframe_stays_within_the_longest_spread() {
+        let now = Instant::now();
+        let mut pacer = VideoSendPacer::default();
+        pacer.observe_loss(now);
+        pacer.begin_frame(240_000, 2_000_000, now);
+        assert!(send_duration(&mut pacer, 200, now) <= LONGEST_FRAME_SPREAD);
+    }
+
+    #[test]
+    fn spreading_stops_once_the_link_stays_clean() {
+        let now = Instant::now();
+        let mut pacer = VideoSendPacer::default();
+        pacer.observe_loss(now);
+        let later = now + SPREAD_AFTER_LOSS;
+        pacer.begin_frame(24_000, 5_000_000, later);
+        assert_eq!(send_duration(&mut pacer, 20, later), Duration::ZERO);
+    }
 
     #[test]
     fn small_overrun_rebases_without_skipping_an_extra_slot() {

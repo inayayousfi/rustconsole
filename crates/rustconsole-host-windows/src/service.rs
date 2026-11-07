@@ -1762,6 +1762,7 @@ mod windows {
                 Instant::now(),
             );
         let mut resend_pending = std::collections::VecDeque::<bytes::Bytes>::new();
+        let mut send_pacer = rustconsole_host_core::video_pacing::VideoSendPacer::default();
         let mut video_started = Instant::now();
         let mut audio_pending = std::collections::VecDeque::<bytes::Bytes>::new();
         let mut audio_pending_diagnostic = None::<PayloadDigest>;
@@ -1779,6 +1780,7 @@ mod windows {
                         video_policy.require_keyframe();
                     }
                     Ok(WorkerVideoControl::ResendChunks(request)) => {
+                        send_pacer.observe_loss(Instant::now());
                         resend_pending.extend(recent_video.take(
                             request.sequence,
                             &request.chunk_indexes,
@@ -2145,6 +2147,11 @@ mod windows {
                             record.packetization_completed_at_micros = clock.now()?;
                         }
                         video_pending = datagrams.into_iter().map(bytes::Bytes::from).collect();
+                        send_pacer.begin_frame(
+                            video_pending.iter().map(bytes::Bytes::len).sum(),
+                            video_policy.target_bits_per_second(),
+                            Instant::now(),
+                        );
                         recent_video.remember(
                             sequence,
                             video_pending.iter().cloned().collect(),
@@ -2176,7 +2183,10 @@ mod windows {
                     Err(quinn::SendDatagramError::TooLarge) => resend_pending.clear(),
                     Err(error) => return Err(error.into()),
                 }
-            } else if let Some(datagram) = video_pending.front() {
+            } else if let Some(datagram) = video_pending
+                .front()
+                .filter(|_| send_pacer.ready(Instant::now()))
+            {
                 if let Some(record) = video_pending_diagnostic.as_mut()
                     && record.first_send_attempt_at_micros == 0
                 {
@@ -2188,6 +2198,7 @@ mod windows {
                     Duration::from_millis(1),
                 )) {
                     Ok(true) => {
+                        send_pacer.sent(datagram.len(), Instant::now());
                         video_pending.pop_front();
                         if video_pending.is_empty() {
                             if let Some(mut record) = video_pending_diagnostic.take() {

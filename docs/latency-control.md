@@ -69,6 +69,8 @@ The host remembers the highest bitrate it held for 20 seconds without a cut. Whe
 
 When both ends support it, the player asks the host to send missing chunks again and holds newer frames until the repair arrives, for about 50 ms and at most 8 frames. The host keeps its 16 newest frames for this and limits resends to a quarter of the target, with a floor of 2 Mbit/s. A repaired frame counts as neither lost nor late, so repaired loss never lowers the bitrate. Requests travel as datagrams, because a reliable stream would hold them behind its retransmission timer. A player cannot ask for a frame it never heard of, so at low frame rates the host repeats a frame's last chunk 20 ms later to announce it.
 
+For 30 seconds after a resend request, the host spreads each frame instead of sending it as one burst, at 1.5 times the target bitrate and over at most 20 ms. A clean link never requests a resend, so it pays no added delay.
+
 A keyframe depends on nothing before it. The player therefore releases a complete keyframe at once, stops waiting for older frames, and does not treat the frames the host skipped before it as a loss.
 
 A frame's assembly deadline does not run while the link delivers nothing, because a silent link is delaying chunks rather than losing them. With resends, a frame still waits at most twice its normal budget. Loss above 10% of a report's chunks cuts at once. Smaller loss cuts only when the report before it also had loss, so a passing burst costs nothing and continuing loss costs at most one extra report of reaction time.
