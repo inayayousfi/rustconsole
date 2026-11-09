@@ -4,6 +4,7 @@ pub mod latency;
 pub mod video_pacing;
 mod video_recovery;
 pub mod video_resend;
+pub mod video_sender;
 pub mod video_stream;
 
 use rustconsole_media::{AudioSamples, VideoFormat, VideoFrame};

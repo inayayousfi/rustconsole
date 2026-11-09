@@ -36,7 +36,7 @@ Application crates are composition roots. They may connect libraries and deal wi
 
 - `crates/rustconsole-client-core` owns platform-neutral host selection, address resolution, discovery composition, host probing, and player child-process supervision. It bridges the Tauri client to player-side connection behavior without depending on Tauri.
 - `crates/rustconsole-player-core` owns platform-neutral player session orchestration: authenticated host probing, stream negotiation and reception, media packet assembly, input transmission, and the client-player process protocol.
-- `crates/rustconsole-host-core` owns platform-neutral host session rules: session lifecycle and single-stream ownership, adaptive bitrate behavior, bounded queues, and the capture, audio, and input contracts implemented by a host platform.
+- `crates/rustconsole-host-core` owns platform-neutral host session rules: session lifecycle and single-stream ownership, adaptive bitrate behavior, video send order and repair, bounded queues, and the capture, audio, and input contracts implemented by a host platform.
 
 Core crates define policy and orchestration. They must not call operating-system, user-interface, media-library, or graphics APIs directly.
 

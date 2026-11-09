@@ -162,9 +162,9 @@ mod windows {
         ephemeral_server_config, read_envelope, write_envelope,
     };
     use rustconsole_host_core::{
-        DesktopCapture, HostSessionControlAction, HostSessionControlSource, VideoDeliveryReport,
-        VideoPathReport,
+        DesktopCapture, HostSessionControlAction, HostSessionControlSource, VideoPathReport,
         video_pacing::frame_period,
+        video_sender::{OutgoingKind, VideoSender},
         video_stream::{HostEncodedVideoFrame, HostVideoStreamPolicy},
     };
     #[cfg(not(feature = "development"))]
@@ -1739,15 +1739,22 @@ mod windows {
             network_baseline_micros,
             Instant::now(),
         );
-        let mut bitrate_change_sequence = 0_u64;
-        let mut bitrate_change_cause = rustconsole_host_core::VideoBitrateChangeCause::Startup;
+        let frame_period =
+            frame_period(frames_per_second).ok_or("video stream frame rate is zero")?;
+        let mut sender = VideoSender::<bytes::Bytes>::new(
+            video_policy,
+            frame_period,
+            video_datagram_version,
+            video_resend,
+            Instant::now(),
+        );
         let clock = crate::clock::HostClock::new()?;
         let (_shutdown_tx, shutdown_rx) = shutdown_channel();
         let Some(mut stream) = worker
             .start_video_stream(
                 &shutdown_rx,
                 frames_per_second,
-                video_policy.target_bits_per_second(),
+                sender.policy().target_bits_per_second(),
                 enable_audio,
                 diagnostic_tx.is_some(),
             )
@@ -1755,55 +1762,32 @@ mod windows {
         else {
             return Ok(WorkerVideoExit::Stopped);
         };
-        let mut video_pending = std::collections::VecDeque::<bytes::Bytes>::new();
         let mut video_pending_diagnostic = None::<PayloadDigest>;
-        let mut recent_video =
-            rustconsole_host_core::video_resend::RecentVideoChunks::<bytes::Bytes>::new(
-                Instant::now(),
-            );
-        let mut resend_pending = std::collections::VecDeque::<bytes::Bytes>::new();
-        let mut video_started = Instant::now();
         let mut audio_pending = std::collections::VecDeque::<bytes::Bytes>::new();
         let mut audio_pending_diagnostic = None::<PayloadDigest>;
         let mut audio_queued_at = 0_u64;
         let mut local_audio_drops = 0_u64;
         let mut worker_audio_drops = 0_u64;
-        let frame_period =
-            frame_period(frames_per_second).ok_or("video stream frame rate is zero")?;
         let mut observed_worker_drops = stream.dropped_events();
         let mut capture_freshness = CaptureFreshnessMonitor::new(Instant::now());
         loop {
             loop {
                 match controls.try_recv() {
                     Ok(WorkerVideoControl::RequestKeyframe) => {
-                        video_policy.require_keyframe();
+                        sender.require_keyframe();
                     }
                     Ok(WorkerVideoControl::ResendChunks(request)) => {
-                        resend_pending.extend(recent_video.take(
-                            request.sequence,
-                            &request.chunk_indexes,
-                            video_policy.target_bits_per_second(),
-                            Instant::now(),
-                        ));
+                        sender.observe_resend_request(&request, Instant::now());
                     }
                     Ok(WorkerVideoControl::ReceiverReport(report)) => {
                         let path = connection.stats().path;
-                        let change = video_policy.observe_receiver_with_latency(
+                        let change = sender.observe_receiver_report(
                             VideoPathReport {
                                 round_trip_time: path.rtt,
                                 congestion_window_bytes: path.cwnd,
                                 lost_packets: path.lost_packets,
                             },
-                            VideoDeliveryReport {
-                                received_chunks: report.received_chunks,
-                                completed_payload_bytes: report.completed_payload_bytes,
-                                measurement_interval_micros: report.measurement_interval_micros,
-                                lost_chunks: report.lost_chunks,
-                                late_chunks: report.late_chunks,
-                                assembly_overflows: report.assembly_overflows,
-                                incomplete_frames: report.incomplete_frames,
-                            },
-                            report.latency,
+                            report,
                             Instant::now(),
                         );
                         let change = match change {
@@ -1812,7 +1796,7 @@ mod windows {
                                 return Ok(WorkerVideoExit::LatencyBudgetExceeded(failure));
                             }
                         };
-                        if let Some(status) = video_policy.latency_status() {
+                        if let Some(status) = sender.latency_status() {
                             responses
                                 .try_send(Envelope {
                                     body: Some(envelope::Body::LatencyControlStatus(status)),
@@ -1820,8 +1804,6 @@ mod windows {
                                 .map_err(|_| "latency status response queue unavailable")?;
                         }
                         if let Some(change) = change {
-                            bitrate_change_sequence = bitrate_change_sequence.saturating_add(1);
-                            bitrate_change_cause = change.cause;
                             stream.set_bitrate(change.target_bits_per_second)?;
                         }
                     }
@@ -1838,9 +1820,9 @@ mod windows {
             let worker_drops = stream.dropped_events();
             if worker_drops > observed_worker_drops {
                 observed_worker_drops = worker_drops;
-                video_policy.observe_worker_queue_drop();
+                sender.observe_worker_queue_drop();
             }
-            if video_policy.keyframe_request_due(Instant::now()) {
+            if sender.keyframe_request_due(Instant::now()) {
                 stream.request_keyframe()?;
             }
             if enable_audio
@@ -2012,22 +1994,14 @@ mod windows {
                     true
                 }
             });
-            let send_deadline = rustconsole_host_core::video_transport::assembly_deadline(
-                frame_period,
-                connection.rtt(),
-            );
-            if !video_pending.is_empty() && video_started.elapsed() >= send_deadline {
-                video_pending.clear();
-                if let Some(change) = video_policy.observe_send_deadline_expired() {
-                    bitrate_change_sequence = bitrate_change_sequence.saturating_add(1);
-                    bitrate_change_cause = change.cause;
-                    stream.set_bitrate(change.target_bits_per_second)?;
-                }
-                if let Some(record) = video_pending_diagnostic.take() {
-                    submit_payload_digest(diagnostic_tx.as_ref(), record)?;
-                }
+            let (abandoned, change) = sender.expire_late_frame(connection.rtt(), Instant::now());
+            if let Some(change) = change {
+                stream.set_bitrate(change.target_bits_per_second)?;
             }
-            if video_pending.is_empty()
+            if abandoned && let Some(record) = video_pending_diagnostic.take() {
+                submit_payload_digest(diagnostic_tx.as_ref(), record)?;
+            }
+            if sender.wants_frame()
                 && let Some(event) = stream
                     .next_event_timeout(Duration::ZERO)
                     .map_err(|error| error.to_string())?
@@ -2069,7 +2043,7 @@ mod windows {
                             stream.restart_capture()?;
                             continue;
                         }
-                        if !video_policy.accept_encoded_frame(sequence, keyframe) {
+                        if !sender.accept_frame(sequence, keyframe) {
                             continue;
                         }
                         let Some(maximum_datagram_size) = connection.max_datagram_size() else {
@@ -2123,35 +2097,26 @@ mod windows {
                             keyframe,
                             payload,
                         };
-                        let datagrams = video_policy.packetize_encoded_frame(
-                            frame,
-                            maximum_datagram_size,
-                            video_datagram_version,
-                        )?;
+                        sender.queue_frame(frame, maximum_datagram_size, Instant::now())?;
                         if let Some(record) = prepared_diagnostic.as_mut() {
                             let path = connection.stats().path;
+                            let policy = sender.policy();
                             record.video_target_bitrate_bits_per_second =
-                                video_policy.target_bits_per_second();
+                                policy.target_bits_per_second();
                             record.video_delivered_goodput_bits_per_second =
-                                video_policy.estimated_capacity_bits_per_second();
+                                policy.estimated_capacity_bits_per_second();
                             record.video_soft_ceiling_bits_per_second =
-                                video_policy.soft_ceiling_bits_per_second().unwrap_or(0);
-                            record.video_bitrate_change_sequence = bitrate_change_sequence;
-                            record.video_bitrate_change_cause = bitrate_change_cause as u64;
+                                policy.soft_ceiling_bits_per_second().unwrap_or(0);
+                            record.video_bitrate_change_sequence = sender.bitrate_change_sequence();
+                            record.video_bitrate_change_cause =
+                                sender.bitrate_change_cause() as u64;
                             record.video_path_round_trip_micros =
                                 u64::try_from(path.rtt.as_micros()).unwrap_or(u64::MAX);
                             record.video_path_congestion_window_bytes = path.cwnd;
                             record.video_path_lost_packets = path.lost_packets;
                             record.packetization_completed_at_micros = clock.now()?;
                         }
-                        video_pending = datagrams.into_iter().map(bytes::Bytes::from).collect();
-                        recent_video.remember(
-                            sequence,
-                            video_pending.iter().cloned().collect(),
-                            Instant::now(),
-                        );
                         video_pending_diagnostic = prepared_diagnostic;
-                        video_started = Instant::now();
                     }
                     WorkerEvent::Failure(error) => return Err(error.into()),
                     WorkerEvent::VideoReconfigurationRequired(cause) => {
@@ -2160,47 +2125,31 @@ mod windows {
                     _ => return Err("media worker returned an unexpected stream event".into()),
                 }
             }
-            if video_resend {
-                resend_pending.extend(recent_video.take_announcement(Instant::now()));
-            }
-            if let Some(datagram) = resend_pending.front() {
-                match runtime.block_on(rustconsole_host_core::authentication::send_media_datagram(
-                    &connection,
-                    datagram.clone(),
-                    Duration::from_millis(1),
-                )) {
-                    Ok(true) => {
-                        resend_pending.pop_front();
-                    }
-                    Ok(false) => {}
-                    Err(quinn::SendDatagramError::TooLarge) => resend_pending.clear(),
-                    Err(error) => return Err(error.into()),
-                }
-            } else if let Some(datagram) = video_pending.front() {
-                if let Some(record) = video_pending_diagnostic.as_mut()
+            if let Some(outgoing) = sender.next(Instant::now()) {
+                let frame_chunk = outgoing.kind == OutgoingKind::Frame;
+                if frame_chunk
+                    && let Some(record) = video_pending_diagnostic.as_mut()
                     && record.first_send_attempt_at_micros == 0
                 {
                     record.first_send_attempt_at_micros = clock.now()?;
                 }
                 match runtime.block_on(rustconsole_host_core::authentication::send_media_datagram(
                     &connection,
-                    datagram.clone(),
+                    outgoing.datagram,
                     Duration::from_millis(1),
                 )) {
                     Ok(true) => {
-                        video_pending.pop_front();
-                        if video_pending.is_empty() {
-                            if let Some(mut record) = video_pending_diagnostic.take() {
-                                record.last_send_completed_at_micros = clock.now()?;
-                                submit_payload_digest(diagnostic_tx.as_ref(), record)?;
-                            }
+                        if sender.sent(outgoing.kind)
+                            && let Some(mut record) = video_pending_diagnostic.take()
+                        {
+                            record.last_send_completed_at_micros = clock.now()?;
+                            submit_payload_digest(diagnostic_tx.as_ref(), record)?;
                         }
                     }
                     Ok(false) => {}
                     Err(quinn::SendDatagramError::TooLarge) => {
-                        video_pending.clear();
-                        video_policy.require_keyframe();
-                        if let Some(record) = video_pending_diagnostic.take() {
+                        sender.refused_as_too_large(outgoing.kind);
+                        if frame_chunk && let Some(record) = video_pending_diagnostic.take() {
                             submit_payload_digest(diagnostic_tx.as_ref(), record)?;
                         }
                     }
