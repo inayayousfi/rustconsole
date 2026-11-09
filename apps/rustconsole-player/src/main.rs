@@ -30,14 +30,18 @@ use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 mod diagnostics;
+mod held_button_check;
 mod network_path;
 use diagnostics::LatencyDiagnostics;
+use held_button_check::{HeldButtonCheck, held_button_notice};
 use network_path::{NetworkPath, PathKind};
 
 const RENDERING_BACKEND_LABEL: &str = "Rendering backend: Vulkan";
 const RECONNECT_STABLE_RESET: Duration = Duration::from_secs(30);
 const PRESENTATION_TRACKER_CAPACITY: usize = 512;
 const EVENT_WORK_BUDGET: Duration = Duration::from_millis(2);
+/// How long the player shows a notice about local input, such as a held-back button.
+const INPUT_NOTICE_DURATION: Duration = Duration::from_secs(10);
 const REPEATED_FRAME_INTERVAL: Duration = Duration::from_millis(16);
 const VIDEO_PRESENTATION_STALL: Duration = Duration::from_secs(1);
 
@@ -522,6 +526,8 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
     let mut pointer_capture_available = false;
     let mut pointer_captured = false;
     let mut input_focus = RemoteInputFocus::new();
+    let mut held_button_check = HeldButtonCheck::default();
+    let mut input_notice = None::<(String, Instant)>;
     let mut renderer =
         None::<Box<dyn PlayerVideoBackend<NativeDmaBufFrame, GuiFrame, Error = String>>>;
     let mut last_frame = None::<QueuedVideoFrame>;
@@ -1603,10 +1609,41 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+        if input_notice
+            .as_ref()
+            .is_some_and(|(_, shown_at)| shown_at.elapsed() >= INPUT_NOTICE_DURATION)
+        {
+            input_notice = None;
+            redraw = true;
+        }
         let sdl_work_started = Instant::now();
         while sdl_work_started.elapsed() < EVENT_WORK_BUDGET
             && let Some(event) = event_pump.poll_event()
         {
+            match &event {
+                Event::MouseButtonDown {
+                    timestamp,
+                    mouse_btn,
+                    ..
+                } => {
+                    if let Some(button) = mouse_button(*mouse_btn) {
+                        held_button_check.press(button, *timestamp);
+                    }
+                }
+                Event::MouseButtonUp {
+                    timestamp,
+                    mouse_btn,
+                    ..
+                } => {
+                    if let Some(button) = mouse_button(*mouse_btn)
+                        .and_then(|button| held_button_check.release(button, *timestamp))
+                    {
+                        input_notice = Some((held_button_notice(button), Instant::now()));
+                        redraw = true;
+                    }
+                }
+                _ => {}
+            }
             match event {
                 Event::Quit { .. } => break 'running,
                 Event::KeyDown {
@@ -1983,7 +2020,7 @@ fn run_pipe_session() -> Result<(), Box<dyn std::error::Error>> {
                     fullscreen,
                     pointer_capture_available,
                     pointer_captured,
-                    status: None,
+                    status: input_notice.as_ref().map(|(notice, _)| notice.as_str()),
                     diagnostics: &diagnostics,
                 });
                 if latency_diagnostics.enabled() && diagnose_submission {
