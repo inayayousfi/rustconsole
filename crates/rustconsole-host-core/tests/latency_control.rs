@@ -269,6 +269,18 @@ fn report_interval(
     player_delay: u64,
     start: Instant,
 ) {
+    report_interval_with_loss(policy, half_second, source_delay, player_delay, 0, start);
+}
+
+/// Like `report_interval`, with `lost_chunks` counted since the start of the stream.
+fn report_interval_with_loss(
+    policy: &mut HostVideoStreamPolicy,
+    half_second: u64,
+    source_delay: u64,
+    player_delay: u64,
+    lost_chunks: u64,
+    start: Instant,
+) {
     let captured_at_micros = half_second * 500_000;
     policy
         .packetize_encoded_frame(
@@ -295,6 +307,7 @@ fn report_interval(
         VideoDeliveryReport {
             completed_payload_bytes: target / 16,
             measurement_interval_micros: 500_000,
+            lost_chunks,
             ..VideoDeliveryReport::default()
         },
         Some(report(player_delay, target)),
@@ -327,6 +340,35 @@ fn a_host_stall_does_not_cut_bitrate_but_the_same_delay_from_the_network_does() 
         report_interval(&mut congested, half_second, 13_000, 80_000, start);
     }
     assert!(congested.target_bits_per_second() < before_congestion);
+}
+
+#[test]
+fn delay_while_the_link_loses_data_neither_cuts_nor_sets_a_limit() {
+    let start = Instant::now();
+    let run = |player_delay: u64| {
+        let mut policy = calibrated_stream(start);
+        for half_second in 13..=18 {
+            report_interval_with_loss(
+                &mut policy,
+                half_second,
+                13_000,
+                player_delay,
+                half_second * 10,
+                start,
+            );
+        }
+        policy
+    };
+    let delayed = run(80_000);
+    let undelayed = run(20_000);
+    assert_eq!(
+        delayed.target_bits_per_second(),
+        undelayed.target_bits_per_second()
+    );
+    assert_eq!(
+        delayed.latency_status().unwrap().ceiling_bits_per_second,
+        None
+    );
 }
 
 #[test]

@@ -39,6 +39,7 @@ pub struct LatencyPolicy {
     last_cut_at: Option<Instant>,
     last_cut_pressure: f64,
     last_report_at: Option<Instant>,
+    link_lost_data: bool,
     status: LatencyControlStatus,
 }
 
@@ -73,8 +74,15 @@ impl LatencyPolicy {
             last_cut_at: None,
             last_cut_pressure: 0.0,
             last_report_at: None,
+            link_lost_data: false,
             status: LatencyControlStatus::default(),
         }
+    }
+
+    /// Marks the next report as one in which the link lost data. Frames waiting for repairs then
+    /// raise the delay at any bitrate, and the loss rule already answers that report.
+    pub fn link_lost_data(&mut self) {
+        self.link_lost_data = true;
     }
 
     pub fn observe(
@@ -90,6 +98,7 @@ impl LatencyPolicy {
             reduce_to: None,
             failure: None,
         };
+        let link_lost_data = std::mem::take(&mut self.link_lost_data);
         if self
             .last_report_at
             .is_some_and(|at| now.saturating_duration_since(at) > Duration::from_secs(2))
@@ -181,6 +190,10 @@ impl LatencyPolicy {
             uses_estimates: estimates,
         };
         if !settled {
+            self.pressure_streak = 0;
+            return result;
+        }
+        if excessive && link_lost_data {
             self.pressure_streak = 0;
             return result;
         }

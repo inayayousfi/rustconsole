@@ -69,6 +69,7 @@ pub struct HostVideoStreamPolicy {
     recovery: VideoRecovery,
     latency: Option<crate::latency::LatencyPolicy>,
     source_delay: SourceDelay,
+    previous_delivery: VideoDeliveryReport,
 }
 
 impl HostVideoStreamPolicy {
@@ -79,6 +80,7 @@ impl HostVideoStreamPolicy {
             recovery: VideoRecovery::default(),
             latency: None,
             source_delay: SourceDelay::default(),
+            previous_delivery: VideoDeliveryReport::default(),
         }
     }
 
@@ -95,6 +97,7 @@ impl HostVideoStreamPolicy {
             recovery: VideoRecovery::default(),
             latency: None,
             source_delay: SourceDelay::default(),
+            previous_delivery: VideoDeliveryReport::default(),
         }
     }
 
@@ -140,9 +143,17 @@ impl HostVideoStreamPolicy {
             }
             report
         });
+        let previous_delivery = std::mem::replace(&mut self.previous_delivery, delivery);
+        let link_lost_data = delivery.lost_chunks > previous_delivery.lost_chunks
+            || delivery.late_chunks > previous_delivery.late_chunks
+            || delivery.incomplete_frames > previous_delivery.incomplete_frames
+            || delivery.assembly_overflows > previous_delivery.assembly_overflows;
         let Some(latency) = self.latency.as_mut() else {
             return Ok(self.bitrate.observe(path, delivery));
         };
+        if link_lost_data {
+            latency.link_lost_data();
+        }
         let evaluation = latency.observe(
             report,
             u64::try_from(path.round_trip_time.as_micros()).unwrap_or(u64::MAX),
